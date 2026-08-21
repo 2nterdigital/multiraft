@@ -199,11 +199,16 @@ other pre-publication construction failure, and after a process restart. Calls
 for different `(node_id, group_id)` keys may be concurrent; until lifecycle
 work lands, callers must serialize same-key `create_group` calls.
 
-A factory has no rollback callback. If factory construction, FileLog opening,
-or Raft construction fails before registry insertion, the local group remains
-unpublished and a returned FSM is dropped, so it must release its own side
-effects safely. Conversely, `try_initialize` runs after publication and can
-return an error while the local group is already published.
+A factory has no rollback callback. A factory error, or FileLog/Raft
+construction failure before registry insertion after the factory returns,
+leaves the local group unpublished. Drop-counter coverage proves prompt release
+of the returned FSM only for the tested default `NodeRole::Voter` with
+`SnapshotMode::Disabled` FileLog-open failure path. It explicitly excludes
+`StandbyOffload`: the current state-machine-store/trigger/holder strong-reference
+cycle can retain the FSM, so prompt release is not guaranteed. Factories must
+avoid irreversible side effects and must not rely on prompt drop outside that
+proven path. Conversely, `try_initialize` runs after publication and can return
+an error while the local group is already published.
 
 ---
 

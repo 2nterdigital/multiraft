@@ -98,9 +98,13 @@ RMQ (per-symbol)
 调用方必须串行化同一键的 `create_group` 调用。
 
 工厂没有回滚回调。工厂错误，或工厂返回后 registry 插入前发生的 FileLog/Raft
-构造失败，都会使 Group 保持未发布；返回的 FSM 会被 drop，必须安全释放其资源。
-registry 插入后，`try_initialize` 仍可能在 Group 已发布时返回错误。这个边界不定义
-snapshot restore、业务 store 协调或任何 Group 生命周期修复。
+构造失败，都会使 Group 保持未发布。drop-counter 覆盖仅证明：在已测试的默认
+`NodeRole::Voter` 且 `SnapshotMode::Disabled` 的 FileLog 打开失败路径中，返回的 FSM
+会及时释放。该覆盖明确不包含 `StandbyOffload`：当前 state-machine-store/trigger/holder
+强引用环可能保留 FSM，因此不能保证及时释放。工厂必须避免不可逆副作用，并且在该
+已证明路径之外不得依赖及时 drop。registry 插入后，`try_initialize` 仍可能在 Group
+已发布时返回错误。这个边界不定义 snapshot restore、业务 store 协调或任何 Group
+生命周期修复。
 
 ## Standby 异步快照
 

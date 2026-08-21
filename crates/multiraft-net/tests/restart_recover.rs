@@ -2,30 +2,21 @@
 
 use std::{
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
     time::Duration,
 };
 
 use multiraft_core::ClusterConfig;
 use multiraft_fsm::{ApplyOut, CounterFsm, StateMachine};
-use multiraft_net::{FsmFactoryContext, MultiRaft, StateMachineFactory, wait_for_leader};
+use multiraft_net::{wait_for_leader, FsmFactoryContext, MultiRaft, StateMachineFactory};
 
-fn temp_data_dirs(peer_ids: &[u64]) -> Vec<std::path::PathBuf> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+fn temp_data_dirs(root: &tempfile::TempDir, peer_ids: &[u64]) -> Vec<std::path::PathBuf> {
     peer_ids
         .iter()
         .map(|&id| {
-            let dir = std::env::temp_dir().join(format!(
-                "multiraft-net-restart-{}-{}-{}",
-                std::process::id(),
-                stamp,
-                id
-            ));
+            let dir = root.path().join(format!("node-{id}"));
             std::fs::create_dir_all(&dir).unwrap();
             dir
         })
@@ -132,7 +123,8 @@ impl StateMachineFactory<ReplayProbeFsm> for CountingReplayFactory {
 #[tokio::test]
 async fn restart_replays_committed_state() {
     let peer_ids = [1u64, 2, 3];
-    let dirs = temp_data_dirs(&peer_ids);
+    let data_root = tempfile::tempdir().expect("create temporary data root");
+    let dirs = temp_data_dirs(&data_root, &peer_ids);
     let group = 1u64;
     let members = peer_ids.to_vec();
     let expected: i64 = 1 + 2 + 3 + 4 + 5;
@@ -218,16 +210,16 @@ async fn restart_replays_committed_state() {
         Some(expected),
         "FSM value must be restored after restart"
     );
-
-    for dir in &dirs {
-        let _ = std::fs::remove_dir_all(dir);
+    for n in &nodes {
+        n.shutdown().await.expect("shutdown after recovery");
     }
 }
 
 #[tokio::test]
 async fn file_log_replay_restores_committed_state_with_custom_factory() {
     let peer_ids = [1u64, 2, 3];
-    let dirs = temp_data_dirs(&peer_ids);
+    let data_root = tempfile::tempdir().expect("create temporary data root");
+    let dirs = temp_data_dirs(&data_root, &peer_ids);
     let members = peer_ids.to_vec();
     let calls = Arc::new(AtomicUsize::new(0));
     let factory = CountingReplayFactory {
@@ -286,8 +278,5 @@ async fn file_log_replay_restores_committed_state_with_custom_factory() {
     assert_eq!(calls.load(Ordering::SeqCst), 6);
     for node in &nodes {
         node.shutdown().await.expect("shutdown after recovery");
-    }
-    for dir in &dirs {
-        std::fs::remove_dir_all(dir).expect("remove temporary data dir");
     }
 }

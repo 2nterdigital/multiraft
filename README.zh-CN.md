@@ -139,9 +139,13 @@ let runtime = MultiRaft::<MyFsm>::start_with_factory(config, |context| {
 `(node_id, group_id)` 键的调用可以并发；在 lifecycle 工作落地前，调用方必须
 串行化同一键的 `create_group` 调用。
 
-工厂没有回滚回调。若工厂构造、FileLog 打开或 Raft 构造在 registry 插入前失败，
-本地 Group 不会发布，已返回的 FSM 会被 drop，因此它必须安全释放自己的副作用。
-相反，`try_initialize` 在发布后运行，可能在本地 Group 已发布时返回错误。
+工厂没有回滚回调。工厂错误，或工厂返回后在 registry 插入前发生的 FileLog/Raft
+构造失败，都会使本地 Group 保持未发布。drop-counter 覆盖仅证明：在已测试的默认
+`NodeRole::Voter` 且 `SnapshotMode::Disabled` 的 FileLog 打开失败路径中，返回的 FSM
+会及时释放。该覆盖明确不包含 `StandbyOffload`：当前 state-machine-store/trigger/holder
+强引用环可能保留 FSM，因此不能保证及时释放。工厂必须避免不可逆副作用，并且在该
+已证明路径之外不得依赖及时 drop。相反，`try_initialize` 在发布后运行，可能在本地
+Group 已发布时返回错误。
 
 ---
 

@@ -275,6 +275,15 @@ impl<S: StateMachine> MultiRaft<S> {
         Ok(nodes)
     }
 
+    /// Start one in-process node with a private [`Router`] and state-machine factory.
+    ///
+    /// Retains `factory` as a [`StateMachineFactory`] and invokes it later when
+    /// [`Self::create_group`] constructs a local group.
+    ///
+    /// # Errors
+    ///
+    /// This constructor does not invoke `factory`; factory errors are returned later
+    /// by [`Self::create_group`].
     pub async fn start_with_factory(
         config: ClusterConfig,
         factory: impl StateMachineFactory<S>,

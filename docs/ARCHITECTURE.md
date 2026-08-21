@@ -103,10 +103,15 @@ lands, callers must serialize same-key `create_group` calls.
 
 There is no factory rollback callback. A factory error, or a pre-insertion
 FileLog/Raft construction failure after the factory returns, leaves the group
-unpublished; the returned FSM is dropped and must release its resources safely.
-After registry insertion, `try_initialize` can still return an error after the
-group has been published. This boundary does not define snapshot restore,
-business-store coordination, or any group-lifecycle fix.
+unpublished. Drop-counter coverage proves prompt release of the returned FSM
+only for the tested default `NodeRole::Voter` with `SnapshotMode::Disabled`
+FileLog-open failure path. It explicitly excludes `StandbyOffload`: the current
+state-machine-store/trigger/holder strong-reference cycle can retain the FSM,
+so prompt release is not guaranteed. Factories must avoid irreversible side
+effects and must not rely on prompt drop outside that proven path. After registry
+insertion, `try_initialize` can still return an error after the group has been
+published. This boundary does not define snapshot restore, business-store
+coordination, or any group-lifecycle fix.
 
 ## Standby async snapshot
 
