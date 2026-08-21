@@ -1,11 +1,16 @@
 //! 3-node MultiRaft restart with shared file-backed data dirs.
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use multiraft_core::ClusterConfig;
-use multiraft_fsm::CounterFsm;
-use multiraft_net::MultiRaft;
-use multiraft_net::wait_for_leader;
+use multiraft_fsm::{ApplyOut, CounterFsm, StateMachine};
+use multiraft_net::{FsmFactoryContext, MultiRaft, StateMachineFactory, wait_for_leader};
 
 fn temp_data_dirs(peer_ids: &[u64]) -> Vec<std::path::PathBuf> {
     let stamp = std::time::SystemTime::now()
@@ -39,7 +44,7 @@ fn configs_with_dirs(peer_ids: &[u64], dirs: &[std::path::PathBuf]) -> Vec<Clust
         .collect()
 }
 
-async fn propose_on_leader(nodes: &[MultiRaft], group: u64, data: Vec<u8>) {
+async fn propose_on_leader<S: StateMachine>(nodes: &[MultiRaft<S>], group: u64, data: Vec<u8>) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         for n in nodes {
@@ -58,6 +63,72 @@ async fn propose_on_leader(nodes: &[MultiRaft], group: u64, data: Vec<u8>) {
     }
 }
 
+async fn wait_for_leader_for<S: StateMachine>(
+    nodes: &[MultiRaft<S>],
+    group: u64,
+    timeout: Duration,
+) -> Option<u64> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        for node in nodes {
+            if let Some(leader) = node.leader(group) {
+                if nodes.iter().any(|peer| peer.is_leader(group)) {
+                    return Some(leader);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+#[derive(Default)]
+struct ReplayProbeFsm {
+    value: i64,
+}
+
+impl ReplayProbeFsm {
+    fn encode_add(delta: i64) -> Vec<u8> {
+        delta.to_le_bytes().to_vec()
+    }
+}
+
+impl StateMachine for ReplayProbeFsm {
+    type Error = std::io::Error;
+
+    fn apply(&mut self, _group: u64, _index: u64, data: &[u8]) -> Result<ApplyOut, Self::Error> {
+        let bytes: [u8; 8] = data.try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "replay probe delta")
+        })?;
+        self.value += i64::from_le_bytes(bytes);
+        Ok(ApplyOut::default())
+    }
+
+    fn snapshot(&self, _group: u64) -> Result<Vec<u8>, Self::Error> {
+        Ok(self.value.to_le_bytes().to_vec())
+    }
+
+    fn restore(&mut self, _group: u64, snapshot: &[u8]) -> Result<(), Self::Error> {
+        let bytes: [u8; 8] = snapshot.try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "replay probe snapshot")
+        })?;
+        self.value = i64::from_le_bytes(bytes);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct CountingReplayFactory {
+    calls: Arc<AtomicUsize>,
+}
+
+impl StateMachineFactory<ReplayProbeFsm> for CountingReplayFactory {
+    fn create(&self, _context: FsmFactoryContext) -> anyhow::Result<ReplayProbeFsm> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ReplayProbeFsm::default())
+    }
+}
+
 #[tokio::test]
 async fn restart_replays_committed_state() {
     let peer_ids = [1u64, 2, 3];
@@ -73,9 +144,7 @@ async fn restart_replays_committed_state() {
             .expect("start_cluster");
 
         for n in &nodes {
-            n.create_group(group, &members)
-                .await
-                .expect("create_group");
+            n.create_group(group, &members).await.expect("create_group");
         }
 
         wait_for_leader(&nodes, group, Duration::from_secs(5))
@@ -152,5 +221,73 @@ async fn restart_replays_committed_state() {
 
     for dir in &dirs {
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn file_log_replay_restores_committed_state_with_custom_factory() {
+    let peer_ids = [1u64, 2, 3];
+    let dirs = temp_data_dirs(&peer_ids);
+    let members = peer_ids.to_vec();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory = CountingReplayFactory {
+        calls: calls.clone(),
+    };
+
+    {
+        let nodes = MultiRaft::start_cluster_with_factory(
+            configs_with_dirs(&peer_ids, &dirs),
+            factory.clone(),
+        )
+        .await
+        .expect("start custom cluster");
+        for node in &nodes {
+            node.create_group(1, &members).await.expect("create group");
+        }
+        wait_for_leader_for(&nodes, 1, Duration::from_secs(5))
+            .await
+            .expect("leader");
+        for delta in [1, 2, 3, 4, 5] {
+            propose_on_leader(&nodes, 1, ReplayProbeFsm::encode_add(delta)).await;
+        }
+        for node in &nodes {
+            node.shutdown().await.expect("shutdown");
+        }
+    }
+
+    let nodes = MultiRaft::start_cluster_with_factory(configs_with_dirs(&peer_ids, &dirs), factory)
+        .await
+        .expect("restart custom cluster");
+    for node in &nodes {
+        node.create_group(1, &members)
+            .await
+            .expect("create after restart");
+    }
+    for node in &nodes {
+        node.wait_for_recovery(1, Duration::from_secs(5))
+            .await
+            .expect("recovery");
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let mut values = Vec::new();
+        for node in &nodes {
+            values.push(node.with_fsm(1, |fsm| fsm.value).await);
+        }
+        if values.iter().all(|value| *value == Some(15)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for node in &nodes {
+        assert_eq!(node.with_fsm(1, |fsm| fsm.value).await, Some(15));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
+    for node in &nodes {
+        node.shutdown().await.expect("shutdown after recovery");
+    }
+    for dir in &dirs {
+        std::fs::remove_dir_all(dir).expect("remove temporary data dir");
     }
 }
