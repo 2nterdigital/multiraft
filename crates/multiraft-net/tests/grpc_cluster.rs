@@ -196,4 +196,7 @@ async fn grpc_three_node_custom_factory_propose() {
     for node in &nodes {
         assert_eq!(node.with_fsm(21, |fsm| fsm.value).await, Some(7));
     }
+    for node in &nodes {
+        node.shutdown().await.expect("shutdown custom gRPC node");
+    }
 }
