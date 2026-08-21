@@ -28,7 +28,7 @@ crates/
 | Crate | 做 | 不做 |
 |-------|------|----------|
 | `multiraft-core` | 共享类型 / 错误 | 网络、存储 |
-| `multiraft-net` | `MultiRaft` API，O(nodes) 连接 | 业务命令 |
+| `multiraft-net` | `MultiRaft` API、O(nodes) 连接、通用 FSM 工厂注入 | 业务类型选择、命令语义、持久化业务元数据、业务 registry 或 discriminator |
 | `multiraft-fsm` | Trait + demo `CounterFsm` | 依赖撮合引擎 FSM |
 | `multiraft-store` | 每 Group 持久化 | 订单簿 |
 | `multiraft-demo` | 验收 / Jepsen 靶标 | 生产部署 |
@@ -84,6 +84,23 @@ RMQ (per-symbol)
   → multiraft::MultiRaft (propose / leader callbacks)
     → FSM 适配器 → 撮合引擎 FSM
 ```
+
+### 通用 FSM 工厂与生命周期边界
+
+`multiraft-net` 负责通用注入机制，而不负责业务类型选择、业务命令语义、持久化
+业务元数据、业务 registry 或 discriminator。应用提供 `StateMachineFactory<S>`；
+每个由 `FsmFactoryContext` 调用的工厂成功返回的结果，都是一个本地 Group 单独拥有的
+`S`。`CounterFsm` 仍是 Demo / 默认路径。
+
+工厂是同步、轻量且非阻塞的。它不得执行网络工作、启动不可逆副作用或后台任务。
+工厂构造并非 exactly-once：工厂或其他发布前失败后，以及进程重启后，调用可能
+重复；不同 `(node_id, group_id)` 键的调用可以并发。在单独的 lifecycle 工作落地前，
+调用方必须串行化同一键的 `create_group` 调用。
+
+工厂没有回滚回调。工厂错误，或工厂返回后 registry 插入前发生的 FileLog/Raft
+构造失败，都会使 Group 保持未发布；返回的 FSM 会被 drop，必须安全释放其资源。
+registry 插入后，`try_initialize` 仍可能在 Group 已发布时返回错误。这个边界不定义
+snapshot restore、业务 store 协调或任何 Group 生命周期修复。
 
 ## Standby 异步快照
 

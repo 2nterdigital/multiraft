@@ -172,6 +172,39 @@ Phase-1 (this repo)     → runtime + demo + consistency tests
 Phase-2 (downstream app) → optional RMQ Leader propose → pluggable matching FSM
 ```
 
+### Factory-injected FSMs
+
+Downstream applications can construct their own local FSM type through
+`StateMachineFactory<S>`. The factory receives an `FsmFactoryContext` with the
+local node and group identities:
+
+```rust
+let runtime = MultiRaft::<MyFsm>::start_with_factory(config, |context| {
+    MyFsm::open(context.node_id(), context.group_id())
+}).await?;
+```
+
+`MyFsm::open` returns `anyhow::Result<MyFsm>`. Factory construction is
+synchronous, lightweight, and non-blocking: prepare shared dependencies before
+startup, and do not start network work, irreversible side effects, or
+background tasks from the factory. `CounterFsm` remains the demo/default path.
+
+The public factory constructors are `MultiRaft::start_with_factory`,
+`MultiRaft::start_cluster_with_factory`, `MultiRaft::start_grpc_with_factory`,
+and `SharedFabric::start_node_with_factory`.
+
+Each successful result is a separately owned `S` for one local group. Factory
+creation is not exactly-once: it may be requested again after a factory or
+other pre-publication construction failure, and after a process restart. Calls
+for different `(node_id, group_id)` keys may be concurrent; until lifecycle
+work lands, callers must serialize same-key `create_group` calls.
+
+A factory has no rollback callback. If factory construction, FileLog opening,
+or Raft construction fails before registry insertion, the local group remains
+unpublished and a returned FSM is dropped, so it must release its own side
+effects safely. Conversely, `try_initialize` runs after publication and can
+return an error while the local group is already published.
+
 ---
 
 ## Documentation (bilingual)

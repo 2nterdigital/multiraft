@@ -28,7 +28,7 @@ crates/
 | Crate | Does | Does not |
 |-------|------|----------|
 | `multiraft-core` | Shared types / errors | Networking, storage |
-| `multiraft-net` | `MultiRaft` API, O(nodes) links | Business commands |
+| `multiraft-net` | `MultiRaft` API, O(nodes) links, generic FSM factory injection | Business type selection, command semantics, durable business metadata, business registry, or discriminator |
 | `multiraft-fsm` | Trait + demo `CounterFsm` | Depend on a matching engine FSM |
 | `multiraft-store` | Per-group persistence | Order book |
 | `multiraft-demo` | Acceptance / Jepsen target | Production deploy |
@@ -84,6 +84,29 @@ matching process / ingress shell (RMQ consumer, Leader only)
   → multiraft::MultiRaft (propose / leader callbacks)
     → FSM adapter → matching engine FSM
 ```
+
+### Generic FSM factory and lifecycle boundary
+
+`multiraft-net` owns the generic injection mechanics, not business type
+selection, business command semantics, durable business metadata, a business
+registry, or a discriminator. Applications provide `StateMachineFactory<S>`;
+each successful result from a factory invoked with `FsmFactoryContext` is a
+separately owned `S` for one local group. `CounterFsm` remains the demo/default
+path.
+
+The factory is synchronous, lightweight, and non-blocking. It must not perform
+network work, start irreversible side effects, or start background tasks.
+Factory construction is not exactly-once: calls may repeat after a factory or
+other pre-publication failure and after process restart, and calls for different
+`(node_id, group_id)` keys may be concurrent. Until separate lifecycle work
+lands, callers must serialize same-key `create_group` calls.
+
+There is no factory rollback callback. A factory error, or a pre-insertion
+FileLog/Raft construction failure after the factory returns, leaves the group
+unpublished; the returned FSM is dropped and must release its resources safely.
+After registry insertion, `try_initialize` can still return an error after the
+group has been published. This boundary does not define snapshot restore,
+business-store coordination, or any group-lifecycle fix.
 
 ## Standby async snapshot
 

@@ -115,6 +115,34 @@ STANDBY=1 ./scripts/run_jepsen.sh
 二期（下游应用）     → 可选 RMQ Leader propose → 可插拔撮合 FSM
 ```
 
+### 工厂注入 FSM
+
+下游应用可通过 `StateMachineFactory<S>` 构造自己的本地 FSM 类型。工厂收到的
+`FsmFactoryContext` 包含本地节点和 Group 的标识：
+
+```rust
+let runtime = MultiRaft::<MyFsm>::start_with_factory(config, |context| {
+    MyFsm::open(context.node_id(), context.group_id())
+}).await?;
+```
+
+`MyFsm::open` 返回 `anyhow::Result<MyFsm>`。工厂构造是同步、轻量且非阻塞的：
+应在启动前准备共享依赖，工厂中不得启动网络工作、不可逆副作用或后台任务。
+`CounterFsm` 仍是 Demo / 默认路径。
+
+公开的工厂构造器为 `MultiRaft::start_with_factory`、
+`MultiRaft::start_cluster_with_factory`、`MultiRaft::start_grpc_with_factory`
+和 `SharedFabric::start_node_with_factory`。
+
+每个成功结果都是一个本地 Group 单独拥有的 `S`。工厂创建并非 exactly-once：
+工厂或其他发布前构造失败后，以及进程重启后，都可能再次请求创建。不同
+`(node_id, group_id)` 键的调用可以并发；在 lifecycle 工作落地前，调用方必须
+串行化同一键的 `create_group` 调用。
+
+工厂没有回滚回调。若工厂构造、FileLog 打开或 Raft 构造在 registry 插入前失败，
+本地 Group 不会发布，已返回的 FSM 会被 drop，因此它必须安全释放自己的副作用。
+相反，`try_initialize` 在发布后运行，可能在本地 Group 已发布时返回错误。
+
 ---
 
 ## 文档（双语）
