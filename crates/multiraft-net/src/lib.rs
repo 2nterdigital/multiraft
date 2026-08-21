@@ -9,6 +9,7 @@
 
 mod api;
 mod conn_metrics;
+mod fsm_factory;
 mod grpc;
 mod multiraft;
 mod network;
@@ -18,6 +19,8 @@ mod snapshot_fetch;
 mod standby_throttle;
 
 pub use conn_metrics::ConnMetrics;
+pub use fsm_factory::FsmFactoryContext;
+pub use fsm_factory::StateMachineFactory;
 pub use grpc::GrpcRouter;
 pub use grpc::GrpcServer;
 pub use multiraft::MultiRaft;
