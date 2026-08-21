@@ -1,8 +1,11 @@
-use multiraft_core::ClusterConfig;
+use multiraft_core::{ClusterConfig, NodeRole, SnapshotMode};
 use multiraft_fsm::{ApplyOut, StateMachine};
 use multiraft_net::{FsmFactoryContext, MultiRaft, SharedFabric, StateMachineFactory};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -181,4 +184,125 @@ async fn start_cluster_with_factory_converges_without_sharing_fsm_values() {
     for node in &nodes {
         node.shutdown().await.expect("shutdown");
     }
+}
+
+#[tokio::test]
+async fn factory_is_not_called_before_member_or_config_validation() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = calls.clone();
+    let node = MultiRaft::start_with_factory(ClusterConfig::for_test(1, &[1]), move |_| {
+        called.fetch_add(1, Ordering::SeqCst);
+        Ok(ProbeFsm::new())
+    })
+    .await
+    .expect("start");
+    node.create_group(1, &[])
+        .await
+        .expect_err("invalid members");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    node.shutdown().await.expect("shutdown");
+
+    let mut invalid = ClusterConfig::for_test(1, &[1]);
+    invalid.election_timeout_min_ms = 600;
+    invalid.election_timeout_max_ms = 300;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = calls.clone();
+    let node = MultiRaft::start_with_factory(invalid, move |_| {
+        called.fetch_add(1, Ordering::SeqCst);
+        Ok(ProbeFsm::new())
+    })
+    .await
+    .expect("start");
+    node.create_group(2, &[1])
+        .await
+        .expect_err("invalid OpenRaft config");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    node.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn factory_error_is_contextual_leaves_group_unpublished_and_is_retryable() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let recorded = calls.clone();
+    let node = MultiRaft::start_with_factory(ClusterConfig::for_test(1, &[1]), move |_| {
+        let call = recorded.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            Err(anyhow::anyhow!("reject probe group"))
+        } else {
+            Ok(ProbeFsm::new())
+        }
+    })
+    .await
+    .expect("start");
+    let error = node
+        .create_group(8, &[1])
+        .await
+        .expect_err("factory rejects first call");
+    assert!(error
+        .to_string()
+        .contains("create FSM for node 1, group 8"));
+    assert_eq!(node.with_fsm(8, |_| ()).await, None);
+    node.create_group(8, &[1])
+        .await
+        .expect("serialized retry");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    node.shutdown().await.expect("shutdown");
+}
+
+struct DropProbeFsm {
+    inner: ProbeFsm,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for DropProbeFsm {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl StateMachine for DropProbeFsm {
+    type Error = std::io::Error;
+
+    fn apply(&mut self, group: u64, index: u64, data: &[u8]) -> Result<ApplyOut, Self::Error> {
+        self.inner.apply(group, index, data)
+    }
+
+    fn snapshot(&self, group: u64) -> Result<Vec<u8>, Self::Error> {
+        self.inner.snapshot(group)
+    }
+
+    fn restore(&mut self, group: u64, snapshot: &[u8]) -> Result<(), Self::Error> {
+        self.inner.restore(group, snapshot)
+    }
+}
+
+#[tokio::test]
+async fn file_log_open_failure_drops_factory_fsm_on_default_voter_path_and_keeps_group_unpublished() {
+    let temp = tempfile::tempdir().expect("temporary data dir");
+    let blocked = temp.path().join("group-7");
+    std::fs::write(&blocked, b"not a directory").expect("block FileLog directory");
+    let mut config = ClusterConfig::for_test(1, &[1]);
+    config.data_dir = temp.path().to_path_buf();
+    config.role = NodeRole::Voter;
+    config.snapshot_mode = SnapshotMode::Disabled;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let observed = drops.clone();
+    let node = MultiRaft::start_with_factory(config, move |_| {
+        Ok(DropProbeFsm {
+            inner: ProbeFsm::new(),
+            drops: observed.clone(),
+        })
+    })
+    .await
+    .expect("start");
+    node.create_group(7, &[1])
+        .await
+        .expect_err("FileLog open fails");
+    assert_eq!(node.with_fsm(7, |_| ()).await, None);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    std::fs::remove_file(blocked).expect("unblock FileLog directory");
+    node.create_group(7, &[1])
+        .await
+        .expect("serialized retry after FileLog failure");
+    node.shutdown().await.expect("shutdown");
 }

@@ -1237,10 +1237,13 @@ impl<S: StateMachine> MultiRaft<S> {
             node_id: self.node_id,
             group_id: group,
         };
-        let fsm = self
-            .fsm_factory
-            .create(context)
-            .map_err(MultiRaftError::Other)?;
+        let fsm = self.fsm_factory.create(context).map_err(|source| {
+            MultiRaftError::Other(source.context(format!(
+                "create FSM for node {}, group {}",
+                context.node_id(),
+                context.group_id(),
+            )))
+        })?;
         // StandbyOffload: never hot-dump FSM in openraft build_snapshot (voters or standby).
         let allow_hot_build = self.config.snapshot_mode != SnapshotMode::StandbyOffload;
 
