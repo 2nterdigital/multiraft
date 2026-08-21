@@ -186,6 +186,24 @@ impl SharedFabric {
             Arc::new(|_| Ok::<CounterFsm, anyhow::Error>(CounterFsm::new()));
         MultiRaft::start_inner(config, self.router.clone(), self.glue.clone(), factory).await
     }
+
+    async fn start_node_with_factory_arc<S: StateMachine>(
+        &self,
+        config: ClusterConfig,
+        factory: Arc<dyn StateMachineFactory<S>>,
+    ) -> anyhow::Result<MultiRaft<S>> {
+        MultiRaft::start_inner(config, self.router.clone(), self.glue.clone(), factory).await
+    }
+
+    /// Start one in-process node using the supplied state-machine factory.
+    pub async fn start_node_with_factory<S: StateMachine>(
+        &self,
+        config: ClusterConfig,
+        factory: impl StateMachineFactory<S>,
+    ) -> anyhow::Result<MultiRaft<S>> {
+        self.start_node_with_factory_arc(config, Arc::new(factory))
+            .await
+    }
 }
 
 enum NetBackend {
@@ -220,12 +238,10 @@ impl MultiRaft<CounterFsm> {
     /// `SocketAddr` peers in each config are unused; nodes are linked via the shared router.
     /// Internally uses [`SharedFabric`]; prefer that type when tests need node restart.
     pub async fn start_cluster(configs: Vec<ClusterConfig>) -> anyhow::Result<Vec<Self>> {
-        let fabric = SharedFabric::new();
-        let mut nodes = Vec::with_capacity(configs.len());
-        for config in configs {
-            nodes.push(fabric.start_node(config).await?);
-        }
-        Ok(nodes)
+        Self::start_cluster_with_factory(configs, |_| {
+            Ok::<CounterFsm, anyhow::Error>(CounterFsm::new())
+        })
+        .await
     }
 
     /// Start one node with cross-process tonic transport.
@@ -240,6 +256,24 @@ impl MultiRaft<CounterFsm> {
 }
 
 impl<S: StateMachine> MultiRaft<S> {
+    /// Start N nodes sharing one in-process router and state-machine factory.
+    pub async fn start_cluster_with_factory(
+        configs: Vec<ClusterConfig>,
+        factory: impl StateMachineFactory<S>,
+    ) -> anyhow::Result<Vec<Self>> {
+        let fabric = SharedFabric::new();
+        let factory: Arc<dyn StateMachineFactory<S>> = Arc::new(factory);
+        let mut nodes = Vec::with_capacity(configs.len());
+        for config in configs {
+            nodes.push(
+                fabric
+                    .start_node_with_factory_arc(config, factory.clone())
+                    .await?,
+            );
+        }
+        Ok(nodes)
+    }
+
     pub async fn start_with_factory(
         config: ClusterConfig,
         factory: impl StateMachineFactory<S>,
