@@ -249,9 +249,10 @@ impl MultiRaft<CounterFsm> {
     /// Binds a gRPC server on this node's address from `config.peers` and uses
     /// [`GrpcRouter`] for outbound Raft RPCs to other peers.
     pub async fn start_grpc(config: ClusterConfig) -> anyhow::Result<Self> {
-        let factory: Arc<dyn StateMachineFactory<CounterFsm>> =
-            Arc::new(|_| Ok::<CounterFsm, anyhow::Error>(CounterFsm::new()));
-        Self::start_grpc_inner(config, factory).await
+        Self::start_grpc_with_factory(config, |_| {
+            Ok::<CounterFsm, anyhow::Error>(CounterFsm::new())
+        })
+        .await
     }
 }
 
@@ -285,6 +286,14 @@ impl<S: StateMachine> MultiRaft<S> {
             Arc::new(factory),
         )
         .await
+    }
+
+    /// Start one node with cross-process tonic transport and a state-machine factory.
+    pub async fn start_grpc_with_factory(
+        config: ClusterConfig,
+        factory: impl StateMachineFactory<S>,
+    ) -> anyhow::Result<Self> {
+        Self::start_grpc_inner(config, Arc::new(factory)).await
     }
 
     async fn start_inner(
