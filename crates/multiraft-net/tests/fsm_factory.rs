@@ -1,5 +1,6 @@
+use multiraft_core::ClusterConfig;
 use multiraft_fsm::{ApplyOut, StateMachine};
-use multiraft_net::{FsmFactoryContext, StateMachineFactory};
+use multiraft_net::{FsmFactoryContext, MultiRaft, StateMachineFactory};
 
 #[derive(Default)]
 struct ProbeFsm {
@@ -55,4 +56,32 @@ fn closure_factory_is_public_and_receives_immutable_context() {
     };
     fn assert_factory<F: StateMachineFactory<ProbeFsm>>(_: &F) {}
     assert_factory(&factory);
+}
+
+#[tokio::test]
+async fn start_with_factory_closure_applies_probe_fsm() {
+    let config = ClusterConfig::for_test(1, &[1]);
+    let node = MultiRaft::start_with_factory(config, |_| Ok(ProbeFsm::new()))
+        .await
+        .expect("start custom fsm");
+    node.create_group(9, &[1])
+        .await
+        .expect("create first group");
+    node.create_group(10, &[1])
+        .await
+        .expect("create second group");
+    node.propose(9, ProbeFsm::encode_add(7))
+        .await
+        .expect("propose");
+    assert_eq!(node.with_fsm(9, ProbeFsm::value).await, Some(7));
+    assert_eq!(node.with_fsm(10, ProbeFsm::value).await, Some(0));
+    node.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn counter_constructors_remain_type_inferred() {
+    let single: MultiRaft = MultiRaft::start(ClusterConfig::for_test(1, &[1]))
+        .await
+        .expect("Counter start");
+    single.shutdown().await.expect("shutdown Counter node");
 }

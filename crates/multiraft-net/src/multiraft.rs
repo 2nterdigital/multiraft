@@ -37,6 +37,8 @@ use crate::node::Node;
 use crate::router::Router;
 use crate::snapshot_fetch::pull_snapshot_chunked;
 use crate::standby_throttle::StandbyThrottle;
+use crate::FsmFactoryContext;
+use crate::StateMachineFactory;
 use multiraft_core::ClusterConfig;
 use multiraft_core::GroupId;
 use multiraft_core::MultiRaftError;
@@ -180,10 +182,9 @@ impl SharedFabric {
     }
 
     pub async fn start_node(&self, config: ClusterConfig) -> anyhow::Result<MultiRaft> {
-        MultiRaft::start_inner(config, self.router.clone(), self.glue.clone(), |_| {
-            CounterFsm::new()
-        })
-        .await
+        let factory: Arc<dyn StateMachineFactory<CounterFsm>> =
+            Arc::new(|_| Ok::<CounterFsm, anyhow::Error>(CounterFsm::new()));
+        MultiRaft::start_inner(config, self.router.clone(), self.glue.clone(), factory).await
     }
 }
 
@@ -198,7 +199,7 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     config: ClusterConfig,
     net: NetBackend,
     groups: GroupMap<S>,
-    make_fsm: Arc<dyn Fn(GroupId) -> S + Send + Sync>,
+    fsm_factory: Arc<dyn StateMachineFactory<S>>,
     leader_cbs: Arc<Mutex<Vec<LeaderCb>>>,
     snapshot_rt: Arc<SnapshotRuntime>,
     /// Standby node ids for replication throttle (shared with Router / GrpcRouter).
@@ -208,8 +209,8 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
 impl MultiRaft<CounterFsm> {
     /// Start a single in-process node with a private [`Router`].
     pub async fn start(config: ClusterConfig) -> anyhow::Result<Self> {
-        Self::start_inner(config, Router::new(), ClusterGlue::default(), |_| {
-            CounterFsm::new()
+        Self::start_with_factory(config, |_| {
+            Ok::<CounterFsm, anyhow::Error>(CounterFsm::new())
         })
         .await
     }
@@ -232,20 +233,32 @@ impl MultiRaft<CounterFsm> {
     /// Binds a gRPC server on this node's address from `config.peers` and uses
     /// [`GrpcRouter`] for outbound Raft RPCs to other peers.
     pub async fn start_grpc(config: ClusterConfig) -> anyhow::Result<Self> {
-        Self::start_grpc_inner(config, |_| CounterFsm::new()).await
+        let factory: Arc<dyn StateMachineFactory<CounterFsm>> =
+            Arc::new(|_| Ok::<CounterFsm, anyhow::Error>(CounterFsm::new()));
+        Self::start_grpc_inner(config, factory).await
     }
 }
 
 impl<S: StateMachine> MultiRaft<S> {
-    async fn start_inner<F>(
+    pub async fn start_with_factory(
+        config: ClusterConfig,
+        factory: impl StateMachineFactory<S>,
+    ) -> anyhow::Result<Self> {
+        Self::start_inner(
+            config,
+            Router::new(),
+            ClusterGlue::default(),
+            Arc::new(factory),
+        )
+        .await
+    }
+
+    async fn start_inner(
         config: ClusterConfig,
         router: Router,
         glue: ClusterGlue,
-        make_fsm: F,
-    ) -> anyhow::Result<Self>
-    where
-        F: Fn(GroupId) -> S + Send + Sync + 'static,
-    {
+        factory: Arc<dyn StateMachineFactory<S>>,
+    ) -> anyhow::Result<Self> {
         let groups: GroupMap<S> = Arc::new(Mutex::new(BTreeMap::new()));
         let (node, _tx) = Node::with_groups(config.node_id, router.clone(), groups.clone());
         TypeConfig::spawn(node.run());
@@ -258,17 +271,17 @@ impl<S: StateMachine> MultiRaft<S> {
             config,
             net: NetBackend::InProcess { router, glue },
             groups,
-            make_fsm: Arc::new(make_fsm),
+            fsm_factory: factory,
             leader_cbs: Arc::new(Mutex::new(Vec::new())),
             snapshot_rt,
             standby_throttle,
         })
     }
 
-    async fn start_grpc_inner<F>(config: ClusterConfig, make_fsm: F) -> anyhow::Result<Self>
-    where
-        F: Fn(GroupId) -> S + Send + Sync + 'static,
-    {
+    async fn start_grpc_inner(
+        config: ClusterConfig,
+        factory: Arc<dyn StateMachineFactory<S>>,
+    ) -> anyhow::Result<Self> {
         let self_addr = config
             .peers
             .iter()
@@ -304,7 +317,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 router: grpc_router,
             },
             groups,
-            make_fsm: Arc::new(make_fsm),
+            fsm_factory: factory,
             leader_cbs: Arc::new(Mutex::new(Vec::new())),
             snapshot_rt,
             standby_throttle,
@@ -1186,7 +1199,14 @@ impl<S: StateMachine> MultiRaft<S> {
                 .map_err(|e| MultiRaftError::Other(anyhow::anyhow!(e.to_string())))?,
         );
 
-        let fsm = (self.make_fsm)(group);
+        let context = FsmFactoryContext {
+            node_id: self.node_id,
+            group_id: group,
+        };
+        let fsm = self
+            .fsm_factory
+            .create(context)
+            .map_err(MultiRaftError::Other)?;
         // StandbyOffload: never hot-dump FSM in openraft build_snapshot (voters or standby).
         let allow_hot_build = self.config.snapshot_mode != SnapshotMode::StandbyOffload;
 
