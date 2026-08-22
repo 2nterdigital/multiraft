@@ -2,7 +2,28 @@
 
 use thiserror::Error;
 
+use crate::GroupId;
 use crate::NodeId;
+
+/// Terminal outcome for a local group observation stream.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("group {group_id} observation is closed")]
+pub struct ObservationClosed {
+    group_id: GroupId,
+}
+
+impl ObservationClosed {
+    /// Create a terminal observation error for `group_id`.
+    pub const fn new(group_id: GroupId) -> Self {
+        Self { group_id }
+    }
+
+    /// The group whose local observation stream has ended.
+    pub const fn group_id(&self) -> GroupId {
+        self.group_id
+    }
+}
 
 /// Errors returned by MultiRaft propose / group APIs.
 #[derive(Debug, Error)]
@@ -18,6 +39,9 @@ pub enum MultiRaftError {
 
     #[error("live standby snapshot install is unsupported")]
     LiveSnapshotInstallUnsupported,
+
+    #[error(transparent)]
+    ObservationClosed(#[from] ObservationClosed),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -68,5 +92,22 @@ mod tests {
         };
         assert_eq!(sr.value, 42);
         let _ = format!("{sr:?}");
+    }
+
+    #[test]
+    fn observation_closed_is_typed_and_preserves_group() {
+        fn assert_error<E: std::error::Error>() {}
+
+        assert_error::<ObservationClosed>();
+
+        let closed = ObservationClosed::new(42);
+        assert_eq!(closed.group_id(), 42);
+        assert_eq!(closed.to_string(), "group 42 observation is closed");
+
+        let err: MultiRaftError = closed.into();
+        match err {
+            MultiRaftError::ObservationClosed(actual) => assert_eq!(actual, closed),
+            other => panic!("expected ObservationClosed, got {other:?}"),
+        }
     }
 }

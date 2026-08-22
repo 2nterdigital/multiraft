@@ -15,6 +15,7 @@ pub use config::FileLogSyncLevel;
 pub use config::NodeRole;
 pub use config::SnapshotMode;
 pub use error::MultiRaftError;
+pub use error::ObservationClosed;
 pub use error::ProposeOk;
 pub use error::StaleRead;
 pub use snapshot::is_standby_snapshot_trigger;

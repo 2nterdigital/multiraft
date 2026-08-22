@@ -32,6 +32,9 @@ use std::sync::atomic::AtomicUsize;
 #[cfg(test)]
 use std::sync::atomic::Ordering as AtomicOrdering;
 
+use crate::group_observation::initial_group_observation;
+use crate::group_observation::GroupObservation;
+use crate::group_observation::GroupObservationReceiver;
 use crate::grpc::GrpcRouter;
 use crate::grpc::GrpcServer;
 use crate::network::GrpcNetworkFactory;
@@ -710,6 +713,27 @@ impl<S: StateMachine> MultiRaft<S> {
                 .learner_ids()
                 .collect(),
         )
+    }
+
+    /// Observe this node's latest normalized control-plane state for a local Raft Group.
+    ///
+    /// The initial sample can become stale immediately and must not be treated as
+    /// permission to perform business reads or writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultiRaftError::UnknownGroup`] when this process has no local
+    /// instance for `group`. Returns [`MultiRaftError::ObservationClosed`] if the
+    /// initial server-metrics sample is already terminal.
+    pub fn observe_group(
+        &self,
+        group: GroupId,
+    ) -> Result<(GroupObservation, GroupObservationReceiver), MultiRaftError> {
+        let raft = self
+            .raft(group)
+            .ok_or(MultiRaftError::UnknownGroup(group))?;
+        let raw = raft.server_metrics();
+        initial_group_observation(group, raw).map_err(MultiRaftError::from)
     }
 
     /// Leader proposes the magic standby-snapshot trigger log entry.
@@ -1436,6 +1460,7 @@ mod tests {
     use axum::extract::State;
     use axum::routing::get;
     use axum::Router as AxumRouter;
+    use futures::FutureExt;
 
     struct UpstreamProbe {
         calls: Arc<AtomicUsize>,
@@ -1480,6 +1505,71 @@ mod tests {
         assert_eq!(probe.spawn_attempts.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(probe.ticks.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn group_observer_does_not_wake_on_data_progress() -> anyhow::Result<()> {
+        let peer_ids = [1u64, 2, 3];
+        let configs: Vec<_> = peer_ids
+            .iter()
+            .map(|&id| ClusterConfig::for_test(id, &peer_ids))
+            .collect();
+        let nodes = MultiRaft::start_cluster(configs).await?;
+        let group = 99;
+
+        for node in &nodes {
+            node.create_group(group, &peer_ids).await?;
+        }
+
+        let leader_id = wait_for_leader(&nodes, group, Duration::from_secs(10))
+            .await
+            .expect("leader elected");
+        let leader = nodes
+            .iter()
+            .find(|node| node.node_id() == leader_id)
+            .expect("leader handle");
+        let raft = leader.raft(group).expect("leader raft");
+        let mut raw_full_metrics = raft.metrics();
+        let _ = raw_full_metrics.borrow_and_update().clone();
+        let (_initial, mut observer) = leader.observe_group(group).expect("observe group");
+
+        let proposed = leader.propose(group, CounterFsm::encode_add(1, 1)).await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut last_applied = None;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "timed out waiting for raw full metrics last_applied >= {}; last observed {:?}",
+                    proposed.index, last_applied
+                );
+            }
+
+            match tokio::time::timeout(remaining, raw_full_metrics.changed()).await {
+                Ok(Ok(())) => {
+                    let metrics = {
+                        let borrowed = raw_full_metrics.borrow_and_update();
+                        borrowed.clone()
+                    };
+                    last_applied = metrics.last_applied.as_ref().map(|log_id| log_id.index());
+                    if last_applied >= Some(proposed.index) {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => panic!("raw full metrics closed before data progress"),
+                Err(_) => panic!(
+                    "timed out waiting for raw full metrics last_applied >= {}; last observed {:?}",
+                    proposed.index, last_applied
+                ),
+            }
+        }
+
+        assert!(
+            observer.changed().now_or_never().is_none(),
+            "server-metrics observer must not wake on data-only progress"
+        );
         Ok(())
     }
 }
