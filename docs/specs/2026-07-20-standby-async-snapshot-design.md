@@ -7,6 +7,8 @@
 **Related:** [ARCHITECTURE.md](../ARCHITECTURE.md) · openraft `=0.10.0-alpha.30`  
 **Premium gaps / roadmap:** [Aeron Standby parity](./2026-07-20-aeron-standby-parity-design.md)
 
+> **2026-08-22 containment note:** This is a historical design record; its live restore claims are not rewritten here. Factory 6677 deliberately designed Catalog -> `current_snapshot` -> OpenRaft and ad/HTTP -> direct install as `StandbyOffload`. That first contract is withdrawn for v1 because C42 and metadata do not prove complete ownership. `STANDBY=1` remains lab learner/catalog/checksum/ad generation; catalog is not a current provider, live HTTP/ad/catalog/daisy restoration is typed unsupported, and normal OpenRaft recovery remains. The prior precheck -> tail apply -> FSM-only restore -> divergence sequence is contained. A future restore protocol requires separately Accepted complete envelope, atomic capture, Vote/full `LogId`/membership, and `install_full_snapshot`.
+
 ---
 
 ## Goal

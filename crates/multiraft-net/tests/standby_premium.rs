@@ -11,7 +11,6 @@ use axum::routing::get;
 use axum::Router;
 use multiraft_core::ClusterConfig;
 use multiraft_core::NodeRole;
-use multiraft_core::RecoverOutcome;
 use multiraft_core::SnapshotAdvertisement;
 use multiraft_core::SnapshotMode;
 use multiraft_fsm::CounterFsm;
@@ -250,44 +249,38 @@ async fn auto_recover_via_http_from_standby_ads() {
         fetch_url: fetch_url.clone(),
     });
 
-    let outcome = restarted
+    let err = restarted
         .try_recover_from_standby_ads(group)
         .await
-        .expect("recover");
-    match outcome {
-        RecoverOutcome::Installed { last_index, .. } => {
-            assert_eq!(last_index, ad_index);
+        .expect_err("live ad recovery must be contained");
+    assert!(matches!(
+        err,
+        multiraft_core::MultiRaftError::LiveSnapshotInstallUnsupported
+    ));
+    let fetched = restarted
+        .fetch_snapshot_bytes(&fetch_url)
+        .await
+        .expect("fetch-only snapshot verification");
+    assert_eq!(fetched.last_index, ad_index);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let restored = restarted
+            .with_fsm(group, |fsm| fsm.value(group))
+            .await
+            .unwrap_or(0);
+        if restored >= expected {
+            break;
         }
-        RecoverOutcome::SkippedNotNewer { .. } => {
-            // Raft may have already caught up via log; still exercise direct HTTP pull.
-            restarted
-                .pull_and_install_snapshot(group, &fetch_url)
-                .await
-                .expect("direct pull");
-        }
-        other => panic!("expected Installed or SkippedNotNewer, got {other:?}"),
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native catch-up stalled at {restored}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-
-    let restored = restarted
-        .with_fsm(group, |fsm| fsm.value(group))
-        .await
-        .expect("fsm");
-    assert!(
-        restored >= expected,
-        "restored={restored} expected>={expected}"
-    );
-    // SM watermark must track durable install (not only Raft metrics).
-    let (idx, _) = restarted.local_applied(group).await.expect("applied");
-    assert!(idx >= ad_index, "sm applied={idx} ad={ad_index}");
-
-    let again = restarted
-        .try_recover_from_standby_ads(group)
-        .await
-        .expect("recover again");
-    assert!(
-        matches!(again, RecoverOutcome::SkippedNotNewer { .. }),
-        "second recover should skip, got {again:?}"
-    );
+    assert!(matches!(
+        restarted.try_recover_from_standby_ads(group).await,
+        Err(multiraft_core::MultiRaftError::LiveSnapshotInstallUnsupported)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

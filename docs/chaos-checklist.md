@@ -6,6 +6,8 @@
 
 **Legend:** ✅ Automated · 🔶 Script coverage · ⬜ TODO
 
+> **2026-08-22 containment:** C42 and the P0/P2 live restore path are historical and contained. The prior precheck -> tail apply -> FSM-only restore -> divergence sequence is not exercised as a v1 recovery contract; live HTTP/ad/catalog/daisy restoration must fail typed unsupported while normal OpenRaft recovery continues.
+
 ---
 
 ## 1. Process / node failures
@@ -48,12 +50,12 @@
 |----|----------|-------------|--------|----------------|
 | C40 | Kill Standby under load | Voters keep writing; Standby restart catches up | ✅ | `chaos_standby::kill_standby_voters_keep_writing` |
 | C41 | Kill Leader with Standby present | Survivors elect; values non-decreasing; Standby catches up + `read_stale` | ✅ | `kill_leader_with_standby_present` |
-| C42 | Wipe voter + recover from Standby ad | Under continued writes, `try_recover_from_standby_ads` then catch-up | ✅ | `voter_recover_from_standby_under_load` |
+| C42 | Historical: wipe voter + recover from Standby ad | Live restore is typed unsupported; normal OpenRaft recovery remains | Contained | Historical coverage |
 | C43 | Promote Standby then kill old voter | 4-voter quorum remains writable | ✅ | `promote_standby_then_kill_old_voter` |
-| C44 | Multi-process Standby kill/restart + kill leader + promote + recover | Values non-decreasing on voters; `--peer-nodes` includes Standby | ✅ | `scripts/chaos.sh` `SCENARIO=standby` |
+| C44 | Multi-process Standby kill/restart + kill leader + promote | Learner/membership behavior and normal recovery remain | ✅ | `scripts/chaos.sh` `SCENARIO=standby` |
 | C45 | Promote then demote under load | Back to 3-voter + learner; still writable; Standby catches up | ✅ | `promote_then_demote_under_load` |
 | C46 | Multi-group + Standby leader kill | All groups writable after kill; Standby catches each group | ✅ | `multi_group_standby_leader_kill` |
-| C47 | Corrupt snapshot ad | `FetchFailed`; wiped voter still catches up via log | ✅ | `bad_snapshot_ad_fails_closed_then_log_catchup` |
+| C47 | Corrupt snapshot ad | Live ad recovery is typed unsupported before ad/fetch effects; wiped voter catches up through normal OpenRaft recovery/log | ✅ | `bad_snapshot_ad_fails_closed_then_log_catchup` |
 | C48 | Throttled Standby kill under churn | Voters keep writing despite `standby_replicate_delay_ms`; Standby catch-up + stale | ✅ | `throttled_standby_kill_under_churn` |
 
 ## 5. Explicitly out of scope (this period)

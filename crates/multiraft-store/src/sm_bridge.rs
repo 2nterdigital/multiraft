@@ -19,14 +19,12 @@ use multiraft_core::TypeConfig;
 use multiraft_fsm::GroupId;
 use multiraft_fsm::StateMachine;
 use openraft::alias::DefaultEntryOf;
-use openraft::alias::LeaderIdOf;
 use openraft::alias::LogIdOf;
 use openraft::alias::SnapshotMetaOf;
 use openraft::alias::SnapshotOf;
 use openraft::alias::StoredMembershipOf;
 use openraft::storage::EntryResponder;
 use openraft::storage::RaftStateMachine;
-use openraft::vote::RaftLeaderIdExt;
 use openraft::EntryPayload;
 use openraft::OptionalSend;
 use openraft::RaftSnapshotBuilder;
@@ -51,8 +49,6 @@ pub struct StoredSnapshot {
     pub meta: SnapshotMetaOf<TypeConfig>,
     pub data: Vec<u8>,
 }
-
-type StateMachineSnapshot = SnapshotOf<TypeConfig, Cursor<Vec<u8>>>;
 
 #[derive(Debug)]
 struct StateMachineStoreInner<S: StateMachine> {
@@ -152,55 +148,13 @@ impl<S: StateMachine> StateMachineStore<S> {
 
     /// Last applied `(index, term)` from the SM store (source of truth for FSM watermark).
     ///
-    /// Prefer this over Raft metrics after out-of-band [`Self::install_durable_snapshot`].
+    /// This is an observation of the OpenRaft-applied FSM watermark.
     pub async fn last_applied(&self) -> Option<(u64, u64)> {
         let inner = self.inner.lock().await;
         inner
             .last_applied_log
             .as_ref()
             .map(|id| (id.index(), id.committed_leader_id().term))
-    }
-
-    /// Restore FSM + last_applied from durable snapshot bytes (recovery / pull).
-    ///
-    /// Preserves existing `last_membership` so an out-of-band install does not wipe
-    /// openraft membership metadata exposed via `get_current_snapshot`.
-    pub async fn install_durable_snapshot(
-        &self,
-        last_index: u64,
-        last_term: u64,
-        _membership_default: bool,
-        data: Vec<u8>,
-    ) -> Result<(), io::Error> {
-        let leader_id = LeaderIdOf::<TypeConfig>::new_committed(last_term, 0);
-        let log_id = LogIdOf::<TypeConfig>::new(leader_id, last_index);
-        let snapshot_id = format!("{last_index}-{last_term}");
-
-        let mut inner = self.inner.lock().await;
-        let group_id = inner.group_id;
-        // Keep prior membership; durable snapshot payloads are FSM-only.
-        let last_membership = inner.last_membership.clone();
-        let meta = SnapshotMetaOf::<TypeConfig> {
-            last_log_id: Some(log_id),
-            last_membership,
-            snapshot_id: snapshot_id.clone(),
-        };
-        inner
-            .fsm
-            .restore(group_id, &data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        inner.last_applied_log = meta.last_log_id;
-        // membership already preserved in meta / unchanged on inner
-        inner.current_snapshot = Some(StoredSnapshot {
-            meta: meta.clone(),
-            data: data.clone(),
-        });
-        drop(inner);
-
-        if let Some(catalog) = &self.catalog {
-            catalog.write(group_id, last_index, last_term, snapshot_id, &data)?;
-        }
-        Ok(())
     }
 
     /// Freeze FSM under a brief lock, then serialize/fsync on a blocking thread.
@@ -222,7 +176,7 @@ impl<S: StateMachine> StateMachineStore<S> {
 
         let catalog = catalog.clone();
         let snapshot_id = format!("{index}-{term}");
-        let data_for_write = data.clone();
+        let data_for_write = data;
         let entry = tokio::task::spawn_blocking(move || {
             if let Some(d) = serialize_delay {
                 std::thread::sleep(d);
@@ -232,46 +186,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         .await
         .map_err(|e| io::Error::other(format!("spawn_blocking: {e}")))??;
 
-        // Advertise locally via current_snapshot for openraft get_current_snapshot.
-        let leader_id = LeaderIdOf::<TypeConfig>::new_committed(term, 0);
-        let log_id = LogIdOf::<TypeConfig>::new(leader_id, index);
-        let meta = SnapshotMetaOf::<TypeConfig> {
-            last_log_id: Some(log_id),
-            last_membership: {
-                let inner = self.inner.lock().await;
-                inner.last_membership.clone()
-            },
-            snapshot_id: entry.snapshot_id.clone(),
-        };
-        {
-            let mut inner = self.inner.lock().await;
-            inner.current_snapshot = Some(StoredSnapshot { meta, data });
-        }
-
         Ok(entry)
-    }
-
-    fn snapshot_from_catalog(&self) -> Result<Option<StateMachineSnapshot>, io::Error> {
-        let Some(catalog) = &self.catalog else {
-            return Ok(None);
-        };
-        let Some(entry) = catalog.latest(self.group_id)? else {
-            return Ok(None);
-        };
-        let Some(data) = catalog.read(self.group_id, &entry.snapshot_id)? else {
-            return Ok(None);
-        };
-        let leader_id = LeaderIdOf::<TypeConfig>::new_committed(entry.last_term, 0);
-        let log_id = LogIdOf::<TypeConfig>::new(leader_id, entry.last_index);
-        let meta = SnapshotMetaOf::<TypeConfig> {
-            last_log_id: Some(log_id),
-            last_membership: StoredMembershipOf::<TypeConfig>::default(),
-            snapshot_id: entry.snapshot_id,
-        };
-        Ok(Some(SnapshotOf::<TypeConfig, Cursor<Vec<u8>>> {
-            meta,
-            snapshot: Cursor::new(data),
-        }))
     }
 }
 
@@ -301,7 +216,7 @@ where
         &mut self,
     ) -> Result<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>, io::Error> {
         if !self.allow_hot_build {
-            // StandbyOffload: never sync-dump FSM; serve installed / catalog only.
+            // StandbyOffload: never sync-dump FSM; serve only an OpenRaft snapshot.
             {
                 let inner = self.inner.lock().await;
                 if let Some(snapshot) = &inner.current_snapshot {
@@ -311,12 +226,9 @@ where
                     });
                 }
             }
-            if let Some(snap) = self.snapshot_from_catalog()? {
-                return Ok(snap);
-            }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "no catalog/installed snapshot available (StandbyOffload; hot build disabled)",
+                "no installed snapshot available (StandbyOffload; hot build disabled)",
             ));
         }
 
@@ -496,10 +408,7 @@ where
                     snapshot: Cursor::new(data),
                 }))
             }
-            None => {
-                drop(inner);
-                self.snapshot_from_catalog()
-            }
+            None => Ok(None),
         }
     }
 

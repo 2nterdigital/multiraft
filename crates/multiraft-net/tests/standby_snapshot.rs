@@ -170,22 +170,29 @@ async fn standby_async_snapshot_and_voter_recovery() {
         .expect("recreate group on voter1");
 
     let catalog = standby.snapshot_catalog().expect("standby catalog");
-    restarted
+    let err = restarted
         .try_install_from_standby_catalog(group, catalog.as_ref())
         .await
-        .expect("install from standby catalog");
-
-    let restored = restarted
-        .with_fsm(group, |fsm| fsm.value(group))
-        .await
-        .expect("fsm after install");
-    // Snapshot was taken at trigger time (before +10) or after — either is valid
-    // as long as restore succeeded and value is from a consistent freeze.
-    assert!(
-        restored >= expected - 10 && restored <= expected,
-        "restored={restored} expected_range=[{}..{expected}]",
-        expected - 10
-    );
+        .expect_err("live catalog install must be contained");
+    assert!(matches!(
+        err,
+        multiraft_core::MultiRaftError::LiveSnapshotInstallUnsupported
+    ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let restored = restarted
+            .with_fsm(group, |fsm| fsm.value(group))
+            .await
+            .expect("fsm after native catch-up");
+        if restored == expected {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native catch-up stalled at {restored}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     assert!(!standby.is_leader(group));
 }

@@ -7,6 +7,8 @@
 **关联：** [standby-async-snapshot](./2026-07-20-standby-async-snapshot-design.zh-CN.md) · [ARCHITECTURE.zh-CN.md](../ARCHITECTURE.zh-CN.md)  
 **上游参考：** [Aeron Cluster Standby (Premium)](https://aeron.io/premium-docs/aeron-cluster-standby/standby-overview.html)
 
+> **2026-08-22 containment 注记：** 本文是历史分阶段设计记录，不是当前 v1 交付声明。Factory 6677 的实时 `StandbyOffload` 契约（Catalog -> `current_snapshot` -> OpenRaft；ad/HTTP -> 直接安装）因 C42 与元数据没有证明完整恢复所有权而撤回。C42/P0/P2 实时恢复为历史且已 containment：`STANDBY=1` 限于 learner/catalog/checksum/ad 生成，catalog 不是 current provider，实时 HTTP/ad/catalog/daisy 恢复返回类型化 unsupported。保留正常 OpenRaft recovery；旧的 precheck -> tail apply -> 仅 FSM restore -> divergence 流程禁止使用。未来恢复需要单独 Accepted 的完整 envelope、原子捕获、Vote/完整 `LogId`/membership 和 `install_full_snapshot`。
+
 ---
 
 ## 0. 目的

@@ -49,9 +49,10 @@ STANDBY=1 ./scripts/run_demo_cluster.sh
 curl -s http://127.0.0.1:21100/admin/groups/0/status
 curl -s -X POST http://127.0.0.1:21100/admin/standby_snapshot/0
 curl -s http://127.0.0.1:21103/admin/catalog/0
-curl -s -X POST http://127.0.0.1:21100/admin/replicate_standby_snapshot/0
 curl -s http://127.0.0.1:21103/groups/0/stale
 ```
+
+这些是安全的实验室 learner/catalog/checksum/ad 生成命令。catalog 不是 current snapshot provider；实时 HTTP/ad/catalog/daisy 恢复返回类型化 unsupported，恢复仍使用正常 OpenRaft recovery。
 
 ## 验收 / Chaos / Jepsen
 

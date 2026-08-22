@@ -27,5 +27,6 @@
 ## 范围说明
 
 - Demo Admin HTTP 与 Raft gRPC 面向实验 / 本地集群 — 若脚本默认启用且暴露到不可信网络，视为范围内。
-- **Admin HTTP 无鉴权。** `/admin/*`（成员变更 promote/demote、snapshot ads、带任意 `fetch_url` 的 `replicate_standby_snapshot`）以及 `/snapshots/*/latest` 必须保持回环监听或置于已鉴权网关之后，勿端口转发到不可信网络。Snapshot SHA-256 只校验完整性，不代表拉取源可信。
+- **Admin HTTP 无鉴权。** `/admin/*`（成员变更 promote/demote、snapshot ads）以及 `/snapshots/*/latest` 必须保持回环监听或置于已鉴权网关之后。`replicate_standby_snapshot` 是历史且已 containment 的端点，在任何 `fetch_url` 或其他拉取效果前返回类型化 unsupported（HTTP 409）。勿将这些路由端口转发到不可信网络。Snapshot SHA-256 只校验完整性，不代表拉取源可信；未来任何重新启用 `replicate_standby_snapshot` 的改动都属安全敏感。
+- 2026-08-22 的 Standby containment 是 **P2 威胁边界修正**：C42 及其元数据没有证明完整的恢复所有权，因此实时 HTTP/ad/catalog/daisy 恢复为类型化 unsupported。在单独 Accepted 的完整恢复协议存在前，任何试图重新启用它的路由都应按安全敏感处理。
 - 依赖 CVE：优先提交升版 PR 并附简短风险说明（尊重 openraft 精确锁定，除非刻意升版）。

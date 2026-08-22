@@ -108,15 +108,21 @@ RMQ (per-symbol)
 
 ## Standby 异步快照
 
-可选 `SnapshotMode::StandbyOffload`：voter 在 `build_snapshot` 中不再同步 dump FSM。
-**Standby**（openraft Learner）应用魔术 trigger 日志，短暂 freeze FSM，再经
-`spawn_blocking` 写入 `{data_dir}/snapshots/` 持久 catalog。voter 恢复时按广告拉取。
+`SnapshotMode::StandbyOffload` 在 v1 已被 containment。`STANDBY=1` 仍可用于实验室
+learner/catalog/checksum/ad 生成，但 catalog 不是 current snapshot provider，实时
+HTTP/ad/catalog/daisy 恢复返回类型化 unsupported。正常 OpenRaft recovery 仍是权威路径。
+Factory 6677 曾有意设计 Catalog -> `current_snapshot` -> OpenRaft 与 ad/HTTP -> 直接安装；
+本 candidate 撤回该首个契约，因为 C42 和现有元数据未证明完整恢复所有权。
+
+被 containment 的历史流程为 precheck -> tail apply -> 仅 FSM restore -> divergence。
+未来恢复必须有单独 Accepted 的完整 envelope、原子捕获、Vote/完整 `LogId`/membership 与
+`install_full_snapshot`；本仓没有交付或排期该协议。
 
 详情：[specs/2026-07-20-standby-async-snapshot-design.zh-CN.md](./specs/2026-07-20-standby-async-snapshot-design.zh-CN.md)
 · [English](./specs/2026-07-20-standby-async-snapshot-design.md)。
 
-Premium 对等（从 ad HTTP 拉取、standby 复制限速、promote/demote、多 Standby 选最新 ad、
-经 `daisy_upstream_base` 的**快照 daisy-chain**、HTTP Range 分块续传、Standby `read_stale`）：
+learner 成员关系、限速、promote/demote 与 `read_stale` 仍与实时恢复分离。历史的
+HTTP/ad/catalog/daisy 恢复声明已 containment：
 [specs/2026-07-20-aeron-standby-parity-design.zh-CN.md](./specs/2026-07-20-aeron-standby-parity-design.zh-CN.md)
 · [English](./specs/2026-07-20-aeron-standby-parity-design.md)。
 

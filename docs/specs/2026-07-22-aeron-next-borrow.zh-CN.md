@@ -6,9 +6,9 @@
 **状态：** Backlog（未排期）  
 **约束：** openraft `=0.10.0-alpha.30`；**借思想，不借 Aeron 运行时** — 不做 Media Driver、SBE 编译器、完整 Archive 引擎、Consensus Module 替换。
 
-**已交付（勿再当缺口）：**
+**既有的非实时恢复能力（不得当作实时恢复验收）：**
 
-- Standby Premium 对等 P0–P3 — [aeron-standby-parity](./2026-07-20-aeron-standby-parity-design.zh-CN.md)
+- learner/成员关系、限速与 stale-read；历史 P0/P2 实时恢复已 containment — [aeron-standby-parity](./2026-07-20-aeron-standby-parity-design.zh-CN.md)
 - 热路径 M1–M3 — [aeron-inspired-hotpath](./2026-07-21-aeron-inspired-hotpath-design.zh-CN.md)
 - 与商业 Aeron 定位 — [compare/aeron-commercial](../compare/aeron-commercial.zh-CN.md)
 
@@ -97,7 +97,7 @@ Archive：按位点持久录制、回放与运维工具 — 不只是「最新�
 | **N3c** 恢复剧本 | 文档 | 冷启 / 换 voter / standby 升格：curl + 期望 `RecoverOutcome` |
 | **N3d** 加固 | 可选 | Range 续传已有部分；catalog GC / 保留策略 |
 
-建立在现有 SnapshotCatalog + HTTP Range + sha256 上 — 加深 **运维语义**，不造 recording 引擎。
+不得把 SnapshotCatalog + HTTP Range + sha256 作为实时恢复基础。未来运维协议须有单独 Accepted 的完整 metadata/Vote/membership、原子捕获、完整 `LogId` 与 `install_full_snapshot`；不得声称已交付被 containment 的路径。
 
 ### 成功标准
 
@@ -147,5 +147,5 @@ Media Driver · SBE 编译器 · 完整 Aeron Archive · Consensus Module 移植
 | [Aeron Cluster performance limits](https://aeron.io/docs/aeron-cluster/performance-limits/) | `W` 决定的顺序 RSM 上限 |
 | [Efficient business logic](https://aeron.io/docs/aeron-cluster/efficient-business-logic/) | 编码 / 校验 / apply 无阻塞 |
 | [热路径设计](./2026-07-21-aeron-inspired-hotpath-design.zh-CN.md) | M1–M3 已完成 |
-| [Standby 对等](./2026-07-20-aeron-standby-parity-design.zh-CN.md) | HA 语义已完成 |
+| [Standby 对等](./2026-07-20-aeron-standby-parity-design.zh-CN.md) | 历史映射；实时恢复仍为 containment |
 | [perf.zh-CN.md](../perf.zh-CN.md) | 墙钟上限与多 Group 说明 |

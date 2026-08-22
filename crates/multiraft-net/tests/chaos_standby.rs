@@ -15,7 +15,6 @@ use axum::routing::get;
 use axum::Router;
 use multiraft_core::ClusterConfig;
 use multiraft_core::NodeRole;
-use multiraft_core::RecoverOutcome;
 use multiraft_core::SnapshotAdvertisement;
 use multiraft_core::SnapshotMode;
 use multiraft_fsm::CounterFsm;
@@ -452,25 +451,19 @@ async fn voter_recover_from_standby_under_load() {
         .unwrap();
     voters[victim_idx].record_snapshot_ad(ad);
 
-    match voters[victim_idx]
+    let err = voters[victim_idx]
         .try_recover_from_standby_ads(group)
         .await
-        .unwrap()
-    {
-        RecoverOutcome::Installed { .. } | RecoverOutcome::SkippedNotNewer { .. } => {}
-        other => panic!("unexpected recover: {other:?}"),
-    }
-
-    let restored = voters[victim_idx]
-        .with_fsm(group, |fsm| fsm.value(group))
+        .expect_err("live ad recovery must be contained");
+    assert!(matches!(
+        err,
+        multiraft_core::MultiRaftError::LiveSnapshotInstallUnsupported
+    ));
+    let fetched = voters[victim_idx]
+        .fetch_snapshot_bytes(&format!("http://{addr}/snap"))
         .await
-        .unwrap_or(0);
-    assert!(
-        restored >= expected - 1,
-        "restored={restored} expected~={expected}"
-    );
-
-    // Catch up remaining log.
+        .expect("fetch-only standby snapshot");
+    assert_eq!(fetched.last_index, entry.last_index);
     wait_fsm_ge(
         &voters[victim_idx],
         group,
@@ -933,15 +926,14 @@ async fn bad_snapshot_ad_fails_closed_then_log_catchup() {
         fetch_url: format!("http://{addr}/snap"),
     });
 
-    match voters[victim_idx]
+    let err = voters[victim_idx]
         .try_recover_from_standby_ads(group)
         .await
-        .unwrap()
-    {
-        RecoverOutcome::FetchFailed { .. } => {}
-        other => panic!("expected FetchFailed, got {other:?}"),
-    }
-
+        .expect_err("live ad recovery must be contained");
+    assert!(matches!(
+        err,
+        multiraft_core::MultiRaftError::LiveSnapshotInstallUnsupported
+    ));
     // Log replication from survivors must still restore the FSM.
     wait_fsm_ge(
         &voters[victim_idx],

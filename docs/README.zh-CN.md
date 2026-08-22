@@ -4,6 +4,8 @@
 
 **multiraft** GitHub 仓库的自包含文档（导航不必依赖仓外链接）。下表每份文档均有英文 + 中文（`.zh-CN.md`）成对版本。
 
+> **2026-08-22 containment：** 历史 Standby P0/P2 实时恢复材料保留为历史。v1 支持 Disabled、正常 OpenRaft recovery、learner 与成员关系；`STANDBY=1` 的 catalog/checksum/ad 输出仅供实验室使用，不是恢复 provider。
+
 ## 从这里开始
 
 | Doc (EN) | 中文 | 读者 |
@@ -21,8 +23,8 @@
 | Spec (EN) | 中文 | 主题 |
 |-----------|------|------|
 | [2026-07-18-multiraft-design.md](./specs/2026-07-18-multiraft-design.md) | [2026-07-18-multiraft-design.zh-CN.md](./specs/2026-07-18-multiraft-design.zh-CN.md) | 撮合高可用薄 Multi-Raft |
-| [2026-07-20-standby-async-snapshot-design.md](./specs/2026-07-20-standby-async-snapshot-design.md) | [2026-07-20-standby-async-snapshot-design.zh-CN.md](./specs/2026-07-20-standby-async-snapshot-design.zh-CN.md) | Standby 异步快照（对齐 Aeron） |
-| [2026-07-20-aeron-standby-parity-design.md](./specs/2026-07-20-aeron-standby-parity-design.md) | [2026-07-20-aeron-standby-parity-design.zh-CN.md](./specs/2026-07-20-aeron-standby-parity-design.zh-CN.md) | Aeron Standby Premium 对等（P0–P3） |
+| [2026-07-20-standby-async-snapshot-design.md](./specs/2026-07-20-standby-async-snapshot-design.md) | [2026-07-20-standby-async-snapshot-design.zh-CN.md](./specs/2026-07-20-standby-async-snapshot-design.zh-CN.md) | 历史异步快照设计；实时恢复已 containment |
+| [2026-07-20-aeron-standby-parity-design.md](./specs/2026-07-20-aeron-standby-parity-design.md) | [2026-07-20-aeron-standby-parity-design.zh-CN.md](./specs/2026-07-20-aeron-standby-parity-design.zh-CN.md) | 历史 Standby P0–P3 映射；实时 P0/P2 恢复已 containment |
 | [2026-07-21-aeron-inspired-hotpath-design.md](./specs/2026-07-21-aeron-inspired-hotpath-design.md) | [2026-07-21-aeron-inspired-hotpath-design.zh-CN.md](./specs/2026-07-21-aeron-inspired-hotpath-design.zh-CN.md) | 热路径 + 设计理念（M1–M4） |
 | [2026-07-22-sync1-disk-pipeline-merge.md](./specs/2026-07-22-sync1-disk-pipeline-merge.md) | [2026-07-22-sync1-disk-pipeline-merge.zh-CN.md](./specs/2026-07-22-sync1-disk-pipeline-merge.zh-CN.md) | M4：深流水线 / sync=1 组提交 / 复制批与拐点 |
 | [2026-07-22-aeron-next-borrow.md](./specs/2026-07-22-aeron-next-borrow.md) | [2026-07-22-aeron-next-borrow.zh-CN.md](./specs/2026-07-22-aeron-next-borrow.zh-CN.md) | 下一阶段 Aeron 借鉴 backlog（N1–N3） |

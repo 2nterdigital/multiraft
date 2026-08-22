@@ -27,6 +27,11 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::atomic::Ordering as AtomicOrdering;
+
 use crate::grpc::GrpcRouter;
 use crate::grpc::GrpcServer;
 use crate::network::GrpcNetworkFactory;
@@ -72,8 +77,21 @@ use openraft::ChangeMembers;
 use openraft::Config;
 use openraft::ReadPolicy;
 
+#[cfg(test)]
+use tokio::sync::Notify;
+
 type LeaderCb = Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>;
 type SnapshotReadyCb = Arc<dyn Fn(SnapshotAdvertisement) + Send + Sync + 'static>;
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[derive(Clone, Default)]
+struct DaisySpawnProbe {
+    spawn_attempts: Arc<AtomicUsize>,
+    spawned: Arc<Notify>,
+    permit_first_tick: Arc<Notify>,
+    ticks: Arc<AtomicUsize>,
+}
 
 /// Shared snapshot catalog / ads for one MultiRaft node.
 struct SnapshotRuntime {
@@ -222,6 +240,8 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     snapshot_rt: Arc<SnapshotRuntime>,
     /// Standby node ids for replication throttle (shared with Router / GrpcRouter).
     standby_throttle: StandbyThrottle,
+    #[cfg(test)]
+    daisy_spawn_probe: Option<DaisySpawnProbe>,
 }
 
 impl MultiRaft<CounterFsm> {
@@ -327,6 +347,8 @@ impl<S: StateMachine> MultiRaft<S> {
             leader_cbs: Arc::new(Mutex::new(Vec::new())),
             snapshot_rt,
             standby_throttle,
+            #[cfg(test)]
+            daisy_spawn_probe: None,
         })
     }
 
@@ -373,6 +395,8 @@ impl<S: StateMachine> MultiRaft<S> {
             leader_cbs: Arc::new(Mutex::new(Vec::new())),
             snapshot_rt,
             standby_throttle,
+            #[cfg(test)]
+            daisy_spawn_probe: None,
         })
     }
 
@@ -481,18 +505,18 @@ impl<S: StateMachine> MultiRaft<S> {
             .max_by_key(|a| (a.last_term, a.last_index))
     }
 
-    /// HTTP GET `fetch_url` (chunked Range when possible), verify sha256, install into FSM.
+    /// Live Standby snapshot installation is contained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultiRaftError::LiveSnapshotInstallUnsupported`] before HTTP,
+    /// Raft, or FSM mutation.
     pub async fn pull_and_install_snapshot(
         &self,
-        group: u64,
-        fetch_url: &str,
+        _group: u64,
+        _fetch_url: &str,
     ) -> Result<(), MultiRaftError> {
-        let fetched = self
-            .fetch_snapshot_bytes(fetch_url)
-            .await
-            .map_err(MultiRaftError::Other)?;
-        self.install_durable_snapshot(group, fetched.last_index, fetched.last_term, fetched.data)
-            .await
+        Err(MultiRaftError::LiveSnapshotInstallUnsupported)
     }
 
     /// Fetch snapshot bytes via chunked Range download (resume temp under data_dir / temp).
@@ -509,177 +533,45 @@ impl<S: StateMachine> MultiRaft<S> {
         pull_snapshot_chunked(fetch_url, chunk, &temp_dir).await
     }
 
-    /// Pick the newest local snapshot ad for `group` and pull if newer than local applied.
+    /// Live Standby advertisement recovery is contained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultiRaftError::LiveSnapshotInstallUnsupported`] before reading
+    /// advertisements or performing network, Raft, or FSM effects.
+    #[allow(clippy::needless_return)]
     pub async fn try_recover_from_standby_ads(
         &self,
-        group: u64,
+        _group: u64,
     ) -> Result<RecoverOutcome, MultiRaftError> {
-        let Some(ad) = self.best_snapshot_ad(group) else {
-            return Ok(RecoverOutcome::SkippedNoAd);
-        };
-
-        let (local_index, local_term) = self.local_applied(group).await.unwrap_or((0, 0));
-        if !log_pos_newer(ad.last_term, ad.last_index, local_term, local_index) {
-            return Ok(RecoverOutcome::SkippedNotNewer {
-                local_index,
-                ad_index: ad.last_index,
-            });
-        }
-
-        match self.pull_and_install_snapshot(group, &ad.fetch_url).await {
-            Ok(()) => Ok(RecoverOutcome::Installed {
-                last_index: ad.last_index,
-                last_term: ad.last_term,
-            }),
-            Err(MultiRaftError::UnknownGroup(g)) => Err(MultiRaftError::UnknownGroup(g)),
-            Err(e) => Ok(RecoverOutcome::FetchFailed {
-                error: e.to_string(),
-            }),
-        }
+        return Err(MultiRaftError::LiveSnapshotInstallUnsupported);
     }
 
-    /// Pull latest snapshot from [`ClusterConfig::daisy_upstream_base`] into local
-    /// catalog + FSM, then refresh a local [`SnapshotAdvertisement`].
+    /// Live daisy snapshot synchronization is contained.
     ///
-    /// Skips install (and returns [`RecoverOutcome::SkippedNotNewer`]) when the
-    /// upstream snapshot is not strictly newer than the local SM applied watermark.
+    /// # Errors
+    ///
+    /// Returns [`MultiRaftError::LiveSnapshotInstallUnsupported`] before reading
+    /// daisy configuration or contacting an upstream.
+    #[allow(clippy::needless_return)]
     pub async fn sync_from_daisy_upstream(
         &self,
-        group: u64,
+        _group: u64,
     ) -> Result<RecoverOutcome, MultiRaftError> {
-        let base = self.config.daisy_upstream_base.as_ref().ok_or_else(|| {
-            MultiRaftError::Other(anyhow::anyhow!(
-                "sync_from_daisy_upstream: daisy_upstream_base not set"
-            ))
-        })?;
-        let url = format!("{}/snapshots/{group}/latest", base.trim_end_matches('/'));
-
-        let fetched = match self.fetch_snapshot_bytes(&url).await {
-            Ok(f) => f,
-            Err(e) => {
-                return Ok(RecoverOutcome::FetchFailed {
-                    error: e.to_string(),
-                })
-            }
-        };
-
-        let (local_index, local_term) = self.local_applied(group).await.unwrap_or((0, 0));
-        if !log_pos_newer(
-            fetched.last_term,
-            fetched.last_index,
-            local_term,
-            local_index,
-        ) {
-            return Ok(RecoverOutcome::SkippedNotNewer {
-                local_index,
-                ad_index: fetched.last_index,
-            });
-        }
-
-        let snapshot_id = fetched
-            .snapshot_id
-            .clone()
-            .unwrap_or_else(|| format!("{}-{}", fetched.last_index, fetched.last_term));
-
-        if let Some(catalog) = self.snapshot_rt.catalog.as_ref() {
-            catalog
-                .write(
-                    group,
-                    fetched.last_index,
-                    fetched.last_term,
-                    &snapshot_id,
-                    &fetched.data,
-                )
-                .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("daisy catalog write: {e}")))?;
-        } else {
-            return Err(MultiRaftError::Other(anyhow::anyhow!(
-                "sync_from_daisy_upstream: SnapshotCatalog required (StandbyOffload + data_dir)"
-            )));
-        }
-
-        if self.raft(group).is_some() {
-            self.install_durable_snapshot(
-                group,
-                fetched.last_index,
-                fetched.last_term,
-                fetched.data.clone(),
-            )
-            .await?;
-        }
-
-        let fetch_url = self
-            .snapshot_rt
-            .admin_advertise_addr
-            .map(|addr| format!("http://{addr}/snapshots/{group}/latest"))
-            .unwrap_or_default();
-        let ad = SnapshotAdvertisement {
-            group,
-            last_index: fetched.last_index,
-            last_term: fetched.last_term,
-            snapshot_id,
-            size: fetched.data.len() as u64,
-            sha256_hex: fetched.sha256_hex,
-            fetch_url,
-        };
-        self.record_snapshot_ad(ad);
-
-        Ok(RecoverOutcome::Installed {
-            last_index: fetched.last_index,
-            last_term: fetched.last_term,
-        })
+        return Err(MultiRaftError::LiveSnapshotInstallUnsupported);
     }
 
-    /// Background loop: when `daisy_upstream_base` is set, periodically
-    /// [`Self::sync_from_daisy_upstream`] for each group (interval from config).
-    pub fn spawn_daisy_sync_loop(&self, groups: Vec<u64>) {
-        let Some(base) = self.config.daisy_upstream_base.clone() else {
-            tracing::debug!("spawn_daisy_sync_loop: daisy_upstream_base unset, skip");
-            return;
-        };
-        let interval = Duration::from_millis(self.config.daisy_sync_interval_ms.max(1));
-        let chunk = self.config.snapshot_fetch_chunk_bytes.max(1);
-        let temp_dir = if self.config.data_dir.as_os_str().is_empty() {
-            std::env::temp_dir().join("multiraft-snap-fetch")
-        } else {
-            self.config.data_dir.join("snap-fetch-tmp")
-        };
-        let snapshot_rt = self.snapshot_rt.clone();
-        let groups_map = self.groups.clone();
-        let admin = self.snapshot_rt.admin_advertise_addr;
+    /// Live daisy background synchronization is contained.
+    ///
+    /// Returns [`MultiRaftError::LiveSnapshotInstallUnsupported`] before reading
+    /// configuration or creating a task.
+    pub fn spawn_daisy_sync_loop(&self, _groups: Vec<u64>) -> Result<(), MultiRaftError> {
+        Err(MultiRaftError::LiveSnapshotInstallUnsupported)
+    }
 
-        TypeConfig::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                for &group in &groups {
-                    match daisy_sync_once(
-                        &base,
-                        group,
-                        chunk,
-                        &temp_dir,
-                        &snapshot_rt,
-                        &groups_map,
-                        admin,
-                    )
-                    .await
-                    {
-                        Ok(RecoverOutcome::Installed { last_index, .. }) => {
-                            tracing::info!(
-                                group,
-                                last_index,
-                                "daisy sync installed snapshot from upstream"
-                            );
-                        }
-                        Ok(other) => {
-                            tracing::debug!(group, ?other, "daisy sync outcome");
-                        }
-                        Err(e) => {
-                            tracing::warn!(group, error = %e, "daisy sync failed");
-                        }
-                    }
-                }
-            }
-        });
+    #[cfg(test)]
+    fn set_daisy_spawn_probe_for_test(&mut self, probe: DaisySpawnProbe) {
+        self.daisy_spawn_probe = Some(probe);
     }
 
     /// Leader-only: promote a Standby learner to voter (`change_membership` AddVoterIds).
@@ -863,44 +755,36 @@ impl<S: StateMachine> MultiRaft<S> {
             .flatten()
     }
 
-    /// Install durable snapshot bytes into the local state machine (recovery).
+    /// Direct durable snapshot installation is contained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultiRaftError::LiveSnapshotInstallUnsupported`] before Raft or
+    /// FSM effects.
+    #[allow(clippy::needless_return)]
     pub async fn install_durable_snapshot(
         &self,
-        group: GroupId,
-        last_index: u64,
-        last_term: u64,
-        data: Vec<u8>,
+        _group: GroupId,
+        _last_index: u64,
+        _last_term: u64,
+        _data: Vec<u8>,
     ) -> Result<(), MultiRaftError> {
-        let sm = self
-            .groups
-            .lock()
-            .unwrap()
-            .get(&group)
-            .map(|g| g.state_machine.clone())
-            .ok_or(MultiRaftError::UnknownGroup(group))?;
-        sm.install_durable_snapshot(last_index, last_term, true, data)
-            .await
-            .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("install_durable_snapshot: {e}")))
+        return Err(MultiRaftError::LiveSnapshotInstallUnsupported);
     }
 
-    /// Pull snapshot bytes from a Standby's catalog (in-process helper) and install.
+    /// Standby catalog installation is contained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultiRaftError::LiveSnapshotInstallUnsupported`] before reading
+    /// the catalog or mutating Raft/FSM state.
+    #[allow(clippy::needless_return)]
     pub async fn try_install_from_standby_catalog(
         &self,
-        group: GroupId,
-        standby_catalog: &SnapshotCatalog,
+        _group: GroupId,
+        _standby_catalog: &SnapshotCatalog,
     ) -> Result<(), MultiRaftError> {
-        let entry = standby_catalog
-            .latest(group)
-            .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("catalog latest: {e}")))?
-            .ok_or_else(|| {
-                MultiRaftError::Other(anyhow::anyhow!("no snapshot in standby catalog"))
-            })?;
-        let data = standby_catalog
-            .read(group, &entry.snapshot_id)
-            .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("catalog read: {e}")))?
-            .ok_or_else(|| MultiRaftError::Other(anyhow::anyhow!("snapshot data missing")))?;
-        self.install_durable_snapshot(group, entry.last_index, entry.last_term, data)
-            .await
+        return Err(MultiRaftError::LiveSnapshotInstallUnsupported);
     }
 
     async fn try_initialize(
@@ -1513,94 +1397,6 @@ pub async fn wait_for_leader(
     None
 }
 
-async fn daisy_sync_once<S: StateMachine>(
-    base: &str,
-    group: GroupId,
-    chunk: usize,
-    temp_dir: &std::path::Path,
-    snapshot_rt: &SnapshotRuntime,
-    groups: &GroupMap<S>,
-    admin: Option<std::net::SocketAddr>,
-) -> Result<RecoverOutcome, MultiRaftError> {
-    let url = format!("{}/snapshots/{group}/latest", base.trim_end_matches('/'));
-    let fetched = match pull_snapshot_chunked(&url, chunk, temp_dir).await {
-        Ok(f) => f,
-        Err(e) => {
-            return Ok(RecoverOutcome::FetchFailed {
-                error: e.to_string(),
-            })
-        }
-    };
-
-    let sm = groups
-        .lock()
-        .unwrap()
-        .get(&group)
-        .map(|g| g.state_machine.clone());
-    let (local_index, local_term) = match &sm {
-        Some(sm) => sm.last_applied().await.unwrap_or((0, 0)),
-        None => (0, 0),
-    };
-    if !log_pos_newer(
-        fetched.last_term,
-        fetched.last_index,
-        local_term,
-        local_index,
-    ) {
-        return Ok(RecoverOutcome::SkippedNotNewer {
-            local_index,
-            ad_index: fetched.last_index,
-        });
-    }
-
-    let snapshot_id = fetched
-        .snapshot_id
-        .clone()
-        .unwrap_or_else(|| format!("{}-{}", fetched.last_index, fetched.last_term));
-    let catalog = snapshot_rt.catalog.as_ref().ok_or_else(|| {
-        MultiRaftError::Other(anyhow::anyhow!(
-            "daisy sync: SnapshotCatalog required (StandbyOffload + data_dir)"
-        ))
-    })?;
-    catalog
-        .write(
-            group,
-            fetched.last_index,
-            fetched.last_term,
-            &snapshot_id,
-            &fetched.data,
-        )
-        .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("daisy catalog write: {e}")))?;
-
-    if let Some(sm) = sm {
-        sm.install_durable_snapshot(
-            fetched.last_index,
-            fetched.last_term,
-            true,
-            fetched.data.clone(),
-        )
-        .await
-        .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("daisy install: {e}")))?;
-    }
-
-    let fetch_url = admin
-        .map(|addr| format!("http://{addr}/snapshots/{group}/latest"))
-        .unwrap_or_default();
-    snapshot_rt.record_ad(SnapshotAdvertisement {
-        group,
-        last_index: fetched.last_index,
-        last_term: fetched.last_term,
-        snapshot_id,
-        size: fetched.data.len() as u64,
-        sha256_hex: fetched.sha256_hex,
-        fetch_url,
-    });
-    Ok(RecoverOutcome::Installed {
-        last_index: fetched.last_index,
-        last_term: fetched.last_term,
-    })
-}
-
 const MEMBERSHIP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const MEMBERSHIP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -1634,7 +1430,56 @@ where
     }
 }
 
-/// True when `(remote_term, remote_index)` is strictly newer than local.
-fn log_pos_newer(remote_term: u64, remote_index: u64, local_term: u64, local_index: u64) -> bool {
-    (remote_term, remote_index) > (local_term, local_index)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::routing::get;
+    use axum::Router as AxumRouter;
+
+    struct UpstreamProbe {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<Notify>,
+    }
+
+    async fn counting_upstream(State(probe): State<Arc<UpstreamProbe>>) -> axum::http::StatusCode {
+        probe.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        probe.entered.notify_one();
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    #[tokio::test]
+    async fn background_daisy_is_rejected_before_task_creation() -> anyhow::Result<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let upstream_entered = Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let app = AxumRouter::new()
+            .route("/snapshots/0/latest", get(counting_upstream))
+            .with_state(Arc::new(UpstreamProbe {
+                calls: calls.clone(),
+                entered: upstream_entered.clone(),
+            }));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut config = ClusterConfig::for_test(1, &[1]);
+        config.daisy_upstream_base = Some(format!("http://{address}"));
+        config.daisy_sync_interval_ms = 1;
+        let mut node = MultiRaft::start(config).await?;
+        let probe = DaisySpawnProbe::default();
+        node.set_daisy_spawn_probe_for_test(probe.clone());
+        let result: Result<(), MultiRaftError> = node.spawn_daisy_sync_loop(vec![0]);
+        server.abort();
+        node.shutdown().await?;
+        assert!(matches!(
+            result,
+            Err(MultiRaftError::LiveSnapshotInstallUnsupported)
+        ));
+        assert_eq!(probe.spawn_attempts.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(probe.ticks.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        Ok(())
+    }
 }

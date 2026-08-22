@@ -17,13 +17,13 @@
 - `MultiRaft`：`propose` / `propose_batch` / `read_linearizable` / 领导权回调
 - 每 Group 文件持久化（可重启恢复）；sync 档位 **0/1/2**（与 Aeron 对齐）
 - Aeron 启发式热路径：类型化进程内 RPC、流水线 propose、合并 / 流式落盘
-- 类 Standby Premium HA：learner standby、快照卸载、promote/demote、daisy 链、stale 读
+- Standby learner 与成员变更，以及仅实验室使用的 snapshot catalog/checksum/ad 生成；实时 Standby 恢复已禁用
 - 多进程 gRPC Demo + Admin HTTP（验收 / Jepsen）
 - acceptance、chaos、porcupine、本地 Jepsen
 
 ### 与 Aeron Cluster / Standby Premium
 
-multiraft **不是** Aeron 的 fork。在 openraft（Apache 2.0 / Rust）上追求撮合 HA **语义对齐**，并借鉴 Aeron 热路径思路 —— 不做 Media Driver、SBE 或商业 Cluster。
+multiraft **不是** Aeron 的 fork。它是基于 openraft（Apache 2.0 / Rust）并借鉴 Aeron 热路径思路的 Multi-Raft 库，不做 Media Driver、SBE 或商业 Cluster。
 
 - **本机实测（3 voter、进程内）：** mem 墙钟 **~300k+** TPS；file sync=0 深流水线 **~117k–187k**；顺序 file **~2k**；sync=1 顺序 **~25 TPS**，深流水线 + 大 pe **~15–25万**（见 [技术亮点](docs/spotlight/2026-07-hotpath-sync1.zh-CN.md) / [M4](docs/specs/2026-07-22-sync1-disk-pipeline-merge.zh-CN.md)）。
 - **选 multiraft** 做嵌入式 Rust/openraft 撮合 HA；**选 Aeron 商业版** 要 Media Driver、完整 Archive、ClusteredService 与 Real Logic 支持。
@@ -76,11 +76,10 @@ STANDBY=1 ./scripts/run_demo_cluster.sh
 curl -s http://127.0.0.1:21100/admin/groups/0/status
 curl -s -X POST http://127.0.0.1:21100/admin/standby_snapshot/0
 curl -s http://127.0.0.1:21103/admin/catalog/0
-curl -s -X POST http://127.0.0.1:21100/admin/replicate_standby_snapshot/0
 curl -s http://127.0.0.1:21103/groups/0/stale
 ```
 
-Voter 重启时若本地已有更新的 snapshot ad，会自动调用 `try_recover_from_standby_ads`。
+该实验流程只覆盖 learner 成员关系和 catalog/checksum/ad 生成。catalog 不是 current snapshot provider；实时 HTTP/ad/catalog/daisy 恢复端点返回类型化 unsupported。Voter 恢复仍使用正常 OpenRaft recovery。被撤回的 `StandbyOffload` 恢复路径曾采用 precheck -> tail apply -> 仅 FSM restore -> divergence，因此不是 v1 契约。未来实时恢复须有单独 Accepted 的完整 envelope、原子捕获、Vote/完整 `LogId`/membership 和 `install_full_snapshot`。
 
 ### 一致性（每 Group）
 

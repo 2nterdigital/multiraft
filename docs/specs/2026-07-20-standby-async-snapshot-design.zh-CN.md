@@ -7,6 +7,8 @@
 **相关：** [ARCHITECTURE.zh-CN.md](../ARCHITECTURE.zh-CN.md) · openraft `=0.10.0-alpha.30`  
 **商业版差距 / 路线图：** [Aeron Standby 对标](./2026-07-20-aeron-standby-parity-design.zh-CN.md)
 
+> **2026-08-22 containment 注记：** 本文是历史设计记录，保留原有实时恢复声明而不改写历史。Factory 6677 曾有意设计 Catalog -> `current_snapshot` -> OpenRaft 与 ad/HTTP -> 直接安装的 `StandbyOffload`。由于 C42 与元数据未证明完整所有权，v1 撤回该首个契约。`STANDBY=1` 仍为实验室 learner/catalog/checksum/ad 生成；catalog 不是 current provider，实时 HTTP/ad/catalog/daisy 恢复返回类型化 unsupported，正常 OpenRaft recovery 继续有效。先前 precheck -> tail apply -> 仅 FSM restore -> divergence 的序列已 containment。未来恢复协议须有单独 Accepted 的完整 envelope、原子捕获、Vote/完整 `LogId`/membership 和 `install_full_snapshot`。
+
 ---
 
 ## 目标

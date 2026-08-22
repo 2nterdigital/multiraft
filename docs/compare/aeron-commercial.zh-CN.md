@@ -8,7 +8,9 @@
 
 ## 定位
 
-**multiraft 不是 Aeron 的分支或 fork。** 它不嵌入 Aeron Media Driver、Consensus Module 或 Archive，而是在钉死的 **[openraft](https://github.com/databendlabs/openraft) `=0.10.0-alpha.30`** + `openraft-multi` 之上，追求撮合 HA 的**语义对齐**：热备、快照卸载、升降级，以及 **Aeron 启发的热路径**。
+**multiraft 不是 Aeron 的分支或 fork。** 它不嵌入 Aeron Media Driver、Consensus Module 或 Archive，而是构建在钉死的 **[openraft](https://github.com/databendlabs/openraft) `=0.10.0-alpha.30`** + `openraft-multi` 之上的 **Aeron 启发式热路径**。
+
+> **2026-08-22 containment：** `STANDBY=1` 是实验室 learner/catalog/checksum/ad 生成流程。catalog 不是 current snapshot provider；实时 HTTP/ad/catalog/daisy 恢复返回类型化 unsupported，正常 OpenRaft recovery 继续有效。历史 Factory 6677 `StandbyOffload` 恢复契约因 C42 及其元数据未证明完整所有权而被撤回。未来协议需要单独 Accepted 的完整 metadata、原子捕获、Vote/完整 `LogId`/membership 与 `install_full_snapshot`。
 
 | | multiraft | Aeron Cluster / Standby Premium |
 |---|-----------|----------------------------------|
@@ -28,18 +30,18 @@
 
 | 领域 | multiraft 对应实现 | 说明 |
 |------|-------------------|------|
-| **Standby 卸载** | openraft **Learner**（`add_standby`）；异步快照不阻塞 voter | `StandbyOffload` + `trigger_standby_snapshot` |
+| **Standby 实验室范围** | openraft **Learner**（`add_standby`）；catalog/checksum/ad 生成不阻塞 voter | 实时 `StandbyOffload` 恢复已 containment |
 | **Standby 不反压 leader** | `standby_max_inflight`、`standby_replicate_delay_ms` 对 standby 节流 | 近似「standby 不得对主集群日志施加反压」 |
-| **快照恢复** | `SnapshotAdvertisement`、`try_recover_from_standby_ads`、HTTP `fetch_url` 拉取 | 分块 Range + sha256 校验 |
+| **快照恢复** | 正常 OpenRaft recovery；实时 ad/HTTP/catalog 恢复为类型化 unsupported | 未来完整协议需要 Accepted envelope 与 `install_full_snapshot` |
 | **Promote / demote** | `promote_standby`、`demote_to_standby`（`change_membership`） | 暖 DR / TransitionModule 类比（需运维触发） |
-| **Daisy 快照链** | `daisy_upstream_base`、`sync_from_daisy_upstream` | **仅快照** daisy，非完整 log 重定向 |
+| **Daisy 快照链** | 实时 daisy 恢复为类型化 unsupported | 历史声明已 containment；不是 v1 recovery 契约 |
 | **Stale 读** | `read_stale`、`enable_stale_queries` | 显式水位；非线性一致 |
 | **类型化进程内 RPC** | `RaftCall` / `RaftReply` 走 `mpsc`，同进程无 bincode | 跨进程 gRPC 仍用 bincode |
 | **`propose_batch` 流水线** | 每条 payload 独立 Raft entry；`join_all` 并行发起 | 抬墙钟 TPS，非巨型 entry |
 | **文件 sync 档位 0 / 1 / 2** | `FileLogSyncLevel::{Os, Data, All}` ↔ Aeron `file.sync.level` | 见下文耐久表 |
 | **Stream 选项** | `FileLogStreamOptions`：`stream_buf_bytes`、`stream_flush_ms` | sync=0 下缓冲顺序 append |
 
-Standby 建模为 openraft Learner，而非第二套共识。Archive 语义用**持久 SnapshotCatalog + HTTP/gRPC 拉取**近似，非完整 Aeron Archive。
+Standby 建模为 openraft Learner，而非第二套共识。catalog 记录实验室产物；它不是 v1 实时恢复的 snapshot provider 或 Archive 近似。
 
 ---
 
@@ -121,8 +123,8 @@ Demo：`--bench-file-sync-level 0|1|2`。
 ### 选 multiraft 当
 
 - 撮合 / 交易栈是 **Rust**，且已确定 **openraft** Multi-Raft。
-- 需要 **Standby Premium 类 HA**（learner standby、快照卸载、promote、快照 daisy、stale 读），**不要** JVM/C++ Aeron 依赖。
-- 可接受 **HTTP 快照拉取** 替代完整 Archive，以及**运维触发**的 promote/demote。
+- 需要 learner standby、复制节流、**运维触发**的 promote/demote 与 stale 读，且不要 JVM/C++ Aeron 依赖。
+- 可接受仅实验室使用的 catalog/checksum/ad 生成和正常 OpenRaft recovery；实时 HTTP/ad/catalog/daisy 恢复返回类型化 unsupported。
 - 需要 **Apache 2.0** 源码、chaos/Jepsen 钩子、可嵌入的薄库——而非 clustered-service 容器。
 - 吞吐目标符合**流水线 propose**（mem 墙钟 100k+；file sync=0 深流水线 100k+），或可接受 **~2k 顺序 file** / **fsync 下 ~25 TPS**。
 
@@ -154,4 +156,4 @@ multiraft 优化的是 **openraft 热路径**（类型化进程内 RPC、流水�
 
 ## 小结
 
-multiraft 提供**开源、Rust 原生撮合 HA**：与 Aeron Standby Premium **语义对齐**（standby、快照、promote、daisy、stale 读），并采用 Aeron Cluster 的**机械共情模式**（类型化热路径、流水线 propose、分级耐久）——**基于 openraft**，无 Media Driver 与商业 Cluster。嵌入 Rust Multi-Raft 选 multiraft；要完整 Real Logic 平台选 Aeron 商业版。
+multiraft 提供**开源、Rust 原生撮合 HA**：具备 learner/成员关系操作、stale 读，并采用 Aeron Cluster 的**机械共情模式**（类型化热路径、流水线 propose、分级耐久）——**基于 openraft**，无 Media Driver 与商业 Cluster。其实时 StandbyOffload 恢复能力已 containment：catalog 产物不是 current provider，HTTP/ad/catalog/daisy 恢复返回类型化 unsupported，恢复仍使用正常 OpenRaft recovery。嵌入 Rust Multi-Raft 选 multiraft；要完整 Real Logic 平台选 Aeron 商业版。

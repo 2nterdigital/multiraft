@@ -15,6 +15,12 @@ GROUPS="${GROUPS:-10}"
 NODES="${NODES:-3}"
 DATA="${ACCEPTANCE_DATA:-$ROOT/.acceptance-data}"
 WORKDIR=""
+STANDBY="${STANDBY:-0}"
+DAISY="${DAISY:-0}"
+if [[ "$DAISY" == "1" || "$STANDBY" == "2" ]]; then
+  printf '%s\n' 'daisy/live standby restore is unsupported in this candidate' >&2
+  exit 2
+fi
 
 log() { printf '[acceptance] %s\n' "$*"; }
 fail() { printf '[acceptance] FAIL: %s\n' "$*" >&2; exit 1; }
@@ -199,6 +205,48 @@ print("" if d.get("leader") is None else str(d["leader"]))
   return 1
 }
 
+find_group_floor() {
+  group="$1"; floor_file="$WORKDIR/floor-${group}.txt"; floor_node_file="$WORKDIR/floor-node-${group}.txt"
+  deadline=$((SECONDS + 45))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    node=1
+    while [ "$node" -le "$NODES" ]; do
+      if [ "$node" = "$restarted_voter" ]; then node=$((node + 1)); continue; fi
+      json_file="$WORKDIR/survivor-${group}-${node}.json"
+      if curl -fsS --max-time 2 "$(admin_url "$node")/groups/$group/value" >"$json_file" 2>/dev/null && python3 - "$json_file" "$node" "$restarted_voter" "$floor_file" "$floor_node_file" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1])); node=int(sys.argv[2])
+assert node != int(sys.argv[3])
+assert x["consistency"] == "linearizable"
+assert int(x["leader"]) == node
+if "is_leader" in x: assert x["is_leader"] is True
+open(sys.argv[4],"w").write(str(int(x["value"]))+"\n")
+open(sys.argv[5],"w").write(str(node)+"\n")
+PY
+      then return 0; fi
+      node=$((node + 1))
+    done
+    sleep 1
+  done
+  printf '%s\n' "no leader-linearizable floor for group $group" >&2; return 1
+}
+
+wait_restarted_victim_floor() {
+  group="$1"; floor_file="$WORKDIR/floor-${group}.txt"; deadline=$((SECONDS + 45))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    json_file="$WORKDIR/restarted-victim-${group}.json"
+    if curl -fsS --max-time 2 "$(admin_url "$restarted_voter")/groups/$group/value" >"$json_file" 2>/dev/null && python3 - "$json_file" "$floor_file" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+assert x["consistency"] in ("local","linearizable")
+assert int(x["value"]) >= int(open(sys.argv[2]).read())
+PY
+    then return 0; fi
+    sleep 1
+  done
+  printf '%s\n' "restarted victim behind floor for group $group" >&2; return 1
+}
+
 # --- prep ---
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/multiraft-acceptance.XXXXXX")"
 F1="${WORKDIR}/g1.txt"
@@ -326,43 +374,22 @@ cp "${WORKDIR}/post_grow_values.txt" "${WORKDIR}/pre_restart_values.txt"
 
 # --- 5: restart killed node with same data_dir ---
 log "check 5: restart killed node ${KILL_NODE} with same data_dir"
+restarted_voter="$KILL_NODE"
+: "${WORKDIR:?}" "${NODES:?}" "${GROUPS:?}" "${restarted_voter:?}"
+group=0
+while [ "$group" -lt "$GROUPS" ]; do
+  find_group_floor "$group" || fail "check5: no leader-linearizable floor for group ${group}"
+  test "$(cat "$WORKDIR/floor-node-${group}.txt")" != "$restarted_voter"
+  group=$((group + 1))
+done
 start_one_node "$KILL_NODE"
 
-CATCHUP_DEADLINE=$((SECONDS + 60))
-while true; do
-  if http_get "$(admin_url "$KILL_NODE")/groups/0/value" >/dev/null 2>&1 \
-    && fetch_all_groups "$F4" 2>/dev/null; then
-    values_file <"$F4" >"${WORKDIR}/restart_values.txt"
-    if python3 -c '
-import sys
-pre = [int(x) for x in open(sys.argv[1]).read().split()]
-post = [int(x) for x in open(sys.argv[2]).read().split()]
-assert len(pre) == len(post)
-for i, (a, b) in enumerate(zip(pre, post)):
-    if b < a:
-        raise SystemExit(1)
-sys.exit(0)
-' "${WORKDIR}/pre_restart_values.txt" "${WORKDIR}/restart_values.txt"; then
-      break
-    fi
-  fi
-  if (( SECONDS >= CATCHUP_DEADLINE )); then
-    fail "check5: restarted node did not catch up within 60s"
-  fi
-  sleep 0.5
+group=0
+while [ "$group" -lt "$GROUPS" ]; do
+  wait_restarted_victim_floor "$group" || fail "check5: restarted voter behind floor for group ${group}"
+  group=$((group + 1))
 done
-assert_groups_healthy "check5-after-restart" "$F4"
-python3 -c '
-import sys
-pre = [int(x) for x in open(sys.argv[1]).read().split()]
-post = [int(x) for x in open(sys.argv[2]).read().split()]
-assert len(pre) == len(post)
-for i, (a, b) in enumerate(zip(pre, post)):
-    if b < a:
-        raise SystemExit("group %d lost value across restart (%d -> %d)" % (i, a, b))
-' "${WORKDIR}/pre_restart_values.txt" "${WORKDIR}/restart_values.txt" \
-  || fail "check5: values not restored after restart"
-log "check 5 OK: FSM values restored/caught-up after node restart"
+log "check 5 OK: restarted voter reached each leader-linearizable floor"
 
 # --- 6: unit tests ---
 log "check 6: not_leader + grpc_cluster tests"

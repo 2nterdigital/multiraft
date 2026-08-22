@@ -20,13 +20,13 @@ downstream app): RMQ Leader propose + a pluggable matching FSM.
 - `MultiRaft` facade: `propose`, `propose_batch`, `read_linearizable`, leader callbacks
 - File-backed log / state / snapshot per group (restart recovery); sync levels **0/1/2** (Aeron-aligned)
 - Aeron-inspired hot path: typed in-process RPC, pipelined propose, coalesced / streamed file append
-- Standby Premium–like HA: learner standby, snapshot offload, promote/demote, daisy chain, stale reads
+- Standby learner and membership operations, plus lab-only snapshot catalog/checksum/ad generation; live standby restore is disabled
 - Multi-process gRPC demo (`multiraft-demo`) + admin HTTP for ops / Jepsen
 - Acceptance, chaos scripts, porcupine linearizability test, local Jepsen suite
 
 ### vs Aeron Cluster / Standby Premium
 
-multiraft is **not** a fork of Aeron. It targets matching-HA **semantic parity** on openraft (Apache 2.0 Rust), with an Aeron-inspired hot path — not Media Driver, SBE, or commercial Cluster.
+multiraft is **not** a fork of Aeron. It is an openraft (Apache 2.0 Rust) Multi-Raft library with an Aeron-inspired hot path — not Media Driver, SBE, or commercial Cluster.
 
 - **Measured (3 voters, in-process, this machine):** mem wall **~300k+** TPS; file sync=0 deep pipeline **~117k–187k**; sequential file **~2k**; sync=1 sequential **~25 TPS**, deep pipeline + fat pe **~150k–250k** (see [highlights](docs/spotlight/2026-07-hotpath-sync1.md) / [M4](docs/specs/2026-07-22-sync1-disk-pipeline-merge.md)).
 - **Choose multiraft** for embedded Rust/openraft matching HA; **choose Aeron commercial** for Media Driver, full Archive, ClusteredService, and Real Logic support.
@@ -126,13 +126,12 @@ curl -s http://127.0.0.1:21100/admin/groups/0/status
 curl -s -X POST http://127.0.0.1:21100/admin/standby_snapshot/0
 curl -s http://127.0.0.1:21103/admin/catalog/0
 curl -s http://127.0.0.1:21100/admin/best_snapshot_ad/0
-curl -s -X POST http://127.0.0.1:21100/admin/replicate_standby_snapshot/0
 curl -s http://127.0.0.1:21103/groups/0/stale
 # warm promote (leader):
 curl -s -X POST http://127.0.0.1:21100/admin/promote_standby/0/4
 ```
 
-Voter restart auto-calls `try_recover_from_standby_ads` for each group when local snapshot ads are present and newer than the SM applied watermark.
+This lab flow exercises learner membership and catalog/checksum/advertisement generation only. The catalog is not a current snapshot provider, and live HTTP/ad/catalog/daisy restore endpoints return typed unsupported errors. Voter recovery uses normal OpenRaft recovery. The withdrawn `StandbyOffload` restore path formerly used precheck -> tail apply -> FSM-only restore -> divergence; it is not a v1 contract. Any future live restore needs a separately Accepted complete envelope, atomic capture, Vote/full `LogId`/membership, and `install_full_snapshot`.
 
 ### Consistency (per group)
 

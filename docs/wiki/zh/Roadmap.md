@@ -13,10 +13,10 @@
 
 ## 一期加固 / 库能力
 
-- [x] Standby 异步快照（对齐 Aeron 的 Learner 卸载）— 见 [设计](../../specs/2026-07-20-standby-async-snapshot-design.zh-CN.md)
-- [x] Aeron Standby Premium 对等 **P0**：从 ad HTTP 拉取 + standby 复制限速 — [对等设计](../../specs/2026-07-20-aeron-standby-parity-design.zh-CN.md)
+- [x] learner Standby、成员关系与实验室 catalog/checksum/ad 生成 — 见[历史设计](../../specs/2026-07-20-standby-async-snapshot-design.zh-CN.md)
+- [ ] Standby 实时恢复 P0/P2：已 containment；未来协议须有独立 Accepted 的完整 metadata/Vote/membership、原子捕获、完整 `LogId` 和 `install_full_snapshot` — 见[历史对等设计](../../specs/2026-07-20-aeron-standby-parity-design.zh-CN.md)
 - [x] Aeron Standby Premium 对等 **P1**：`promote_standby` / `demote_to_standby` 切换
-- [x] Aeron Standby Premium 对等 **P2**：daisy-chain（快照链）/ 多 standby / Range 流式拉取
+- [ ] 实时 daisy/catalog/HTTP 恢复：在独立 Accepted 完整协议前保持 containment
 - [x] Aeron Standby Premium 对等 **P3**：`read_stale` / Standby 只读服务卸载
 - [x] Standby chaos（C40–C44）+ 可选 `STANDBY=1` 的 Jepsen
 
@@ -25,7 +25,7 @@
 - [ ] 可选 Leader 消费 RMQ → `propose`
 - [ ] 可插拔撮合引擎 FSM + 幂等键
 - [ ] 生产指标（propose 延迟、落后 index、切主次数）
-- [x] 持久化 / snapshot 策略加固（StandbyOffload catalog；更多 hardening 待续）
+- [ ] durable snapshot/restart P0 仍未解决；v1 契约为 Disabled 加正常 OpenRaft recovery
 
 ## 明确不做（近期）
 

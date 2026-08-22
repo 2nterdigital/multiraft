@@ -16,6 +16,9 @@ pub enum MultiRaftError {
     #[error("stale queries disabled (set ClusterConfig::enable_stale_queries)")]
     StaleQueriesDisabled,
 
+    #[error("live standby snapshot install is unsupported")]
+    LiveSnapshotInstallUnsupported,
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -50,6 +53,11 @@ mod tests {
         assert!(MultiRaftError::StaleQueriesDisabled
             .to_string()
             .contains("stale"));
+        let unsupported = MultiRaftError::LiveSnapshotInstallUnsupported;
+        assert_eq!(
+            unsupported.to_string(),
+            "live standby snapshot install is unsupported"
+        );
         let other: MultiRaftError = anyhow::anyhow!("boom").into();
         assert!(other.to_string().contains("boom"));
         let _ = format!("{:?}", ProposeOk { index: 1, term: 1 });

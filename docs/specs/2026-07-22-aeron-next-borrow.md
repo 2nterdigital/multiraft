@@ -6,9 +6,9 @@
 **Status:** Backlog (not scheduled)  
 **Constraints:** openraft `=0.10.0-alpha.30`; **borrow ideas, not the Aeron runtime** — no Media Driver, SBE compiler, full Archive engine, or Consensus Module replacement.
 
-**Already shipped (do not re-list as gaps):**
+**Existing non-restore capabilities (do not treat as live-restore acceptance):**
 
-- Standby Premium parity P0–P3 — [aeron-standby-parity](./2026-07-20-aeron-standby-parity-design.md)
+- Learner/membership, throttling, and stale-read work; historical P0/P2 live restore is contained — [aeron-standby-parity](./2026-07-20-aeron-standby-parity-design.md)
 - Hot path M1–M3 — [aeron-inspired-hotpath](./2026-07-21-aeron-inspired-hotpath-design.md)
 - Positioning vs commercial Aeron — [compare/aeron-commercial](../compare/aeron-commercial.md)
 
@@ -97,7 +97,7 @@ Archive: durable recording by position, replay, and operational tooling — not 
 | **N3c** Recovery playbooks | Docs | Cold start / voter replace / standby promote sequences with curl + expected `RecoverOutcome` |
 | **N3d** Hardening | Optional | Resume already partial via Range; catalog GC / retention policy |
 
-Builds on existing SnapshotCatalog + HTTP Range + sha256 — deepen **ops semantics**, do not build a recording engine.
+Do not rely on SnapshotCatalog + HTTP Range + sha256 as a live restore base. Any future ops protocol needs separately Accepted complete metadata/Vote/membership, atomic capture, full `LogId`, and `install_full_snapshot`; it must not claim the contained path is already shipped.
 
 ### Success criteria
 
@@ -147,5 +147,5 @@ Media Driver · SBE schema compiler · full Aeron Archive · Consensus Module po
 | [Aeron Cluster performance limits](https://aeron.io/docs/aeron-cluster/performance-limits/) | `W`-bound sequential RSM ceiling |
 | [Efficient business logic](https://aeron.io/docs/aeron-cluster/efficient-business-logic/) | Encode / validate / no blocking apply |
 | [hotpath design](./2026-07-21-aeron-inspired-hotpath-design.md) | M1–M3 already done |
-| [standby parity](./2026-07-20-aeron-standby-parity-design.md) | HA semantics already done |
+| [standby parity](./2026-07-20-aeron-standby-parity-design.md) | Historical mapping; live restore remains contained |
 | [perf.md](../perf.md) | Measured wall ceilings & multi-group notes |

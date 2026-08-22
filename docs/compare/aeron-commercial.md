@@ -8,7 +8,9 @@ This document compares **multiraft** — an open-source, Rust Multi-Raft library
 
 ## Positioning
 
-**multiraft is not a fork of Aeron.** It does not embed the Aeron Media Driver, Consensus Module, or Archive. Instead, it targets **semantic parity** for matching-engine high availability: warm standby, snapshot offload, promote/demote, and an **Aeron-inspired hot path** — all on top of pinned **[openraft](https://github.com/databendlabs/openraft) `=0.10.0-alpha.30`** + `openraft-multi`.
+**multiraft is not a fork of Aeron.** It does not embed the Aeron Media Driver, Consensus Module, or Archive. It is an **Aeron-inspired hot path** on pinned **[openraft](https://github.com/databendlabs/openraft) `=0.10.0-alpha.30`** + `openraft-multi`.
+
+> **2026-08-22 containment:** `STANDBY=1` is a lab learner/catalog/checksum/advertisement-generation flow. The catalog is not a current snapshot provider; live HTTP/ad/catalog/daisy restore is typed unsupported, while normal OpenRaft recovery remains. The historical Factory 6677 `StandbyOffload` restore contract is withdrawn because C42 and its metadata did not prove complete ownership. A future protocol needs separately Accepted complete metadata, atomic capture, Vote/full `LogId`/membership, and `install_full_snapshot`.
 
 | | multiraft | Aeron Cluster / Standby Premium |
 |---|-----------|----------------------------------|
@@ -28,18 +30,18 @@ Capabilities mapped from [Aeron Standby Premium parity](../specs/2026-07-20-aero
 
 | Area | multiraft equivalent | Notes |
 |------|---------------------|-------|
-| **Standby offload** | openraft **Learner** via `add_standby`; async snapshot without stopping voters | `StandbyOffload` + `trigger_standby_snapshot` |
+| **Standby lab scope** | openraft **Learner** via `add_standby`; catalog/checksum/ad generation without stopping voters | Live `StandbyOffload` restore is contained |
 | **Non-blocking standby** | `standby_max_inflight`, `standby_replicate_delay_ms` throttle toward standby peers | Approximates “standby must not back-pressure the leader” |
-| **Snapshot recovery** | `SnapshotAdvertisement`, `try_recover_from_standby_ads`, HTTP `fetch_url` pull | Chunked Range fetch + sha256 verify |
+| **Snapshot recovery** | normal OpenRaft recovery; live ad/HTTP/catalog restore is typed unsupported | future complete protocol requires accepted envelope and `install_full_snapshot` |
 | **Promote / demote** | `promote_standby`, `demote_to_standby` via `change_membership` | Warm DR / TransitionModule analogue (operator-gated) |
-| **Daisy snapshot chain** | `daisy_upstream_base`, `sync_from_daisy_upstream` | **Snapshot** daisy only — not full log redirect |
+| **Daisy snapshot chain** | live daisy restore is typed unsupported | historical claim contained; not a v1 recovery contract |
 | **Stale reads** | `read_stale`, `enable_stale_queries` | Explicit watermark; not linearizable |
 | **Typed in-process RPC** | `RaftCall` / `RaftReply` over `mpsc` — no bincode on same-process hops | gRPC path keeps bincode for cross-process |
 | **`propose_batch` pipeline** | Each payload = its own Raft entry; sends pipelined via `join_all` | Wall TPS lever, not mega-entries |
 | **File sync levels 0 / 1 / 2** | `FileLogSyncLevel::{Os, Data, All}` ↔ Aeron `file.sync.level` | See durability table below |
 | **Stream options** | `FileLogStreamOptions`: `stream_buf_bytes`, `stream_flush_ms` | Os-level buffered append at sync=0 |
 
-Standby is modeled as an openraft Learner, not a second consensus implementation. Archive semantics are approximated with **durable SnapshotCatalog + HTTP/gRPC fetch**, not a full Aeron Archive.
+Standby is modeled as an openraft Learner, not a second consensus implementation. The catalog records lab artifacts; it is not a live snapshot provider or an Archive approximation for v1 restore.
 
 ---
 
@@ -121,8 +123,8 @@ Demo: `--bench-file-sync-level 0|1|2`.
 ### Choose multiraft when
 
 - Your matching / trading stack is **Rust** and you already want **openraft** Multi-Raft.
-- You need **Standby Premium–like HA** (learner standby, snapshot offload, promote, daisy snapshot chain, stale reads) **without** a JVM/C++ Aeron dependency.
-- You accept **HTTP snapshot fetch** instead of full Archive, and **operator-gated** promote/demote.
+- You need learner standby, throttled replication, **operator-gated** promote/demote, and stale reads without a JVM/C++ Aeron dependency.
+- You accept lab-only catalog/checksum/advertisement generation and normal OpenRaft recovery; live HTTP/ad/catalog/daisy restore is typed unsupported.
 - You want **Apache 2.0** source, chaos/Jepsen hooks, and a thin library you embed — not a clustered-service container.
 - Throughput goals fit **pipelined propose** (100k+ mem wall; 100k+ file at sync=0 with deep pipeline) or you can tolerate **~2k sequential file** / **~25 TPS with fsync**.
 
@@ -154,4 +156,4 @@ multiraft optimizes the **openraft hot path** (typed in-process RPC, pipelined b
 
 ## Summary
 
-multiraft offers **open-source, Rust-native matching HA** with **semantic alignment** to Aeron Standby Premium (standby, snapshots, promote, daisy, stale reads) and **mechanical-sympathy patterns** from Aeron Cluster (typed hot path, pipelined propose, graded durability) — **on openraft**, without Media Driver or commercial Cluster. Pick multiraft for embedded Rust Multi-Raft; pick Aeron commercial for the full Real Logic platform.
+multiraft offers **open-source, Rust-native matching HA** with learner/membership operations, stale reads, and **mechanical-sympathy patterns** from Aeron Cluster (typed hot path, pipelined propose, graded durability) — **on openraft**, without Media Driver or commercial Cluster. Its live StandbyOffload restore capability is contained: catalog artifacts are not a current provider, HTTP/ad/catalog/daisy restoration is typed unsupported, and normal OpenRaft recovery remains. Pick multiraft for embedded Rust Multi-Raft; pick Aeron commercial for the full Real Logic platform.

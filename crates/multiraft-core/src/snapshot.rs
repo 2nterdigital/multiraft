@@ -24,7 +24,9 @@ pub struct SnapshotAdvertisement {
     pub fetch_url: String,
 }
 
-/// Result of auto-recovery from standby snapshot advertisements.
+/// Legacy serialized result shape retained for compatibility.
+///
+/// Live Standby recovery no longer emits this outcome.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum RecoverOutcome {

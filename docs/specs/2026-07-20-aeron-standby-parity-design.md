@@ -7,6 +7,8 @@
 **Related:** [standby-async-snapshot](./2026-07-20-standby-async-snapshot-design.md) · [ARCHITECTURE.md](../ARCHITECTURE.md)  
 **Upstream reference:** [Aeron Cluster Standby (Premium)](https://aeron.io/premium-docs/aeron-cluster-standby/standby-overview.html)
 
+> **2026-08-22 containment note:** This is a historical phased-design record, not a current v1 delivery statement. The Factory 6677 live `StandbyOffload` contract (Catalog -> `current_snapshot` -> OpenRaft; ad/HTTP -> direct install) is withdrawn because C42 and metadata do not establish complete restore ownership. C42/P0/P2 live restore is historical and contained: `STANDBY=1` is limited to learner/catalog/checksum/ad generation, catalog is not a current provider, and live HTTP/ad/catalog/daisy restoration is typed unsupported. Preserve normal OpenRaft recovery; the old precheck -> tail apply -> FSM-only restore -> divergence flow is prohibited. Future restoration requires separately Accepted complete envelope, atomic capture, Vote/full `LogId`/membership, and `install_full_snapshot`.
+
 ---
 
 ## 0. Purpose

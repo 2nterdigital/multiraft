@@ -33,6 +33,8 @@ use multiraft_core::SnapshotMode;
 use multiraft_fsm::CounterFsm;
 use multiraft_net::wait_for_leader;
 use multiraft_net::MultiRaft;
+#[cfg(test)]
+use multiraft_net::SharedFabric;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::info;
@@ -357,18 +359,20 @@ async fn run_node(args: Args) -> anyhow::Result<()> {
     let node_id = args
         .node_id
         .ok_or_else(|| anyhow::anyhow!("--node-id is required for --mode node"))?;
+    let daisy_upstream = args.daisy_upstream.clone().or_else(|| {
+        std::env::var("DAISY_UPSTREAM")
+            .ok()
+            .filter(|value| !value.is_empty())
+    });
+    if daisy_upstream.is_some() {
+        anyhow::bail!("live standby snapshot install is unsupported");
+    }
 
     let role = match args.role {
         RoleArg::Voter => NodeRole::Voter,
         RoleArg::Standby => NodeRole::Standby,
     };
-    let standby_offload =
-        role == NodeRole::Standby || std::env::var("STANDBY").ok().as_deref() == Some("1");
-    let snapshot_mode = if standby_offload {
-        SnapshotMode::StandbyOffload
-    } else {
-        SnapshotMode::Disabled
-    };
+    let snapshot_mode = snapshot_mode_for_role(role);
 
     // Voters: membership 1..=nodes. Standby may use node_id == nodes+1.
     // Peer table must include Standby addresses or GrpcRouter cannot reach them.
@@ -398,11 +402,6 @@ async fn run_node(args: Args) -> anyhow::Result<()> {
     std::fs::create_dir_all(&args.data_dir)?;
 
     let peer_ids: Vec<u64> = peers.iter().map(|(id, _)| *id).collect();
-    let daisy_upstream = args.daisy_upstream.clone().or_else(|| {
-        std::env::var("DAISY_UPSTREAM")
-            .ok()
-            .filter(|s| !s.is_empty())
-    });
 
     let mut config = ClusterConfig::for_test(node_id, &peer_ids);
     config.peers = peers;
@@ -428,10 +427,6 @@ async fn run_node(args: Args) -> anyhow::Result<()> {
     );
 
     let node = MultiRaft::start_grpc(config).await?;
-    if daisy_upstream.is_some() {
-        node.spawn_daisy_sync_loop(group_ids.clone());
-        info!(node_id, "spawned daisy snapshot sync loop");
-    }
 
     // Create groups with retries so peers that start later can join initialize.
     let mut last_err = None;
@@ -462,22 +457,6 @@ async fn run_node(args: Args) -> anyhow::Result<()> {
 
     if role == NodeRole::Voter {
         wait_local_sees_leaders(&node, &group_ids, Duration::from_secs(30)).await?;
-        // P0: on restart, auto-pull from persisted snapshot ads when newer than local.
-        for &gid in &group_ids {
-            match node.try_recover_from_standby_ads(gid).await {
-                Ok(outcome) => {
-                    info!(
-                        node_id,
-                        group = gid,
-                        ?outcome,
-                        "try_recover_from_standby_ads"
-                    );
-                }
-                Err(e) => {
-                    warn!(node_id, group = gid, error = %e, "try_recover_from_standby_ads failed");
-                }
-            }
-        }
     } else {
         info!(node_id, "standby: waiting for add_learner from leader");
     }
@@ -530,6 +509,13 @@ async fn run_node(args: Args) -> anyhow::Result<()> {
     }
 
     status_loop(state).await
+}
+
+fn snapshot_mode_for_role(role: NodeRole) -> SnapshotMode {
+    match role {
+        NodeRole::Voter => SnapshotMode::Disabled,
+        NodeRole::Standby => SnapshotMode::StandbyOffload,
+    }
 }
 
 async fn publish_snapshot_ad(
@@ -1011,7 +997,11 @@ async fn admin_replicate_standby_snapshot(
             }),
             Err(e) => {
                 return Err((
-                    StatusCode::BAD_GATEWAY,
+                    if matches!(&e, MultiRaftError::LiveSnapshotInstallUnsupported) {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    },
                     Json(ErrResp {
                         ok: false,
                         error: e.to_string(),
@@ -1723,4 +1713,210 @@ async fn propose_batch_bench(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     anyhow::bail!("propose timeout group={group}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct IsolatedStandbyAdminFixture {
+        state: Arc<DemoState>,
+        fetch_url: String,
+        http_requests: Arc<AtomicU64>,
+        producer: MultiRaft,
+        server: tokio::task::JoinHandle<()>,
+        temp_root: PathBuf,
+    }
+
+    impl IsolatedStandbyAdminFixture {
+        async fn shutdown(self) -> anyhow::Result<()> {
+            self.server.abort();
+            let _ = self.server.await;
+            self.producer.shutdown().await?;
+            for node in &self.state.nodes {
+                node.shutdown().await?;
+            }
+            std::fs::remove_dir_all(&self.temp_root)?;
+            Ok(())
+        }
+    }
+
+    async fn isolated_standby_admin_fixture() -> anyhow::Result<IsolatedStandbyAdminFixture> {
+        let fixture_id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_root = std::env::temp_dir().join(format!(
+            "multiraft-demo-admin-standby-{}-{fixture_id}",
+            std::process::id()
+        ));
+        if temp_root.exists() {
+            anyhow::bail!("fixture directory already exists: {}", temp_root.display());
+        }
+        std::fs::create_dir(&temp_root)?;
+
+        let fabric = SharedFabric::new();
+        let peer_ids = [1u64, 4];
+        let members = [1u64];
+        let mut producer_config = ClusterConfig::for_test(1, &peer_ids);
+        producer_config.data_dir = temp_root.join("producer");
+        producer_config.role = NodeRole::Voter;
+        producer_config.snapshot_mode = SnapshotMode::Disabled;
+        let producer = fabric.start_node(producer_config).await?;
+
+        let mut victim_config = ClusterConfig::for_test(4, &peer_ids);
+        victim_config.data_dir = temp_root.join("victim");
+        victim_config.role = NodeRole::Standby;
+        victim_config.snapshot_mode = SnapshotMode::StandbyOffload;
+        victim_config.snapshot_keep = 2;
+        let victim = fabric.start_node(victim_config).await?;
+
+        producer.create_group(0, &members).await?;
+        victim.create_group(0, &members).await?;
+        wait_for_leader(std::slice::from_ref(&producer), 0, Duration::from_secs(10))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("producer did not become leader"))?;
+        producer.propose(0, CounterFsm::encode_add(1, 1)).await?;
+        let (last_index, last_term) = producer
+            .local_applied(0)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("producer has no local applied position"))?;
+
+        let http_requests = Arc::new(AtomicU64::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let app = AxumRouter::new().route(
+            "/snapshots/0/latest",
+            get({
+                let http_requests = Arc::clone(&http_requests);
+                move || {
+                    let http_requests = Arc::clone(&http_requests);
+                    async move {
+                        http_requests.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let fetch_url = format!("http://{address}/snapshots/0/latest");
+        let ad = SnapshotAdvertisement {
+            group: 0,
+            last_index,
+            last_term,
+            snapshot_id: "isolated-standby-admin-ad".into(),
+            size: 1,
+            sha256_hex: "00".into(),
+            fetch_url: fetch_url.clone(),
+        };
+        let (local_index, local_term) = victim.local_applied(0).await.unwrap_or((0, 0));
+        assert!((local_index, local_term) < (ad.last_index, ad.last_term));
+
+        let state = Arc::new(DemoState {
+            nodes: vec![victim],
+            group_ids: vec![0],
+            idem: AtomicU64::new(0),
+            node_id_base: 4u64 << 32,
+        });
+        let post = admin_post_snapshot_ad(State(Arc::clone(&state)), Json(ad.clone())).await;
+        assert_eq!(post, StatusCode::OK);
+        let Json(ads) = admin_get_snapshot_ads(State(Arc::clone(&state))).await;
+        assert!(ads.iter().any(|seen| seen.snapshot_id == ad.snapshot_id));
+
+        Ok(IsolatedStandbyAdminFixture {
+            state,
+            fetch_url,
+            http_requests,
+            producer,
+            server,
+            temp_root,
+        })
+    }
+
+    #[tokio::test]
+    async fn admin_isolated_standby_explicit_url_is_conflict_after_mapping() -> anyhow::Result<()> {
+        let fx = isolated_standby_admin_fixture().await?;
+        let result = admin_replicate_standby_snapshot(
+            State(Arc::clone(&fx.state)),
+            Path(0),
+            Some(Json(ReplicateStandbyReq {
+                fetch_url: Some(fx.fetch_url.clone()),
+            })),
+        )
+        .await;
+        let (status, Json(body)) = result.unwrap_err();
+        let requests = fx.http_requests.load(Ordering::SeqCst);
+        fx.shutdown().await?;
+        eprintln!("ADMIN_EXPLICIT_BASE_STATUS_{status}");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.error, "live standby snapshot install is unsupported");
+        assert_eq!(requests, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_isolated_standby_no_body_and_daisy_are_conflict_after_mapping(
+    ) -> anyhow::Result<()> {
+        let fx = isolated_standby_admin_fixture().await?;
+        let no_body = admin_replicate_standby_snapshot(State(Arc::clone(&fx.state)), Path(0), None)
+            .await
+            .unwrap_err();
+        let daisy = admin_daisy_sync(State(Arc::clone(&fx.state)), Path(0))
+            .await
+            .unwrap_err();
+        let requests = fx.http_requests.load(Ordering::SeqCst);
+        fx.shutdown().await?;
+        for (status, Json(body)) in [no_body, daisy] {
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body.error, "live standby snapshot install is unsupported");
+        }
+        assert_eq!(requests, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn standby_env_is_role_scoped() {
+        let previous = std::env::var_os("STANDBY");
+        std::env::set_var("STANDBY", "1");
+        assert_eq!(
+            snapshot_mode_for_role(NodeRole::Voter),
+            SnapshotMode::Disabled
+        );
+        assert_eq!(
+            snapshot_mode_for_role(NodeRole::Standby),
+            SnapshotMode::StandbyOffload
+        );
+        match previous {
+            Some(value) => std::env::set_var("STANDBY", value),
+            None => std::env::remove_var("STANDBY"),
+        }
+    }
+
+    #[tokio::test]
+    async fn daisy_upstream_is_rejected_before_data_dir_creation() -> anyhow::Result<()> {
+        let target = std::env::temp_dir().join(format!(
+            "multiraft-demo-daisy-reject-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&target);
+        let args = Args::try_parse_from([
+            "multiraft-demo",
+            "--mode",
+            "node",
+            "--node-id",
+            "1",
+            "--data-dir",
+            target.to_str().unwrap(),
+            "--daisy-upstream",
+            "http://127.0.0.1:29999",
+        ])?;
+        let err = run_node(args).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "live standby snapshot install is unsupported"
+        );
+        assert!(!target.exists());
+        Ok(())
+    }
 }

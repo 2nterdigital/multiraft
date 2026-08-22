@@ -115,17 +115,25 @@ coordination, or any group-lifecycle fix.
 
 ## Standby async snapshot
 
-Optional `SnapshotMode::StandbyOffload`: voters never sync-dump the FSM in
-`build_snapshot`. A **Standby** (openraft Learner) applies a magic trigger log,
-freezes the FSM briefly, then `spawn_blocking` serializes into a durable catalog
-under `{data_dir}/snapshots/`. Voters pull advertisements on recovery.
+`SnapshotMode::StandbyOffload` is contained for v1. `STANDBY=1` remains a lab
+learner/catalog/checksum/advertisement-generation workflow, but the catalog is
+not a current snapshot provider and live HTTP/ad/catalog/daisy restoration is
+typed unsupported. Normal OpenRaft recovery remains authoritative. The Factory
+6677 design intentionally routed Catalog -> `current_snapshot` -> OpenRaft and
+ad/HTTP -> direct install; this candidate withdraws that first contract because
+C42 and the available metadata do not establish complete restore ownership.
+
+The contained historical flow was precheck -> tail apply -> FSM-only restore ->
+divergence. Any future restoration requires a separately Accepted complete
+envelope, atomic capture, Vote/full `LogId`/membership, and
+`install_full_snapshot`; it is not shipped or scheduled by this repository.
 
 Details: [specs/2026-07-20-standby-async-snapshot-design.md](./specs/2026-07-20-standby-async-snapshot-design.md)
 · [中文](./specs/2026-07-20-standby-async-snapshot-design.zh-CN.md).
 
-Premium parity (HTTP pull from ads, standby replication throttle, promote/demote,
-multi-standby newest-ad pick, **snapshot daisy-chain** via `daisy_upstream_base`,
-HTTP Range chunked fetch with resume, Standby `read_stale` offload):
+Learner membership, throttling, promote/demote, and `read_stale` remain separate
+from live restore. Historical HTTP/ad/catalog/daisy restoration claims are
+contained:
 [specs/2026-07-20-aeron-standby-parity-design.md](./specs/2026-07-20-aeron-standby-parity-design.md)
 · [中文](./specs/2026-07-20-aeron-standby-parity-design.zh-CN.md).
 

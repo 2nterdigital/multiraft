@@ -17,7 +17,6 @@ use axum::routing::get;
 use axum::Router;
 use multiraft_core::ClusterConfig;
 use multiraft_core::NodeRole;
-use multiraft_core::RecoverOutcome;
 use multiraft_core::SnapshotAdvertisement;
 use multiraft_core::SnapshotMode;
 use multiraft_fsm::CounterFsm;
@@ -373,20 +372,37 @@ async fn multi_standby_ads_pick_newest() {
         fetch_url: format!("http://{addr_new}/snapshots/0/latest"),
     });
 
-    let outcome = restarted
+    let err = restarted
         .try_recover_from_standby_ads(group)
         .await
-        .expect("recover");
-    match outcome {
-        RecoverOutcome::Installed { last_index, .. } => {
-            assert_eq!(last_index, entry_a.last_index);
+        .expect_err("live ad recovery must be contained");
+    assert!(matches!(
+        err,
+        multiraft_core::MultiRaftError::LiveSnapshotInstallUnsupported
+    ));
+    let fetched = restarted
+        .fetch_snapshot_bytes(&format!("http://{addr_new}/snapshots/0/latest"))
+        .await
+        .expect("fetch newest ad without installing");
+    assert_eq!(fetched.last_index, entry_a.last_index);
+    assert_eq!(fetched.data, data_a);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let value = restarted
+            .with_fsm(group, |fsm| fsm.value(group))
+            .await
+            .unwrap_or(0);
+        if value >= 6 {
+            break;
         }
-        RecoverOutcome::SkippedNotNewer { ad_index, .. } => {
-            assert_eq!(ad_index, entry_a.last_index);
-        }
-        other => panic!("unexpected {other:?}"),
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native catch-up stalled at {value}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let _ = (sa, sb);
+    assert!(!sa.is_leader(group));
+    assert!(!sb.is_leader(group));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -505,100 +521,25 @@ async fn daisy_chain_snapshot_from_upstream() {
     let sb = fabric.start_node(cfg_b).await.expect("standby b");
     sb.create_group(group, &members).await.expect("sb create");
 
-    let outcome = sb
+    let err = sb
         .sync_from_daisy_upstream(group)
         .await
-        .expect("daisy sync");
-    match outcome {
-        RecoverOutcome::Installed { last_index, .. } => {
-            assert_eq!(last_index, entry_a.last_index);
-        }
-        other => panic!("expected Installed, got {other:?}"),
-    }
-
-    let entry_b = sb.latest_catalog_entry(group).expect("B catalog");
-    assert_eq!(entry_b.last_index, entry_a.last_index);
-    assert_eq!(entry_b.sha256_hex, entry_a.sha256_hex);
-    let data_b = sb
-        .snapshot_catalog()
-        .unwrap()
-        .read(group, &entry_b.snapshot_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(data_b, data_a);
-
-    let (addr_b, _hb) = spawn_range_server(RangeSnapServe {
-        data: data_b,
-        last_index: entry_b.last_index,
-        last_term: entry_b.last_term,
-        snapshot_id: entry_b.snapshot_id.clone(),
-        sha256_hex: entry_b.sha256_hex.clone(),
-        fail_after_bytes: AtomicUsize::new(0),
-        failed_once: AtomicBool::new(false),
-    })
-    .await;
-    let fetch_b = format!("http://{addr_b}/snapshots/0/latest");
-
-    voters[0].shutdown().await.expect("shutdown");
-    std::fs::remove_dir_all(&dirs[0]).ok();
-    std::fs::create_dir_all(&dirs[0]).unwrap();
-    let restarted = fabric
-        .start_node(standby_config(
-            1,
-            &peer_ids,
-            dirs[0].clone(),
-            NodeRole::Voter,
-        ))
+        .expect_err("live daisy sync must be contained");
+    assert!(matches!(
+        err,
+        multiraft_core::MultiRaftError::LiveSnapshotInstallUnsupported
+    ));
+    let fetched = sb
+        .fetch_snapshot_bytes(&format!("http://{addr_a}/snapshots/0/latest"))
         .await
-        .expect("restart");
-    restarted
-        .create_group(group, &members)
-        .await
-        .expect("recreate");
-    restarted.record_snapshot_ad(SnapshotAdvertisement {
-        group,
-        last_index: entry_b.last_index,
-        last_term: entry_b.last_term,
-        snapshot_id: entry_b.snapshot_id,
-        size: entry_b.size,
-        sha256_hex: entry_b.sha256_hex,
-        fetch_url: fetch_b,
-    });
-
-    let outcome = restarted
-        .try_recover_from_standby_ads(group)
-        .await
-        .expect("recover from B");
-    match outcome {
-        RecoverOutcome::Installed { last_index, .. } => {
-            assert_eq!(last_index, entry_a.last_index);
-        }
-        RecoverOutcome::SkippedNotNewer { .. } => {
-            // Already caught up via log; force pull from B.
-            restarted
-                .pull_and_install_snapshot(group, &format!("http://{addr_b}/snapshots/0/latest"))
-                .await
-                .expect("pull B");
-        }
-        other => panic!("unexpected {other:?}"),
-    }
-    let restored = restarted
-        .with_fsm(group, |fsm| fsm.value(group))
-        .await
-        .expect("fsm");
-    assert!(restored >= expected, "restored={restored}");
-
-    // Second daisy sync of the same upstream must not regress / reinstall.
-    let skip = sb
-        .sync_from_daisy_upstream(group)
-        .await
-        .expect("daisy sync again");
-    match skip {
-        RecoverOutcome::SkippedNotNewer { ad_index, .. } => {
-            assert_eq!(ad_index, entry_a.last_index);
-        }
-        other => panic!("expected SkippedNotNewer on second daisy sync, got {other:?}"),
-    }
+        .expect("daisy upstream remains fetchable without installation");
+    assert_eq!(fetched.last_index, entry_a.last_index);
+    assert_eq!(fetched.data, data_a);
+    assert!(sb.latest_catalog_entry(group).is_none());
+    assert!(matches!(
+        sb.sync_from_daisy_upstream(group).await,
+        Err(multiraft_core::MultiRaftError::LiveSnapshotInstallUnsupported)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -678,10 +619,14 @@ async fn chunked_range_fetch_install() {
     assert_eq!(fetched.sha256_hex, sha);
 
     // Install via MultiRaft API.
-    nodes[1]
+    let err = nodes[1]
         .pull_and_install_snapshot(group, &url)
         .await
-        .expect("install");
+        .expect_err("live pull must be contained");
+    assert!(matches!(
+        err,
+        multiraft_core::MultiRaftError::LiveSnapshotInstallUnsupported
+    ));
     let v = nodes[1]
         .with_fsm(group, |fsm| fsm.value(group))
         .await

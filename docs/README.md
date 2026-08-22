@@ -4,6 +4,8 @@
 
 Self-contained docs for the **multiraft** GitHub repository (no links outside this tree required to navigate). Every doc below has an English + Chinese (`.zh-CN.md`) pair.
 
+> **2026-08-22 containment:** historical Standby P0/P2 live-restore material is retained as history. v1 supports Disabled plus normal OpenRaft recovery, learner, and membership behavior; `STANDBY=1` catalog/checksum/ad output is lab-only and is not a restore provider.
+
 ## Start here
 
 | Doc (EN) | 中文 | Audience |
@@ -21,8 +23,8 @@ Self-contained docs for the **multiraft** GitHub repository (no links outside th
 | Spec (EN) | 中文 | Topic |
 |-----------|------|-------|
 | [2026-07-18-multiraft-design.md](./specs/2026-07-18-multiraft-design.md) | [2026-07-18-multiraft-design.zh-CN.md](./specs/2026-07-18-multiraft-design.zh-CN.md) | Thin Multi-Raft for matching HA |
-| [2026-07-20-standby-async-snapshot-design.md](./specs/2026-07-20-standby-async-snapshot-design.md) | [2026-07-20-standby-async-snapshot-design.zh-CN.md](./specs/2026-07-20-standby-async-snapshot-design.zh-CN.md) | Standby async snapshot (Aeron-aligned) |
-| [2026-07-20-aeron-standby-parity-design.md](./specs/2026-07-20-aeron-standby-parity-design.md) | [2026-07-20-aeron-standby-parity-design.zh-CN.md](./specs/2026-07-20-aeron-standby-parity-design.zh-CN.md) | Aeron Standby premium parity (P0–P3) |
+| [2026-07-20-standby-async-snapshot-design.md](./specs/2026-07-20-standby-async-snapshot-design.md) | [2026-07-20-standby-async-snapshot-design.zh-CN.md](./specs/2026-07-20-standby-async-snapshot-design.zh-CN.md) | Historical async-snapshot design; live restore contained |
+| [2026-07-20-aeron-standby-parity-design.md](./specs/2026-07-20-aeron-standby-parity-design.md) | [2026-07-20-aeron-standby-parity-design.zh-CN.md](./specs/2026-07-20-aeron-standby-parity-design.zh-CN.md) | Historical Standby P0–P3 mapping; live P0/P2 restore contained |
 | [2026-07-21-aeron-inspired-hotpath-design.md](./specs/2026-07-21-aeron-inspired-hotpath-design.md) | [2026-07-21-aeron-inspired-hotpath-design.zh-CN.md](./specs/2026-07-21-aeron-inspired-hotpath-design.zh-CN.md) | Hot path + design philosophy (M1–M4) |
 | [2026-07-22-sync1-disk-pipeline-merge.md](./specs/2026-07-22-sync1-disk-pipeline-merge.md) | [2026-07-22-sync1-disk-pipeline-merge.zh-CN.md](./specs/2026-07-22-sync1-disk-pipeline-merge.zh-CN.md) | M4: deep pipeline / sync=1 group-commit / replication batch + knees |
 | [2026-07-22-aeron-next-borrow.md](./specs/2026-07-22-aeron-next-borrow.md) | [2026-07-22-aeron-next-borrow.zh-CN.md](./specs/2026-07-22-aeron-next-borrow.zh-CN.md) | Next Aeron borrow backlog (N1–N3) |

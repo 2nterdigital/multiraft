@@ -24,6 +24,11 @@ NODES="${NODES:-3}"
 ROUNDS="${ROUNDS:-5}"
 SCENARIO="${SCENARIO:-random}"
 STANDBY="${STANDBY:-0}"
+DAISY="${DAISY:-0}"
+if [[ "$DAISY" == "1" || "$STANDBY" == "2" ]]; then
+  printf '%s\n' 'daisy/live standby restore is unsupported in this candidate' >&2
+  exit 2
+fi
 if [[ "$SCENARIO" == "standby" ]]; then
   STANDBY=1
 fi
@@ -495,6 +500,48 @@ sys.exit(0)
   done
 }
 
+find_group_floor() {
+  group="$1"; floor_file="$WORKDIR/floor-${group}.txt"; floor_node_file="$WORKDIR/floor-node-${group}.txt"
+  deadline=$((SECONDS + 45))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    node=1
+    while [ "$node" -le "$NODES" ]; do
+      if [ "$node" = "$restarted_voter" ]; then node=$((node + 1)); continue; fi
+      json_file="$WORKDIR/survivor-${group}-${node}.json"
+      if curl -fsS --max-time 2 "$(admin_url "$node")/groups/$group/value" >"$json_file" 2>/dev/null && python3 - "$json_file" "$node" "$restarted_voter" "$floor_file" "$floor_node_file" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1])); node=int(sys.argv[2])
+assert node != int(sys.argv[3])
+assert x["consistency"] == "linearizable"
+assert int(x["leader"]) == node
+if "is_leader" in x: assert x["is_leader"] is True
+open(sys.argv[4],"w").write(str(int(x["value"]))+"\n")
+open(sys.argv[5],"w").write(str(node)+"\n")
+PY
+      then return 0; fi
+      node=$((node + 1))
+    done
+    sleep 1
+  done
+  printf '%s\n' "no leader-linearizable floor for group $group" >&2; return 1
+}
+
+wait_restarted_victim_floor() {
+  group="$1"; floor_file="$WORKDIR/floor-${group}.txt"; deadline=$((SECONDS + 45))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    json_file="$WORKDIR/restarted-victim-${group}.json"
+    if curl -fsS --max-time 2 "$(admin_url "$restarted_voter")/groups/$group/value" >"$json_file" 2>/dev/null && python3 - "$json_file" "$floor_file" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+assert x["consistency"] in ("local","linearizable")
+assert int(x["value"]) >= int(open(sys.argv[2]).read())
+PY
+    then return 0; fi
+    sleep 1
+  done
+  printf '%s\n' "restarted victim behind floor for group $group" >&2; return 1
+}
+
 # Kill one live node, wait healthy + non-decreasing, restart, catch-up.
 kill_restart_one() {
   local kill_node="$1"
@@ -661,13 +708,11 @@ run_standby_promote_round() {
   log "standby promote/demote OK"
 }
 
-# Trigger Standby snapshot, wipe a voter, recover via ads (C42 multi-process).
+# Trigger Standby snapshot, reject live restore, then prove native voter catch-up.
 run_standby_recover_round() {
-  local standby_id victim via kill_pid admin_port id port
+  local standby_id victim via kill_pid id port fetch_url body explicit group
   standby_id=$((NODES + 1))
-  log "=== standby snapshot recover ==="
-  fetch_all_groups "$SNAPSHOT" || fail "standby-recover: fetch pre"
-  values_file <"$SNAPSHOT" >"$VALUES_PRE"
+  log "=== standby snapshot containment + native recovery ==="
 
   # Ensure Standby has applied recent log before snapshot trigger.
   id=1
@@ -686,26 +731,45 @@ run_standby_recover_round() {
   log "standby_snapshot via node ${via}"
   wait_standby_catalog "$standby_id" "standby-recover"
 
+  fetch_url=""
+  deadline=$((SECONDS + 45))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    fetch_url="$(best_ad_fetch_url 2>/dev/null || true)"
+    test -n "$fetch_url" && break
+    sleep 1
+  done
+  test -n "$fetch_url" || fail "standby-recover: no snapshot advertisement"
+  body="$(python3 -c 'import json,sys; print(json.dumps({"fetch_url":sys.argv[1]}))' "$fetch_url")"
+  explicit="$(curl -sS -o "$WORKDIR/standby-recover-explicit.json" -w '%{http_code}' -X POST "$(admin_url "$via")/admin/replicate_standby_snapshot/0" -H 'content-type: application/json' -d "$body")"
+  test "$explicit" = 409 || fail "standby-recover: explicit live restore was not rejected"
+
+  via="$(post_voter_admin "/groups/0/inc" '{"delta":1,"idem":null}')" \
+    || fail "standby-recover: post-snapshot write failed"
+  log "post-snapshot write via node ${via}"
+
   victim="$(pick_live_follower)" || fail "standby-recover: no follower"
   kill_pid="$(cat "$DATA/node-${victim}.pid" 2>/dev/null || true)"
   [[ -n "$kill_pid" ]] || fail "standby-recover: missing pid ${victim}"
   log "kill -9 wipe voter ${victim} pid=${kill_pid}"
   kill -9 "$kill_pid"
   wait "$kill_pid" 2>/dev/null || true
-  rm -rf "$DATA/node-${victim}"
-  mkdir -p "$DATA/node-${victim}"
 
   wait_all_groups_healthy "standby-recover-postkill" "$AFTER"
-  values_file <"$AFTER" >"$VALUES_POST"
-  assert_values_not_backwards "$VALUES_PRE" "$VALUES_POST" "standby-recover-postkill"
-  cp "$VALUES_POST" "$VALUES_PRE"
-
+  restarted_voter="$victim"
+  : "${WORKDIR:?}" "${NODES:?}" "${GROUPS:?}" "${restarted_voter:?}"
+  group=0
+  while [ "$group" -lt "$GROUPS" ]; do
+    find_group_floor "$group" || fail "standby-recover: group ${group} floor"
+    test "$(cat "$WORKDIR/floor-node-${group}.txt")" != "$restarted_voter"
+    group=$((group + 1))
+  done
   start_one_node "$victim"
-  # Prefer explicit fetch_url so the wiped node does not need a local ad list.
-  replicate_from_standby "$victim" "standby-recover" || true
-
-  wait_node_catchup "$victim" "$VALUES_PRE" "$AFTER" "$VALUES_POST" "standby-recover"
-  log "standby snapshot recover OK"
+  group=0
+  while [ "$group" -lt "$GROUPS" ]; do
+    wait_restarted_victim_floor "$group" || fail "standby-recover: group ${group} victim floor"
+    group=$((group + 1))
+  done
+  log "standby snapshot containment + native recovery OK"
 }
 
 run_standby_rounds() {
