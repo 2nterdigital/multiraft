@@ -83,8 +83,7 @@ impl SnapshotCatalog {
             size: data.len() as u64,
             sha256_hex: sha256_hex.clone(),
         };
-        let meta_bytes = serde_json::to_vec_pretty(&meta)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(io::Error::other)?;
         write_fsync(&dir.join("meta.json"), &meta_bytes)?;
         write_fsync(&dir.join("sha256"), format!("{sha256_hex}\n").as_bytes())?;
 
@@ -185,7 +184,7 @@ impl SnapshotCatalog {
         if entries.len() <= self.keep {
             return Ok(());
         }
-        entries.sort_by(|a, b| (a.last_index, a.last_term).cmp(&(b.last_index, b.last_term)));
+        entries.sort_by_key(|entry| (entry.last_index, entry.last_term));
         let remove = entries.len() - self.keep;
         for e in entries.into_iter().take(remove) {
             let _ = fs::remove_dir_all(&e.dir);

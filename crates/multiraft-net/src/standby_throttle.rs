@@ -132,10 +132,7 @@ impl StandbyThrottle {
                 .or_insert_with(|| Arc::new(Semaphore::new(max)))
                 .clone()
         };
-        match sem.acquire_owned().await {
-            Ok(p) => Some(p),
-            Err(_) => None,
-        }
+        sem.acquire_owned().await.ok()
     }
 }
 

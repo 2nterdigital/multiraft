@@ -18,7 +18,8 @@ use crate::node::GroupMap;
 use multiraft_core::typ;
 use multiraft_fsm::StateMachine;
 
-/// Serves [`RaftService`] and dispatches to the same handlers as in-process [`crate::node::Node`].
+/// Serves the tonic Raft service and dispatches to the same handlers as
+/// in-process [`crate::node::Node`].
 pub struct GrpcServer;
 
 impl GrpcServer {

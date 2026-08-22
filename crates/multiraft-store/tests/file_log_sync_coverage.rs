@@ -82,11 +82,11 @@ async fn exercise_store(level: FileLogSyncLevel, coalesce_us: u64) {
     store.save_vote(&vote).await.unwrap();
     assert_eq!(store.read_vote().await.unwrap(), Some(vote));
     let last = LogId::new(LeaderIdOf::<TypeConfig>::new_committed(1, 1), 2);
-    store.save_committed(Some(last.clone())).await.unwrap();
-    assert_eq!(store.read_committed().await.unwrap(), Some(last.clone()));
+    store.save_committed(Some(last)).await.unwrap();
+    assert_eq!(store.read_committed().await.unwrap(), Some(last));
 
     let state = store.get_log_state().await.unwrap();
-    assert_eq!(state.last_log_id, Some(last.clone()));
+    assert_eq!(state.last_log_id, Some(last));
 
     let entries = store.try_get_log_entries(1..=2).await.unwrap();
     assert_eq!(entries.len(), 2);
@@ -633,7 +633,7 @@ fn rewrite_persists_dirty_hard_state() {
             .unwrap();
         let last = LogId::new(LeaderIdOf::<TypeConfig>::new_committed(1, 1), 2);
         // Debounced commit dirties hard_state without immediate persist.
-        store.save_committed(Some(last.clone())).await.unwrap();
+        store.save_committed(Some(last)).await.unwrap();
         store
             .truncate_after(Some(LogId::new(
                 LeaderIdOf::<TypeConfig>::new_committed(1, 1),

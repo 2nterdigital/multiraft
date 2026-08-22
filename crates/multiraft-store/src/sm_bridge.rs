@@ -52,6 +52,8 @@ pub struct StoredSnapshot {
     pub data: Vec<u8>,
 }
 
+type StateMachineSnapshot = SnapshotOf<TypeConfig, Cursor<Vec<u8>>>;
+
 #[derive(Debug)]
 struct StateMachineStoreInner<S: StateMachine> {
     group_id: GroupId,
@@ -187,7 +189,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             .fsm
             .restore(group_id, &data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        inner.last_applied_log = meta.last_log_id.clone();
+        inner.last_applied_log = meta.last_log_id;
         // membership already preserved in meta / unchanged on inner
         inner.current_snapshot = Some(StoredSnapshot {
             meta: meta.clone(),
@@ -215,7 +217,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             inner
                 .fsm
                 .freeze_for_snapshot(group)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                .map_err(io::Error::other)?
         };
 
         let catalog = catalog.clone();
@@ -228,7 +230,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             catalog.write(group, index, term, snapshot_id, &data_for_write)
         })
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking: {e}")))??;
+        .map_err(|e| io::Error::other(format!("spawn_blocking: {e}")))??;
 
         // Advertise locally via current_snapshot for openraft get_current_snapshot.
         let leader_id = LeaderIdOf::<TypeConfig>::new_committed(term, 0);
@@ -249,9 +251,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         Ok(entry)
     }
 
-    fn snapshot_from_catalog(
-        &self,
-    ) -> Result<Option<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>>, io::Error> {
+    fn snapshot_from_catalog(&self) -> Result<Option<StateMachineSnapshot>, io::Error> {
         let Some(catalog) = &self.catalog else {
             return Ok(None);
         };
@@ -325,10 +325,10 @@ where
         let data = inner
             .fsm
             .freeze_for_snapshot(inner.group_id)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         let snapshot_idx = inner.next_snapshot_idx();
-        let snapshot_id = if let Some(last) = inner.last_applied_log.clone() {
+        let snapshot_id = if let Some(last) = inner.last_applied_log {
             format!(
                 "{}-{}-{}",
                 last.committed_leader_id(),
@@ -340,7 +340,7 @@ where
         };
 
         let meta = SnapshotMetaOf::<TypeConfig> {
-            last_log_id: inner.last_applied_log.clone(),
+            last_log_id: inner.last_applied_log,
             last_membership: inner.last_membership.clone(),
             snapshot_id,
         };
@@ -373,10 +373,7 @@ where
         &mut self,
     ) -> Result<(Option<LogIdOf<TypeConfig>>, StoredMembershipOf<TypeConfig>), io::Error> {
         let inner = self.inner.lock().await;
-        Ok((
-            inner.last_applied_log.clone(),
-            inner.last_membership.clone(),
-        ))
+        Ok((inner.last_applied_log, inner.last_membership.clone()))
     }
 
     #[tracing::instrument(level = "trace", skip(self, entries))]
@@ -392,7 +389,7 @@ where
             while let Some((entry, responder)) = entries.try_next().await? {
                 tracing::trace!(%entry.log_id, "replicate to sm");
 
-                inner.last_applied_log = Some(entry.log_id.clone());
+                inner.last_applied_log = Some(entry.log_id);
 
                 let response = match &entry.payload {
                     EntryPayload::Blank => Response::none(),
@@ -411,15 +408,13 @@ where
                             let out = inner
                                 .fsm
                                 .apply(group_id, index, &req.data)
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                                .map_err(io::Error::other)?;
                             Response::new(out.effects)
                         }
                     }
                     EntryPayload::Membership(mem) => {
-                        inner.last_membership = StoredMembershipOf::<TypeConfig>::new(
-                            Some(entry.log_id.clone()),
-                            mem.clone(),
-                        );
+                        inner.last_membership =
+                            StoredMembershipOf::<TypeConfig>::new(Some(entry.log_id), mem.clone());
                         Response::none()
                     }
                 };
@@ -466,7 +461,7 @@ where
             .fsm
             .restore(group_id, &data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        inner.last_applied_log = meta.last_log_id.clone();
+        inner.last_applied_log = meta.last_log_id;
         inner.last_membership = meta.last_membership.clone();
         inner.current_snapshot = Some(new_snapshot);
         drop(inner);

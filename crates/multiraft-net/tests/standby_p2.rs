@@ -690,7 +690,7 @@ async fn chunked_range_fetch_install() {
 
     // Resume: pad payload so mid-fail is reachable with small chunks.
     let mut padded = snap_bytes.clone();
-    padded.extend(std::iter::repeat(b'X').take(200));
+    padded.extend(std::iter::repeat_n(b'X', 200));
     let sha_pad = hex_sha256(&padded);
     let (addr2, _h2) = spawn_range_server(RangeSnapServe {
         data: padded.clone(),

@@ -90,11 +90,11 @@ async fn propose_succeeds_within(
             if !n.is_leader(group) {
                 continue;
             }
-            match tokio::time::timeout(Duration::from_millis(500), n.propose(group, data.clone()))
-                .await
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(500), n.propose(group, data.clone()))
+                    .await
             {
-                Ok(Ok(_)) => return true,
-                Ok(Err(_)) | Err(_) => {}
+                return true;
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -491,9 +491,8 @@ async fn rolling_leader_kill() {
     let members = peer_ids.to_vec();
     create_groups(&nodes, &[group], &members).await;
 
-    let mut idem = 1u64;
     let mut baseline = 0i64;
-    for round in 0..3 {
+    for (idem, round) in (1u64..).zip(0..3) {
         let leader = wait_for_leader(&nodes, group, Duration::from_secs(25))
             .await
             .unwrap_or_else(|| panic!("leader round {round}"));
@@ -508,7 +507,6 @@ async fn rolling_leader_kill() {
         let dead = [leader];
         let _ = wait_for_leader_among(&nodes, group, &dead, Duration::from_secs(30)).await;
         propose_on_leader(&nodes, group, CounterFsm::encode_add(1, idem)).await;
-        idem += 1;
         baseline = wait_fsm_at_least(&nodes, group, baseline + 1, Duration::from_secs(20)).await;
 
         // Restart previous leader before next kill so majority stays comfortable.
@@ -537,8 +535,7 @@ async fn rolling_restart_all_nodes() {
     propose_on_leader(&nodes, group, CounterFsm::encode_add(3, 1)).await;
     let mut floor = wait_fsm_at_least(&nodes, group, 3, Duration::from_secs(15)).await;
 
-    let mut idem = 2u64;
-    for &id in &peer_ids {
+    for (idem, &id) in (2u64..).zip(peer_ids.iter()) {
         let snap = max_fsm_value(&nodes, group).await;
         restart_node(&fabric, &mut nodes, &configs, id, &[group], &members).await;
         let _ = wait_for_leader(&nodes, group, Duration::from_secs(25))
@@ -551,7 +548,6 @@ async fn rolling_restart_all_nodes() {
         );
         floor = floor.max(after_restart);
         propose_on_leader(&nodes, group, CounterFsm::encode_add(1, idem)).await;
-        idem += 1;
         floor = wait_fsm_at_least(&nodes, group, floor + 1, Duration::from_secs(20)).await;
     }
 }
