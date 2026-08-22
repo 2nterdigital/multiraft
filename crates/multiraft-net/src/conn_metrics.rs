@@ -54,4 +54,3 @@ mod tests {
         assert_eq!(m.unique_peer_links(), 3);
     }
 }
-

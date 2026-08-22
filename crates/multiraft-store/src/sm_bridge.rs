@@ -4,23 +4,20 @@
 
 use std::io;
 use std::io::Cursor;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures::lock::Mutex;
 use futures::Stream;
 use futures::TryStreamExt;
-use futures::lock::Mutex;
+use multiraft_core::is_standby_snapshot_trigger;
 use multiraft_core::Request;
 use multiraft_core::Response;
 use multiraft_core::TypeConfig;
-use multiraft_core::is_standby_snapshot_trigger;
 use multiraft_fsm::GroupId;
 use multiraft_fsm::StateMachine;
-use openraft::EntryPayload;
-use openraft::OptionalSend;
-use openraft::RaftSnapshotBuilder;
 use openraft::alias::DefaultEntryOf;
 use openraft::alias::LeaderIdOf;
 use openraft::alias::LogIdOf;
@@ -30,6 +27,9 @@ use openraft::alias::StoredMembershipOf;
 use openraft::storage::EntryResponder;
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderIdExt;
+use openraft::EntryPayload;
+use openraft::OptionalSend;
+use openraft::RaftSnapshotBuilder;
 
 use crate::snapshot_catalog::CatalogEntry;
 use crate::snapshot_catalog::SnapshotCatalog;
@@ -153,12 +153,10 @@ impl<S: StateMachine> StateMachineStore<S> {
     /// Prefer this over Raft metrics after out-of-band [`Self::install_durable_snapshot`].
     pub async fn last_applied(&self) -> Option<(u64, u64)> {
         let inner = self.inner.lock().await;
-        inner.last_applied_log.as_ref().map(|id| {
-            (
-                id.index(),
-                id.committed_leader_id().term,
-            )
-        })
+        inner
+            .last_applied_log
+            .as_ref()
+            .map(|id| (id.index(), id.committed_leader_id().term))
     }
 
     /// Restore FSM + last_applied from durable snapshot bytes (recovery / pull).
@@ -245,16 +243,15 @@ impl<S: StateMachine> StateMachineStore<S> {
         };
         {
             let mut inner = self.inner.lock().await;
-            inner.current_snapshot = Some(StoredSnapshot {
-                meta,
-                data,
-            });
+            inner.current_snapshot = Some(StoredSnapshot { meta, data });
         }
 
         Ok(entry)
     }
 
-    fn snapshot_from_catalog(&self) -> Result<Option<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>>, io::Error> {
+    fn snapshot_from_catalog(
+        &self,
+    ) -> Result<Option<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>>, io::Error> {
         let Some(catalog) = &self.catalog else {
             return Ok(None);
         };
@@ -294,12 +291,15 @@ pub async fn build_standby_snapshot_async<S: StateMachine>(
 impl<S> RaftSnapshotBuilder<TypeConfig> for StateMachineStore<S>
 where
     S: StateMachine,
-    TypeConfig: openraft::RaftTypeConfig<D = Request, R = Response, Entry = DefaultEntryOf<TypeConfig>>,
+    TypeConfig:
+        openraft::RaftTypeConfig<D = Request, R = Response, Entry = DefaultEntryOf<TypeConfig>>,
 {
     type SnapshotData = Cursor<Vec<u8>>;
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn build_snapshot(&mut self) -> Result<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>, io::Error> {
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>, io::Error> {
         if !self.allow_hot_build {
             // StandbyOffload: never sync-dump FSM; serve installed / catalog only.
             {
@@ -329,7 +329,12 @@ where
 
         let snapshot_idx = inner.next_snapshot_idx();
         let snapshot_id = if let Some(last) = inner.last_applied_log.clone() {
-            format!("{}-{}-{}", last.committed_leader_id(), last.index(), snapshot_idx)
+            format!(
+                "{}-{}-{}",
+                last.committed_leader_id(),
+                last.index(),
+                snapshot_idx
+            )
         } else {
             format!("--{}", snapshot_idx)
         };
@@ -358,7 +363,8 @@ where
 impl<S> RaftStateMachine<TypeConfig> for StateMachineStore<S>
 where
     S: StateMachine,
-    TypeConfig: openraft::RaftTypeConfig<D = Request, R = Response, Entry = DefaultEntryOf<TypeConfig>>,
+    TypeConfig:
+        openraft::RaftTypeConfig<D = Request, R = Response, Entry = DefaultEntryOf<TypeConfig>>,
 {
     type SnapshotData = Cursor<Vec<u8>>;
     type SnapshotBuilder = Self;
@@ -367,7 +373,10 @@ where
         &mut self,
     ) -> Result<(Option<LogIdOf<TypeConfig>>, StoredMembershipOf<TypeConfig>), io::Error> {
         let inner = self.inner.lock().await;
-        Ok((inner.last_applied_log.clone(), inner.last_membership.clone()))
+        Ok((
+            inner.last_applied_log.clone(),
+            inner.last_membership.clone(),
+        ))
     }
 
     #[tracing::instrument(level = "trace", skip(self, entries))]

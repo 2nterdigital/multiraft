@@ -14,12 +14,7 @@ pub struct ApplyOut {
 pub trait StateMachine: Send + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn apply(
-        &mut self,
-        group: GroupId,
-        index: u64,
-        data: &[u8],
-    ) -> Result<ApplyOut, Self::Error>;
+    fn apply(&mut self, group: GroupId, index: u64, data: &[u8]) -> Result<ApplyOut, Self::Error>;
 
     fn snapshot(&self, group: GroupId) -> Result<Vec<u8>, Self::Error>;
 

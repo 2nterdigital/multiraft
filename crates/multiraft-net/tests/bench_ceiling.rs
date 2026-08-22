@@ -13,18 +13,18 @@ use multiraft_core::ClusterConfig;
 use multiraft_core::TypeConfig;
 use multiraft_fsm::CounterFsm;
 use multiraft_fsm::StateMachine;
-use multiraft_net::MultiRaft;
 use multiraft_net::decode;
 use multiraft_net::encode;
 use multiraft_net::wait_for_leader;
+use multiraft_net::MultiRaft;
 use multiraft_store::MemLogStore;
 use multiraft_store::Request;
 use multiraft_store::StateMachineStore;
 use multiraft_store::StubNetworkFactory;
-use openraft::BasicNode;
-use openraft::Config;
 use openraft::raft::AppendEntriesRequest;
 use openraft::type_config::TypeConfigExt;
+use openraft::BasicNode;
+use openraft::Config;
 use serde_json::json;
 
 fn pct(sorted: &[u64], p: f64) -> u64 {
@@ -87,17 +87,16 @@ fn ceiling_phases() {
             );
             let log = MemLogStore::default();
             let sm = StateMachineStore::new(0, CounterFsm::new());
-            let raft = openraft::Raft::new(
-                1,
-                config,
-                StubNetworkFactory,
-                log,
-                sm.clone(),
-            )
-            .await
-            .unwrap();
+            let raft = openraft::Raft::new(1, config, StubNetworkFactory, log, sm.clone())
+                .await
+                .unwrap();
             let mut nodes = BTreeMap::new();
-            nodes.insert(1u64, BasicNode { addr: String::new() });
+            nodes.insert(
+                1u64,
+                BasicNode {
+                    addr: String::new(),
+                },
+            );
             raft.initialize(nodes).await.unwrap();
             TypeConfig::sleep(Duration::from_millis(200)).await;
 
@@ -166,9 +165,7 @@ fn ceiling_phases() {
             }
             let fake = FakeAe {
                 term: 1,
-                entries: (1..=8)
-                    .map(|i| (i, CounterFsm::encode_add(1, i)))
-                    .collect(),
+                entries: (1..=8).map(|i| (i, CounterFsm::encode_add(1, i))).collect(),
             };
             let mut lats = Vec::with_capacity(ops as usize);
             let t0 = Instant::now();

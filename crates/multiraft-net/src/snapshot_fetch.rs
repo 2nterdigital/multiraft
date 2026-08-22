@@ -73,8 +73,15 @@ pub async fn pull_snapshot_chunked(
         Some(t) if t > 0 => t,
         _ => {
             // Server may omit length on HEAD / probe; fall back to full GET.
-            return pull_snapshot_full(&client, fetch_url, last_index, last_term, snapshot_id, &expected_sha)
-                .await;
+            return pull_snapshot_full(
+                &client,
+                fetch_url,
+                last_index,
+                last_term,
+                snapshot_id,
+                &expected_sha,
+            )
+            .await;
         }
     };
 

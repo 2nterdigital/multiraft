@@ -238,13 +238,9 @@ async fn factory_error_is_contextual_leaves_group_unpublished_and_is_retryable()
         .create_group(8, &[1])
         .await
         .expect_err("factory rejects first call");
-    assert!(error
-        .to_string()
-        .contains("create FSM for node 1, group 8"));
+    assert!(error.to_string().contains("create FSM for node 1, group 8"));
     assert_eq!(node.with_fsm(8, |_| ()).await, None);
-    node.create_group(8, &[1])
-        .await
-        .expect("serialized retry");
+    node.create_group(8, &[1]).await.expect("serialized retry");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     node.shutdown().await.expect("shutdown");
 }
@@ -277,7 +273,8 @@ impl StateMachine for DropProbeFsm {
 }
 
 #[tokio::test]
-async fn file_log_open_failure_drops_factory_fsm_on_default_voter_path_and_keeps_group_unpublished() {
+async fn file_log_open_failure_drops_factory_fsm_on_default_voter_path_and_keeps_group_unpublished()
+{
     let temp = tempfile::tempdir().expect("temporary data dir");
     let blocked = temp.path().join("group-7");
     std::fs::write(&blocked, b"not a directory").expect("block FileLog directory");

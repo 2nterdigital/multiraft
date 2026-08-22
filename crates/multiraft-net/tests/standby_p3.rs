@@ -7,9 +7,9 @@ use multiraft_core::MultiRaftError;
 use multiraft_core::NodeRole;
 use multiraft_core::SnapshotMode;
 use multiraft_fsm::CounterFsm;
+use multiraft_net::wait_for_leader;
 use multiraft_net::MultiRaft;
 use multiraft_net::SharedFabric;
-use multiraft_net::wait_for_leader;
 
 fn temp_dir(tag: &str, id: u64) -> std::path::PathBuf {
     let stamp = std::time::SystemTime::now()
@@ -169,7 +169,10 @@ async fn enable_stale_queries_on_voter_for_analytics() {
     let peer_ids = [1u64, 2, 3];
     let group = 0u64;
     let members = peer_ids.to_vec();
-    let dirs: Vec<_> = peer_ids.iter().map(|&id| temp_dir("analytics", id)).collect();
+    let dirs: Vec<_> = peer_ids
+        .iter()
+        .map(|&id| temp_dir("analytics", id))
+        .collect();
     let fabric = SharedFabric::new();
 
     let mut nodes = Vec::new();

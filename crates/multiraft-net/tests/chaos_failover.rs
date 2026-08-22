@@ -4,16 +4,16 @@
 //!
 //! Run with: `cargo test -p multiraft-net --test chaos_failover`
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use multiraft_core::ClusterConfig;
 use multiraft_fsm::CounterFsm;
+use multiraft_net::wait_for_leader;
 use multiraft_net::MultiRaft;
 use multiraft_net::SharedFabric;
-use multiraft_net::wait_for_leader;
 
 fn start_configs(peer_ids: &[u64]) -> Vec<ClusterConfig> {
     peer_ids
@@ -34,10 +34,7 @@ fn configs_with_temp_dirs(peer_ids: &[u64], root: &std::path::Path) -> Vec<Clust
         .collect()
 }
 
-async fn start_on_fabric(
-    fabric: &SharedFabric,
-    configs: &[ClusterConfig],
-) -> Vec<MultiRaft> {
+async fn start_on_fabric(fabric: &SharedFabric, configs: &[ClusterConfig]) -> Vec<MultiRaft> {
     let mut nodes = Vec::with_capacity(configs.len());
     for config in configs {
         nodes.push(
@@ -170,7 +167,10 @@ async fn restart_node(
         .iter()
         .position(|n| n.node_id() == node_id)
         .unwrap_or_else(|| panic!("node {node_id} missing"));
-    nodes[idx].shutdown().await.expect("shutdown before restart");
+    nodes[idx]
+        .shutdown()
+        .await
+        .expect("shutdown before restart");
     nodes[idx] = fabric
         .start_node(configs[idx].clone())
         .await
@@ -470,15 +470,7 @@ async fn majority_loss_then_recover() {
         "should stall without majority"
     );
 
-    restart_node(
-        &fabric,
-        &mut nodes,
-        &configs,
-        kill_a,
-        &[group],
-        &members,
-    )
-    .await;
+    restart_node(&fabric, &mut nodes, &configs, kill_a, &[group], &members).await;
     // kill_b stays down; majority is survivor + restarted kill_a.
     let dead = [kill_b];
     let _ = wait_for_leader_among(&nodes, group, &dead, Duration::from_secs(30)).await;
@@ -520,15 +512,7 @@ async fn rolling_leader_kill() {
         baseline = wait_fsm_at_least(&nodes, group, baseline + 1, Duration::from_secs(20)).await;
 
         // Restart previous leader before next kill so majority stays comfortable.
-        restart_node(
-            &fabric,
-            &mut nodes,
-            &configs,
-            leader,
-            &[group],
-            &members,
-        )
-        .await;
+        restart_node(&fabric, &mut nodes, &configs, leader, &[group], &members).await;
         let _ = wait_for_leader(&nodes, group, Duration::from_secs(25))
             .await
             .expect("leader after restart");

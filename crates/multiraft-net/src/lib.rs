@@ -23,25 +23,25 @@ pub use fsm_factory::FsmFactoryContext;
 pub use fsm_factory::StateMachineFactory;
 pub use grpc::GrpcRouter;
 pub use grpc::GrpcServer;
+pub use multiraft::wait_for_leader;
 pub use multiraft::MultiRaft;
 pub use multiraft::SharedFabric;
-pub use multiraft::wait_for_leader;
 pub use network::GrpcNetworkFactory;
 pub use network::NetworkFactory;
+pub use node::create_node;
 pub use node::GroupApp;
 pub use node::Node;
-pub use node::create_node;
 pub use router::NodeMessage;
 pub use router::NodeRx;
 pub use router::NodeTx;
 pub use router::Router;
 pub use router::RouterError;
-pub use snapshot_fetch::FetchedSnapshot;
 pub use snapshot_fetch::pull_snapshot_chunked;
+pub use snapshot_fetch::FetchedSnapshot;
 pub use standby_throttle::StandbyThrottle;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 /// Compact binary Raft RPC encoding (`bincode`).
 pub fn encode<T: Serialize>(t: T) -> Vec<u8> {

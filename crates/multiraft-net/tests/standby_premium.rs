@@ -4,20 +4,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::routing::get;
+use axum::Router;
 use multiraft_core::ClusterConfig;
 use multiraft_core::NodeRole;
 use multiraft_core::RecoverOutcome;
 use multiraft_core::SnapshotAdvertisement;
 use multiraft_core::SnapshotMode;
 use multiraft_fsm::CounterFsm;
+use multiraft_net::wait_for_leader;
 use multiraft_net::MultiRaft;
 use multiraft_net::SharedFabric;
-use multiraft_net::wait_for_leader;
 fn temp_dir(tag: &str, id: u64) -> std::path::PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -123,7 +123,12 @@ async fn auto_recover_via_http_from_standby_ads() {
     for (i, &id) in voter_ids.iter().enumerate() {
         voters.push(
             fabric
-                .start_node(standby_config(id, &peer_ids, dirs[i].clone(), NodeRole::Voter))
+                .start_node(standby_config(
+                    id,
+                    &peer_ids,
+                    dirs[i].clone(),
+                    NodeRole::Voter,
+                ))
                 .await
                 .expect("start voter"),
         );
@@ -161,7 +166,12 @@ async fn auto_recover_via_http_from_standby_ads() {
     let mut expected = 0i64;
     for (i, delta) in [1i64, 2, 3].into_iter().enumerate() {
         expected += delta;
-        propose_on_leader(&voters, group, CounterFsm::encode_add(delta, (i as u64) + 1)).await;
+        propose_on_leader(
+            &voters,
+            group,
+            CounterFsm::encode_add(delta, (i as u64) + 1),
+        )
+        .await;
     }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -216,7 +226,12 @@ async fn auto_recover_via_http_from_standby_ads() {
     std::fs::remove_dir_all(&dirs[0]).ok();
     std::fs::create_dir_all(&dirs[0]).unwrap();
     let restarted = fabric
-        .start_node(standby_config(1, &peer_ids, dirs[0].clone(), NodeRole::Voter))
+        .start_node(standby_config(
+            1,
+            &peer_ids,
+            dirs[0].clone(),
+            NodeRole::Voter,
+        ))
         .await
         .expect("restart");
     restarted
@@ -283,7 +298,10 @@ async fn standby_throttle_delay_proposes_still_ok() {
     let group = 0u64;
     let members = voter_ids.to_vec();
 
-    let dirs: Vec<_> = peer_ids.iter().map(|&id| temp_dir("throttle", id)).collect();
+    let dirs: Vec<_> = peer_ids
+        .iter()
+        .map(|&id| temp_dir("throttle", id))
+        .collect();
     let fabric = SharedFabric::new();
 
     let mut voters = Vec::new();
@@ -293,12 +311,7 @@ async fn standby_throttle_delay_proposes_still_ok() {
         cfg.standby_max_inflight = 2;
         voters.push(fabric.start_node(cfg).await.expect("start voter"));
     }
-    let mut standby_cfg = standby_config(
-        standby_id,
-        &peer_ids,
-        dirs[3].clone(),
-        NodeRole::Standby,
-    );
+    let mut standby_cfg = standby_config(standby_id, &peer_ids, dirs[3].clone(), NodeRole::Standby);
     standby_cfg.standby_replicate_delay_ms = 50;
     let standby = fabric.start_node(standby_cfg).await.expect("standby");
 
@@ -324,12 +337,7 @@ async fn standby_throttle_delay_proposes_still_ok() {
     assert!(leader.standby_throttle_ids().contains(&standby_id));
 
     for i in 0..8u64 {
-        propose_on_leader(
-            &voters,
-            group,
-            CounterFsm::encode_add(1, 1000 + i),
-        )
-        .await;
+        propose_on_leader(&voters, group, CounterFsm::encode_add(1, 1000 + i)).await;
     }
 
     let v = leader
@@ -354,7 +362,12 @@ async fn promote_then_demote_standby_membership() {
     for (i, &id) in voter_ids.iter().enumerate() {
         voters.push(
             fabric
-                .start_node(standby_config(id, &peer_ids, dirs[i].clone(), NodeRole::Voter))
+                .start_node(standby_config(
+                    id,
+                    &peer_ids,
+                    dirs[i].clone(),
+                    NodeRole::Voter,
+                ))
                 .await
                 .expect("start voter"),
         );

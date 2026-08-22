@@ -8,20 +8,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::routing::get;
+use axum::Router;
 use multiraft_core::ClusterConfig;
 use multiraft_core::NodeRole;
 use multiraft_core::RecoverOutcome;
 use multiraft_core::SnapshotAdvertisement;
 use multiraft_core::SnapshotMode;
 use multiraft_fsm::CounterFsm;
+use multiraft_net::wait_for_leader;
 use multiraft_net::MultiRaft;
 use multiraft_net::SharedFabric;
-use multiraft_net::wait_for_leader;
 fn temp_dir(tag: &str, id: u64) -> std::path::PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -59,12 +59,7 @@ async fn propose_on_leader(nodes: &[MultiRaft], group: u64, data: Vec<u8>) {
     propose_on_leader_skipping(nodes, group, data, &[]).await;
 }
 
-async fn propose_on_leader_skipping(
-    nodes: &[MultiRaft],
-    group: u64,
-    data: Vec<u8>,
-    skip: &[u64],
-) {
+async fn propose_on_leader_skipping(nodes: &[MultiRaft], group: u64, data: Vec<u8>, skip: &[u64]) {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         for n in nodes {
@@ -327,8 +322,7 @@ async fn kill_leader_with_standby_present() {
     leader.shutdown().await.unwrap();
 
     let dead = [leader_id];
-    let new_leader =
-        wait_for_leader_skipping(&voters, group, &dead, Duration::from_secs(15)).await;
+    let new_leader = wait_for_leader_skipping(&voters, group, &dead, Duration::from_secs(15)).await;
     assert_ne!(new_leader, leader_id);
 
     propose_on_leader_skipping(&voters, group, CounterFsm::encode_add(2, 2), &dead).await;
@@ -429,18 +423,15 @@ async fn voter_recover_from_standby_under_load() {
         .copied()
         .find(|&id| id != leader_id)
         .unwrap();
-    let victim_idx = voters.iter().position(|n| n.node_id() == victim_id).unwrap();
+    let victim_idx = voters
+        .iter()
+        .position(|n| n.node_id() == victim_id)
+        .unwrap();
     voters[victim_idx].shutdown().await.unwrap();
 
     // Continue writes on survivors.
     let dead = [victim_id];
-    propose_on_leader_skipping(
-        &voters,
-        group,
-        CounterFsm::encode_add(1, 999),
-        &dead,
-    )
-    .await;
+    propose_on_leader_skipping(&voters, group, CounterFsm::encode_add(1, 999), &dead).await;
     expected += 1;
 
     // Wipe victim disk and restart; recover from ad.
@@ -480,7 +471,13 @@ async fn voter_recover_from_standby_under_load() {
     );
 
     // Catch up remaining log.
-    wait_fsm_ge(&voters[victim_idx], group, expected, Duration::from_secs(20)).await;
+    wait_fsm_ge(
+        &voters[victim_idx],
+        group,
+        expected,
+        Duration::from_secs(20),
+    )
+    .await;
 }
 
 /// C43: Promote Standby under load, then kill an old voter — quorum still writable.
@@ -671,10 +668,7 @@ async fn promote_then_demote_under_load() {
                 }
             }
             if !done && standby.is_leader(group) {
-                standby
-                    .demote_to_standby(group, standby_id)
-                    .await
-                    .unwrap();
+                standby.demote_to_standby(group, standby_id).await.unwrap();
                 done = true;
             }
             if done {
@@ -779,8 +773,12 @@ async fn multi_group_standby_leader_kill() {
     let mut expected = [0i64; 3];
     for (gi, &g) in groups.iter().enumerate() {
         for i in 0..3u64 {
-            propose_on_leader(&voters, g, CounterFsm::encode_add(1, (gi as u64) * 100 + i + 1))
-                .await;
+            propose_on_leader(
+                &voters,
+                g,
+                CounterFsm::encode_add(1, (gi as u64) * 100 + i + 1),
+            )
+            .await;
             expected[gi] += 1;
         }
         wait_fsm_ge(&standby, g, expected[gi], Duration::from_secs(10)).await;
@@ -900,17 +898,14 @@ async fn bad_snapshot_ad_fails_closed_then_log_catchup() {
         .copied()
         .find(|&id| id != leader_id)
         .unwrap();
-    let victim_idx = voters.iter().position(|n| n.node_id() == victim_id).unwrap();
+    let victim_idx = voters
+        .iter()
+        .position(|n| n.node_id() == victim_id)
+        .unwrap();
     voters[victim_idx].shutdown().await.unwrap();
     let dead = [victim_id];
 
-    propose_on_leader_skipping(
-        &voters,
-        group,
-        CounterFsm::encode_add(3, 499),
-        &dead,
-    )
-    .await;
+    propose_on_leader_skipping(&voters, group, CounterFsm::encode_add(3, 499), &dead).await;
     expected += 3;
 
     let _ = std::fs::remove_dir_all(&dirs[victim_idx]);
@@ -948,7 +943,13 @@ async fn bad_snapshot_ad_fails_closed_then_log_catchup() {
     }
 
     // Log replication from survivors must still restore the FSM.
-    wait_fsm_ge(&voters[victim_idx], group, expected, Duration::from_secs(20)).await;
+    wait_fsm_ge(
+        &voters[victim_idx],
+        group,
+        expected,
+        Duration::from_secs(20),
+    )
+    .await;
 }
 
 /// C48: Standby replication throttle under churn — kill Standby mid-load; voters keep writing.
@@ -969,12 +970,7 @@ async fn throttled_standby_kill_under_churn() {
         c.standby_max_inflight = 2;
         voters.push(fabric.start_node(c).await.unwrap());
     }
-    let mut sc = cfg(
-        standby_id,
-        &peer_ids,
-        dirs[3].clone(),
-        NodeRole::Standby,
-    );
+    let mut sc = cfg(standby_id, &peer_ids, dirs[3].clone(), NodeRole::Standby);
     sc.standby_replicate_delay_ms = 40;
     let standby = fabric.start_node(sc).await.unwrap();
 

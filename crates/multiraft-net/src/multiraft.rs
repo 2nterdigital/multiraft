@@ -729,7 +729,10 @@ impl<S: StateMachine> MultiRaft<S> {
                 }
                 let msg = e.to_string();
                 if msg.contains("configuration change") {
-                    return Err(transient_membership_err("promote_standby change_membership", &e));
+                    return Err(transient_membership_err(
+                        "promote_standby change_membership",
+                        &e,
+                    ));
                 }
                 Err(MultiRaftError::Other(anyhow::anyhow!(
                     "promote_standby change_membership: {e}"

@@ -3,17 +3,17 @@
 use std::net::SocketAddr;
 
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::Server;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
-use tonic::transport::Server;
 
 use crate::api;
 use crate::encode;
-use crate::grpc::proto::RaftRequest;
-use crate::grpc::proto::RaftResponse;
 use crate::grpc::proto::raft_service_server::RaftService;
 use crate::grpc::proto::raft_service_server::RaftServiceServer;
+use crate::grpc::proto::RaftRequest;
+use crate::grpc::proto::RaftResponse;
 use crate::node::GroupMap;
 use multiraft_core::typ;
 use multiraft_fsm::StateMachine;
@@ -52,10 +52,7 @@ pub(crate) struct RaftServiceImpl<S: StateMachine> {
 
 #[tonic::async_trait]
 impl<S: StateMachine + 'static> RaftService for RaftServiceImpl<S> {
-    async fn call(
-        &self,
-        request: Request<RaftRequest>,
-    ) -> Result<Response<RaftResponse>, Status> {
+    async fn call(&self, request: Request<RaftRequest>) -> Result<Response<RaftResponse>, Status> {
         demux_raft_call(&self.groups, request.into_inner()).await
     }
 }
@@ -69,9 +66,9 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
         match groups.get(&req.group_id) {
             Some(g) => g.raft.clone(),
             None => {
-                let payload = encode::<Result<(), typ::RaftError>>(Err(
-                    typ::RaftError::Fatal(openraft::error::Fatal::Stopped),
-                ));
+                let payload = encode::<Result<(), typ::RaftError>>(Err(typ::RaftError::Fatal(
+                    openraft::error::Fatal::Stopped,
+                )));
                 return Ok(Response::new(RaftResponse { payload }));
             }
         }

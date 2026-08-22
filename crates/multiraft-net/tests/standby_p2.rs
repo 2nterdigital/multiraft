@@ -1,13 +1,12 @@
 //! P2 Aeron Standby parity: multi-standby ads, daisy-chain snapshot sync, Range fetch.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
@@ -15,16 +14,17 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
+use axum::Router;
 use multiraft_core::ClusterConfig;
 use multiraft_core::NodeRole;
 use multiraft_core::RecoverOutcome;
 use multiraft_core::SnapshotAdvertisement;
 use multiraft_core::SnapshotMode;
 use multiraft_fsm::CounterFsm;
-use multiraft_net::MultiRaft;
-use multiraft_net::SharedFabric;
 use multiraft_net::pull_snapshot_chunked;
 use multiraft_net::wait_for_leader;
+use multiraft_net::MultiRaft;
+use multiraft_net::SharedFabric;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -124,10 +124,7 @@ fn snap_meta_headers(s: &RangeSnapServe) -> HeaderMap {
     headers
 }
 
-async fn serve_range_snap(
-    State(s): State<Arc<RangeSnapServe>>,
-    headers: HeaderMap,
-) -> Response {
+async fn serve_range_snap(State(s): State<Arc<RangeSnapServe>>, headers: HeaderMap) -> Response {
     let mut out = snap_meta_headers(&s);
     out.insert(
         axum::http::header::CONTENT_LENGTH,
@@ -203,7 +200,12 @@ async fn multi_standby_ads_pick_newest() {
     for (i, &id) in voter_ids.iter().enumerate() {
         voters.push(
             fabric
-                .start_node(standby_config(id, &peer_ids, dirs[i].clone(), NodeRole::Voter))
+                .start_node(standby_config(
+                    id,
+                    &peer_ids,
+                    dirs[i].clone(),
+                    NodeRole::Voter,
+                ))
                 .await
                 .expect("voter"),
         );
@@ -244,7 +246,12 @@ async fn multi_standby_ads_pick_newest() {
     leader.add_standby(group, standby_b).await.expect("add b");
 
     for (i, delta) in [1i64, 2, 3].into_iter().enumerate() {
-        propose_on_leader(&voters, group, CounterFsm::encode_add(delta, (i as u64) + 1)).await;
+        propose_on_leader(
+            &voters,
+            group,
+            CounterFsm::encode_add(delta, (i as u64) + 1),
+        )
+        .await;
     }
 
     let old_data = b"old-snapshot-payload".to_vec();
@@ -252,7 +259,10 @@ async fn multi_standby_ads_pick_newest() {
     // Wait standby A catch-up, trigger snapshot → newer ad from A.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let v = sa.with_fsm(group, |fsm| fsm.value(group)).await.unwrap_or(0);
+        let v = sa
+            .with_fsm(group, |fsm| fsm.value(group))
+            .await
+            .unwrap_or(0);
         if v >= 6 {
             break;
         }
@@ -332,7 +342,12 @@ async fn multi_standby_ads_pick_newest() {
     std::fs::remove_dir_all(&dirs[0]).ok();
     std::fs::create_dir_all(&dirs[0]).unwrap();
     let restarted = fabric
-        .start_node(standby_config(1, &peer_ids, dirs[0].clone(), NodeRole::Voter))
+        .start_node(standby_config(
+            1,
+            &peer_ids,
+            dirs[0].clone(),
+            NodeRole::Voter,
+        ))
         .await
         .expect("restart");
     restarted
@@ -390,7 +405,12 @@ async fn daisy_chain_snapshot_from_upstream() {
     for (i, &id) in voter_ids.iter().enumerate() {
         voters.push(
             fabric
-                .start_node(standby_config(id, &peer_ids, dirs[i].clone(), NodeRole::Voter))
+                .start_node(standby_config(
+                    id,
+                    &peer_ids,
+                    dirs[i].clone(),
+                    NodeRole::Voter,
+                ))
                 .await
                 .expect("voter"),
         );
@@ -432,7 +452,10 @@ async fn daisy_chain_snapshot_from_upstream() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let v = sa.with_fsm(group, |fsm| fsm.value(group)).await.unwrap_or(0);
+        let v = sa
+            .with_fsm(group, |fsm| fsm.value(group))
+            .await
+            .unwrap_or(0);
         if v == expected {
             break;
         }
@@ -520,7 +543,12 @@ async fn daisy_chain_snapshot_from_upstream() {
     std::fs::remove_dir_all(&dirs[0]).ok();
     std::fs::create_dir_all(&dirs[0]).unwrap();
     let restarted = fabric
-        .start_node(standby_config(1, &peer_ids, dirs[0].clone(), NodeRole::Voter))
+        .start_node(standby_config(
+            1,
+            &peer_ids,
+            dirs[0].clone(),
+            NodeRole::Voter,
+        ))
         .await
         .expect("restart");
     restarted
@@ -643,7 +671,9 @@ async fn chunked_range_fetch_install() {
 
     // Direct chunked helper.
     let tmp = temp_dir("chunk-tmp", 0);
-    let fetched = pull_snapshot_chunked(&url, 16, &tmp).await.expect("chunked pull");
+    let fetched = pull_snapshot_chunked(&url, 16, &tmp)
+        .await
+        .expect("chunked pull");
     assert_eq!(fetched.data, snap_bytes);
     assert_eq!(fetched.sha256_hex, sha);
 
@@ -679,11 +709,7 @@ async fn chunked_range_fetch_install() {
     let partials: Vec<_> = std::fs::read_dir(&tmp2)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .contains("multiraft-snap-")
-        })
+        .filter(|e| e.file_name().to_string_lossy().contains("multiraft-snap-"))
         .collect();
     assert!(!partials.is_empty(), "expected partial temp after mid-fail");
     let fetched2 = pull_snapshot_chunked(&url2, 16, &tmp2)

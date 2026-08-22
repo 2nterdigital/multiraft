@@ -3,19 +3,19 @@
 //! Run with:
 //! `cargo test -p multiraft-net --test linearizability_porcupine -- --nocapture`
 
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
 use multiraft_core::ClusterConfig;
 use multiraft_core::MultiRaftError;
 use multiraft_fsm::CounterFsm;
-use multiraft_net::MultiRaft;
 use multiraft_net::wait_for_leader;
+use multiraft_net::MultiRaft;
 use porcupine_rs::Model;
 use porcupine_rs::Operation;
 
@@ -91,8 +91,7 @@ async fn propose_inc_ok(
                     });
                     return;
                 }
-                Err(MultiRaftError::NotLeader { .. })
-                | Err(MultiRaftError::UnknownGroup(_)) => {}
+                Err(MultiRaftError::NotLeader { .. }) | Err(MultiRaftError::UnknownGroup(_)) => {}
                 Err(_) => {}
             }
         }
@@ -140,8 +139,7 @@ async fn read_ok(
                     });
                     return;
                 }
-                Err(MultiRaftError::NotLeader { .. })
-                | Err(MultiRaftError::UnknownGroup(_)) => {}
+                Err(MultiRaftError::NotLeader { .. }) | Err(MultiRaftError::UnknownGroup(_)) => {}
                 Err(_) => {}
             }
         }

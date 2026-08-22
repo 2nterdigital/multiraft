@@ -44,10 +44,7 @@ fn bad_payload_returns_decode_error() {
         .apply(1, 1, b"not-json")
         .expect_err("invalid payload must fail");
     let msg = err.to_string();
-    assert!(
-        msg.contains("decode"),
-        "expected decode error, got: {msg}"
-    );
+    assert!(msg.contains("decode"), "expected decode error, got: {msg}");
 }
 
 #[test]

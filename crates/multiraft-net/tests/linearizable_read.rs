@@ -5,8 +5,8 @@ use std::time::Duration;
 use multiraft_core::ClusterConfig;
 use multiraft_core::MultiRaftError;
 use multiraft_fsm::CounterFsm;
-use multiraft_net::MultiRaft;
 use multiraft_net::wait_for_leader;
+use multiraft_net::MultiRaft;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_linearizable_sees_committed_write() {
@@ -15,10 +15,14 @@ async fn read_linearizable_sees_committed_write() {
         .iter()
         .map(|&id| ClusterConfig::for_test(id, &peer_ids))
         .collect();
-    let nodes = MultiRaft::start_cluster(configs).await.expect("start_cluster");
+    let nodes = MultiRaft::start_cluster(configs)
+        .await
+        .expect("start_cluster");
     let group = 1u64;
     for n in &nodes {
-        n.create_group(group, &peer_ids).await.expect("create_group");
+        n.create_group(group, &peer_ids)
+            .await
+            .expect("create_group");
     }
     let leader_id = wait_for_leader(&nodes, group, Duration::from_secs(10))
         .await
@@ -47,10 +51,14 @@ async fn read_linearizable_on_follower_returns_not_leader() {
         .iter()
         .map(|&id| ClusterConfig::for_test(id, &peer_ids))
         .collect();
-    let nodes = MultiRaft::start_cluster(configs).await.expect("start_cluster");
+    let nodes = MultiRaft::start_cluster(configs)
+        .await
+        .expect("start_cluster");
     let group = 1u64;
     for n in &nodes {
-        n.create_group(group, &peer_ids).await.expect("create_group");
+        n.create_group(group, &peer_ids)
+            .await
+            .expect("create_group");
     }
     let leader_id = wait_for_leader(&nodes, group, Duration::from_secs(10))
         .await

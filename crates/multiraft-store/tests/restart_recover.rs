@@ -11,9 +11,9 @@ use multiraft_store::Request;
 use multiraft_store::StateMachineStore;
 use multiraft_store::StubNetworkFactory;
 use multiraft_store::TypeConfig as RaftTypeConfig;
+use openraft::type_config::TypeConfigExt;
 use openraft::BasicNode;
 use openraft::Config;
-use openraft::type_config::TypeConfigExt;
 
 async fn create_single_node_file(
     node_id: u64,
@@ -67,12 +67,18 @@ fn restart_replays_committed_state() {
             let (raft, sm) = create_single_node_file(1, group_id, &data_dir).await;
 
             let mut nodes = BTreeMap::new();
-            nodes.insert(1u64, BasicNode { addr: "".to_string() });
+            nodes.insert(
+                1u64,
+                BasicNode {
+                    addr: "".to_string(),
+                },
+            );
             raft.initialize(nodes).await.unwrap();
             RaftTypeConfig::sleep(Duration::from_millis(200)).await;
 
             for (i, delta) in [1i64, 2, 3, 4, 5].into_iter().enumerate() {
-                let req = Request::new(CounterFsm::encode_add(delta, /*idem=*/ (i as u64) + 1));
+                let req =
+                    Request::new(CounterFsm::encode_add(delta, /*idem=*/ (i as u64) + 1));
                 raft.client_write(req).await.unwrap();
             }
 

@@ -6,10 +6,6 @@
 use std::future::Future;
 use std::io::Cursor;
 
-use openraft::BasicNode;
-use openraft::OptionalSend;
-use openraft::RaftNetworkFactory;
-use openraft::RaftNetworkV2;
 use openraft::error::RPCError;
 use openraft::error::ReplicationClosed;
 use openraft::error::StreamingError;
@@ -24,6 +20,10 @@ use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::type_config::alias::SnapshotOf;
 use openraft::type_config::alias::VoteOf;
+use openraft::BasicNode;
+use openraft::OptionalSend;
+use openraft::RaftNetworkFactory;
+use openraft::RaftNetworkV2;
 
 use multiraft_core::NodeId;
 use multiraft_core::TypeConfig;

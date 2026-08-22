@@ -6,9 +6,9 @@ use multiraft_core::ClusterConfig;
 use multiraft_core::NodeRole;
 use multiraft_core::SnapshotMode;
 use multiraft_fsm::CounterFsm;
+use multiraft_net::wait_for_leader;
 use multiraft_net::MultiRaft;
 use multiraft_net::SharedFabric;
-use multiraft_net::wait_for_leader;
 
 fn temp_dir(tag: &str, id: u64) -> std::path::PathBuf {
     let stamp = std::time::SystemTime::now()
@@ -26,7 +26,12 @@ fn temp_dir(tag: &str, id: u64) -> std::path::PathBuf {
     dir
 }
 
-fn standby_config(node_id: u64, peer_ids: &[u64], data_dir: std::path::PathBuf, role: NodeRole) -> ClusterConfig {
+fn standby_config(
+    node_id: u64,
+    peer_ids: &[u64],
+    data_dir: std::path::PathBuf,
+    role: NodeRole,
+) -> ClusterConfig {
     let mut cfg = ClusterConfig::for_test(node_id, peer_ids);
     cfg.data_dir = data_dir;
     cfg.role = role;
@@ -70,16 +75,8 @@ async fn standby_async_snapshot_and_voter_recovery() {
         let cfg = standby_config(id, &peer_ids, dirs[i].clone(), NodeRole::Voter);
         voters.push(fabric.start_node(cfg).await.expect("start voter"));
     }
-    let standby_cfg = standby_config(
-        standby_id,
-        &peer_ids,
-        dirs[3].clone(),
-        NodeRole::Standby,
-    );
-    let standby = fabric
-        .start_node(standby_cfg)
-        .await
-        .expect("start standby");
+    let standby_cfg = standby_config(standby_id, &peer_ids, dirs[3].clone(), NodeRole::Standby);
+    let standby = fabric.start_node(standby_cfg).await.expect("start standby");
 
     for n in &voters {
         n.create_group(group, &members)
@@ -106,10 +103,7 @@ async fn standby_async_snapshot_and_voter_recovery() {
 
     // Standby must never become leader.
     for _ in 0..20 {
-        assert!(
-            !standby.is_leader(group),
-            "standby must not be leader"
-        );
+        assert!(!standby.is_leader(group), "standby must not be leader");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -167,12 +161,7 @@ async fn standby_async_snapshot_and_voter_recovery() {
     voters[0].shutdown().await.expect("shutdown voter1");
 
     let restarted = fabric
-        .start_node(standby_config(
-            1,
-            &peer_ids,
-            voter1_dir,
-            NodeRole::Voter,
-        ))
+        .start_node(standby_config(1, &peer_ids, voter1_dir, NodeRole::Voter))
         .await
         .expect("restart voter1");
     restarted
@@ -180,9 +169,7 @@ async fn standby_async_snapshot_and_voter_recovery() {
         .await
         .expect("recreate group on voter1");
 
-    let catalog = standby
-        .snapshot_catalog()
-        .expect("standby catalog");
+    let catalog = standby.snapshot_catalog().expect("standby catalog");
     restarted
         .try_install_from_standby_catalog(group, catalog.as_ref())
         .await

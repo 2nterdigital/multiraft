@@ -38,14 +38,9 @@ impl CounterFsm {
 impl StateMachine for CounterFsm {
     type Error = CounterError;
 
-    fn apply(
-        &mut self,
-        group: GroupId,
-        _index: u64,
-        data: &[u8],
-    ) -> Result<ApplyOut, Self::Error> {
-        let cmd: Cmd = bincode::deserialize(data)
-            .map_err(|e| CounterError::Decode(e.to_string()))?;
+    fn apply(&mut self, group: GroupId, _index: u64, data: &[u8]) -> Result<ApplyOut, Self::Error> {
+        let cmd: Cmd =
+            bincode::deserialize(data).map_err(|e| CounterError::Decode(e.to_string()))?;
         let seen = self.seen.entry(group).or_default();
         if seen.insert(cmd.idem) {
             *self.values.entry(group).or_default() += cmd.delta;
@@ -64,8 +59,8 @@ impl StateMachine for CounterFsm {
     }
 
     fn restore(&mut self, group: GroupId, snapshot: &[u8]) -> Result<(), Self::Error> {
-        let (v, seen): (i64, Vec<u64>) = serde_json::from_slice(snapshot)
-            .map_err(|e| CounterError::Decode(e.to_string()))?;
+        let (v, seen): (i64, Vec<u64>) =
+            serde_json::from_slice(snapshot).map_err(|e| CounterError::Decode(e.to_string()))?;
         self.values.insert(group, v);
         self.seen.insert(group, seen.into_iter().collect());
         Ok(())

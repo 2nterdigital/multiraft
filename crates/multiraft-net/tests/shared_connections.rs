@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use multiraft_core::TypeConfig;
 use multiraft_fsm::CounterFsm;
-use multiraft_net::Router;
 use multiraft_net::create_node;
+use multiraft_net::Router;
 use multiraft_store::Request;
-use openraft::BasicNode;
 use openraft::async_runtime::WatchReceiver;
 use openraft::type_config::TypeConfigExt;
+use openraft::BasicNode;
 
 #[tokio::test]
 async fn peer_connections_are_o_nodes_not_o_groups() {
@@ -47,9 +47,24 @@ async fn peer_connections_are_o_nodes_not_o_groups() {
 
     let all_nodes = {
         let mut nodes = BTreeMap::new();
-        nodes.insert(1u64, BasicNode { addr: "".to_string() });
-        nodes.insert(2u64, BasicNode { addr: "".to_string() });
-        nodes.insert(3u64, BasicNode { addr: "".to_string() });
+        nodes.insert(
+            1u64,
+            BasicNode {
+                addr: "".to_string(),
+            },
+        );
+        nodes.insert(
+            2u64,
+            BasicNode {
+                addr: "".to_string(),
+            },
+        );
+        nodes.insert(
+            3u64,
+            BasicNode {
+                addr: "".to_string(),
+            },
+        );
         nodes
     };
 

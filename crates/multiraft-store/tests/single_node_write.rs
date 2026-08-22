@@ -15,9 +15,9 @@ use multiraft_store::Request;
 use multiraft_store::StateMachineStore;
 use multiraft_store::StubNetworkFactory;
 use multiraft_store::TypeConfig as RaftTypeConfig;
+use openraft::type_config::TypeConfigExt;
 use openraft::BasicNode;
 use openraft::Config;
-use openraft::type_config::TypeConfigExt;
 
 async fn create_single_node(
     node_id: u64,
@@ -57,7 +57,12 @@ fn single_node_client_write_applies_to_counter_fsm() {
 
         // Initialize single-node membership (from upstream test_cluster bootstrap).
         let mut nodes = BTreeMap::new();
-        nodes.insert(1u64, BasicNode { addr: "".to_string() });
+        nodes.insert(
+            1u64,
+            BasicNode {
+                addr: "".to_string(),
+            },
+        );
         raft.initialize(nodes).await.unwrap();
 
         RaftTypeConfig::sleep(Duration::from_millis(200)).await;

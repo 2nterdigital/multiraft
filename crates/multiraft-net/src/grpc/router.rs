@@ -7,7 +7,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use openraft::OptionalSend;
 use openraft::alias::SnapshotOf;
 use openraft::error::RPCError;
 use openraft::error::ReplicationClosed;
@@ -22,6 +21,7 @@ use openraft::raft::TransferLeaderRequest;
 use openraft::raft::TransferLeaderResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
+use openraft::OptionalSend;
 use openraft_multi::GroupRouter;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
@@ -29,15 +29,15 @@ use tonic::transport::Endpoint;
 use crate::conn_metrics::ConnMetrics;
 use crate::decode;
 use crate::encode;
-use crate::grpc::proto::RaftRequest;
 use crate::grpc::proto::raft_service_client::RaftServiceClient;
+use crate::grpc::proto::RaftRequest;
 use crate::standby_throttle::StandbyThrottle;
+use multiraft_core::typ;
+use multiraft_core::typ::RaftError;
 use multiraft_core::ClusterConfig;
 use multiraft_core::GroupId;
 use multiraft_core::NodeId;
 use multiraft_core::TypeConfig;
-use multiraft_core::typ;
-use multiraft_core::typ::RaftError;
 
 #[derive(Debug)]
 struct GrpcError(String);
@@ -241,8 +241,8 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
     }
 
     fn backoff(&self) -> Option<Backoff> {
-        Some(Backoff::new(std::iter::repeat(std::time::Duration::from_millis(
-            500,
-        ))))
+        Some(Backoff::new(std::iter::repeat(
+            std::time::Duration::from_millis(500),
+        )))
     }
 }

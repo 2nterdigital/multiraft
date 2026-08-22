@@ -5,8 +5,8 @@ use std::time::Duration;
 use multiraft_core::ClusterConfig;
 use multiraft_core::MultiRaftError;
 use multiraft_fsm::CounterFsm;
-use multiraft_net::MultiRaft;
 use multiraft_net::wait_for_leader;
+use multiraft_net::MultiRaft;
 
 #[tokio::test]
 async fn propose_unknown_group_errors() {
@@ -16,7 +16,9 @@ async fn propose_unknown_group_errors() {
         .map(|&id| ClusterConfig::for_test(id, &peer_ids))
         .collect();
 
-    let nodes = MultiRaft::start_cluster(configs).await.expect("start_cluster");
+    let nodes = MultiRaft::start_cluster(configs)
+        .await
+        .expect("start_cluster");
     let err = nodes[0]
         .propose(99, CounterFsm::encode_add(1, 1))
         .await
@@ -32,7 +34,9 @@ async fn propose_unknown_group_errors() {
 async fn create_group_empty_members_errors() {
     let peer_ids = [1u64];
     let configs = vec![ClusterConfig::for_test(1, &peer_ids)];
-    let nodes = MultiRaft::start_cluster(configs).await.expect("start_cluster");
+    let nodes = MultiRaft::start_cluster(configs)
+        .await
+        .expect("start_cluster");
 
     let err = nodes[0]
         .create_group(1, &[])
@@ -54,7 +58,9 @@ async fn create_group_empty_members_errors() {
 async fn create_group_local_not_in_members_errors() {
     let peer_ids = [1u64, 2];
     let configs = vec![ClusterConfig::for_test(1, &peer_ids)];
-    let nodes = MultiRaft::start_cluster(configs).await.expect("start_cluster");
+    let nodes = MultiRaft::start_cluster(configs)
+        .await
+        .expect("start_cluster");
 
     // Local node is 1; members omit it.
     let err = nodes[0]
@@ -65,10 +71,7 @@ async fn create_group_local_not_in_members_errors() {
     match err {
         MultiRaftError::Other(e) => {
             let s = e.to_string();
-            assert!(
-                s.contains("not in members"),
-                "unexpected: {s}"
-            );
+            assert!(s.contains("not in members"), "unexpected: {s}");
         }
         other => panic!("expected Other, got {other:?}"),
     }
@@ -82,14 +85,14 @@ async fn propose_after_shutdown_errors() {
         .map(|&id| ClusterConfig::for_test(id, &peer_ids))
         .collect();
 
-    let nodes = MultiRaft::start_cluster(configs).await.expect("start_cluster");
+    let nodes = MultiRaft::start_cluster(configs)
+        .await
+        .expect("start_cluster");
     let members = peer_ids.to_vec();
     let group = 1u64;
 
     for n in &nodes {
-        n.create_group(group, &members)
-            .await
-            .expect("create_group");
+        n.create_group(group, &members).await.expect("create_group");
     }
 
     wait_for_leader(&nodes, group, Duration::from_secs(5))
