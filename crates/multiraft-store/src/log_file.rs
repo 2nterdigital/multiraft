@@ -80,6 +80,17 @@ struct FileLogInner<C: RaftTypeConfig> {
     hard_state_dirty: bool,
 }
 
+struct PurgeDiagnostic {
+    directory: PathBuf,
+    sync_level: FileLogSyncLevel,
+    previous_last_purged_index: Option<u64>,
+    requested_purge_index: u64,
+    removed_entries: u64,
+    remaining_entries: u64,
+    first_retained_index: Option<u64>,
+    last_retained_index: Option<u64>,
+}
+
 impl<C: RaftTypeConfig> std::fmt::Debug for FileLogInner<C>
 where
     C::Entry: std::fmt::Debug,
@@ -425,6 +436,28 @@ where
         let log = load_log::<C>(&dir)?;
         let writer_cap = stream.stream_buf_bytes.max(DEFAULT_WRITER_CAP);
 
+        tracing::info!(
+            target: "multiraft::recovery",
+            operation = "file_log_open",
+            phase = "complete",
+            directory = %dir.display(),
+            persisted_last_purged_index = ?hard
+                .last_purged_log_id
+                .as_ref()
+                .map(|log_id| log_id.index()),
+            persisted_committed_index = ?hard.committed.as_ref().map(|log_id| log_id.index()),
+            vote_present = hard.vote.is_some(),
+            retained_entries = log.len() as u64,
+            retained_first_index = ?log.keys().next().copied(),
+            retained_last_index = ?log.keys().next_back().copied(),
+            sync_level = ?sync_level,
+            coalesce_us,
+            stream_buf_bytes = stream.stream_buf_bytes as u64,
+            stream_flush_ms = stream.stream_flush_ms,
+            hold_overlap = stream.hold_overlap,
+            "opened file-backed Raft log"
+        );
+
         Ok(Self {
             inner: Arc::new(Mutex::new(FileLogInner {
                 dir,
@@ -635,18 +668,33 @@ where
         self.rewrite_log()
     }
 
-    async fn purge(&mut self, log_id: LogIdOf<C>) -> Result<(), io::Error> {
+    async fn purge(&mut self, log_id: LogIdOf<C>) -> Result<PurgeDiagnostic, io::Error> {
+        let previous_last_purged_index = self
+            .last_purged_log_id
+            .as_ref()
+            .map(|previous| previous.index());
         {
             let ld = &mut self.last_purged_log_id;
             assert!(ld.as_ref() <= Some(&log_id));
             *ld = Some(log_id.clone());
         }
         let keys: Vec<u64> = self.log.range(..=log_id.index()).map(|(k, _)| *k).collect();
+        let removed_entries = keys.len() as u64;
         for key in keys {
             self.log.remove(&key);
         }
         self.persist_hard_state()?;
-        self.rewrite_log()
+        self.rewrite_log()?;
+        Ok(PurgeDiagnostic {
+            directory: self.dir.clone(),
+            sync_level: self.sync_level,
+            previous_last_purged_index,
+            requested_purge_index: log_id.index(),
+            removed_entries,
+            remaining_entries: self.log.len() as u64,
+            first_retained_index: self.log.keys().next().copied(),
+            last_retained_index: self.log.keys().next_back().copied(),
+        })
     }
 }
 
@@ -770,6 +818,7 @@ mod impl_log_store {
     use std::ops::RangeBounds;
     use std::sync::Arc;
 
+    use multiraft_core::FileLogSyncLevel;
     use openraft::alias::LogIdOf;
     use openraft::alias::VoteOf;
     use openraft::storage::IOFlushed;
@@ -877,8 +926,26 @@ mod impl_log_store {
         }
 
         async fn purge(&mut self, log_id: LogIdOf<C>) -> Result<(), io::Error> {
-            let mut inner = self.inner.lock().await;
-            inner.purge(log_id).await
+            let diagnostic = {
+                let mut inner = self.inner.lock().await;
+                inner.purge(log_id).await?
+            };
+            tracing::info!(
+                target: "multiraft::recovery",
+                operation = "file_log_purge",
+                phase = "complete",
+                directory = %diagnostic.directory.display(),
+                sync_level = ?diagnostic.sync_level,
+                crash_durable = diagnostic.sync_level != FileLogSyncLevel::Os,
+                previous_last_purged_index = ?diagnostic.previous_last_purged_index,
+                requested_purge_index = diagnostic.requested_purge_index,
+                removed_entries = diagnostic.removed_entries,
+                remaining_entries = diagnostic.remaining_entries,
+                first_retained_index = ?diagnostic.first_retained_index,
+                last_retained_index = ?diagnostic.last_retained_index,
+                "completed Raft log prefix purge"
+            );
+            Ok(())
         }
 
         async fn get_log_reader(&mut self) -> Self::LogReader {

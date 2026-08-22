@@ -1016,22 +1016,50 @@ impl<S: StateMachine> MultiRaft<S> {
     /// For in-process mode, also unregisters this node from the shared [`Router`]
     /// so peers observe it as unreachable (used by demo admin leader-loss simulation).
     pub async fn shutdown(&self) -> Result<(), MultiRaftError> {
-        let rafts: Vec<Raft<S>> = self
+        let rafts: Vec<(GroupId, Raft<S>)> = self
             .groups
             .lock()
             .unwrap()
-            .values()
-            .map(|g| g.raft.clone())
+            .iter()
+            .map(|(&group_id, group)| (group_id, group.raft.clone()))
             .collect();
-        for raft in rafts {
-            raft.shutdown()
-                .await
-                .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("shutdown: {e}")))?;
+        tracing::info!(
+            target: "multiraft::recovery",
+            operation = "node_shutdown",
+            phase = "start",
+            node_id = self.node_id,
+            group_count = rafts.len() as u64,
+            "shutting down Multi-Raft node"
+        );
+        for (group_id, raft) in rafts {
+            if let Err(error) = raft.shutdown().await {
+                tracing::error!(
+                    target: "multiraft::recovery",
+                    operation = "node_shutdown",
+                    phase = "error",
+                    node_id = self.node_id,
+                    group_id,
+                    error = %error,
+                    error_debug = ?error,
+                    "failed to shut down Raft group"
+                );
+                return Err(MultiRaftError::Other(anyhow::anyhow!(
+                    "shutdown group {group_id}: {error}"
+                )));
+            }
         }
         self.groups.lock().unwrap().clear();
         if let NetBackend::InProcess { router, .. } = &self.net {
             let _ = router.unregister_node(self.node_id);
         }
+        tracing::info!(
+            target: "multiraft::recovery",
+            operation = "node_shutdown",
+            phase = "complete",
+            node_id = self.node_id,
+            remaining_groups = 0_u64,
+            "shut down Multi-Raft node"
+        );
         Ok(())
     }
 
@@ -1042,12 +1070,56 @@ impl<S: StateMachine> MultiRaft<S> {
         group: GroupId,
         timeout: Duration,
     ) -> Result<(), MultiRaftError> {
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            target: "multiraft::recovery",
+            operation = "recovery_wait",
+            phase = "start",
+            node_id = self.node_id,
+            group_id = group,
+            timeout_ms,
+            "waiting for Raft state-machine recovery"
+        );
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
-        raft.wait_for_recovery(Some(timeout))
-            .await
-            .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("wait_for_recovery: {e}")))?;
+        let metrics = match raft.wait_for_recovery(Some(timeout)).await {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                tracing::error!(
+                    target: "multiraft::recovery",
+                    operation = "recovery_wait",
+                    phase = "error",
+                    node_id = self.node_id,
+                    group_id = group,
+                    timeout_ms,
+                    error = %error,
+                    error_debug = ?error,
+                    "Raft state-machine recovery failed"
+                );
+                return Err(MultiRaftError::Other(anyhow::anyhow!(
+                    "wait_for_recovery node {}, group {}: {error}",
+                    self.node_id,
+                    group
+                )));
+            }
+        };
+        let applied_index = metrics.last_applied.as_ref().map(|log_id| log_id.index());
+        let applied_term = metrics
+            .last_applied
+            .as_ref()
+            .map(|log_id| log_id.committed_leader_id().term);
+        tracing::info!(
+            target: "multiraft::recovery",
+            operation = "recovery_wait",
+            phase = "complete",
+            node_id = self.node_id,
+            group_id = group,
+            timeout_ms,
+            applied_index = ?applied_index,
+            applied_term = ?applied_term,
+            "Raft state-machine recovery completed"
+        );
         Ok(())
     }
 
@@ -1123,12 +1195,45 @@ impl<S: StateMachine> MultiRaft<S> {
     }
 
     async fn spawn_local_group(&self, group: GroupId) -> Result<(), MultiRaftError> {
-        let snapshot_policy = if self.config.snapshot_mode == SnapshotMode::StandbyOffload {
-            // Voters/standby never auto hot-snapshot; Standby builds via trigger log.
-            openraft::SnapshotPolicy::Never
+        let (snapshot_policy, snapshot_policy_name) =
+            if self.config.snapshot_mode == SnapshotMode::StandbyOffload {
+                // Voters/standby never auto hot-snapshot; Standby builds via trigger log.
+                (openraft::SnapshotPolicy::Never, "never")
+            } else {
+                (
+                    openraft::SnapshotPolicy::LogsSinceLast(5000),
+                    "logs_since_last",
+                )
+            };
+        let storage = if self.config.data_dir.as_os_str().is_empty() {
+            "memory"
         } else {
-            openraft::SnapshotPolicy::LogsSinceLast(5000)
+            "file"
         };
+        let transport = match &self.net {
+            NetBackend::InProcess { .. } => "in_process",
+            NetBackend::Grpc { .. } => "grpc",
+        };
+        let group_directory = if self.config.data_dir.as_os_str().is_empty() {
+            PathBuf::from("<memory>")
+        } else {
+            self.config.data_dir.join(format!("group-{group}"))
+        };
+        tracing::info!(
+            target: "multiraft::recovery",
+            operation = "group_start",
+            phase = "start",
+            node_id = self.node_id,
+            group_id = group,
+            transport,
+            storage,
+            directory = %group_directory.display(),
+            role = ?self.config.role,
+            snapshot_mode = ?self.config.snapshot_mode,
+            snapshot_policy = snapshot_policy_name,
+            file_log_sync_level = ?self.config.file_log_sync_level,
+            "starting local Raft group"
+        );
         let config = Config {
             heartbeat_interval: self.config.heartbeat_interval_ms,
             election_timeout_min: self.config.election_timeout_min_ms,
@@ -1156,17 +1261,41 @@ impl<S: StateMachine> MultiRaft<S> {
             },
             ..Default::default()
         };
-        let config = Arc::new(
-            config
-                .validate()
-                .map_err(|e| MultiRaftError::Other(anyhow::anyhow!(e.to_string())))?,
-        );
+        let config = Arc::new(config.validate().map_err(|error| {
+            tracing::error!(
+                target: "multiraft::recovery",
+                operation = "group_start",
+                phase = "error",
+                node_id = self.node_id,
+                group_id = group,
+                transport,
+                storage,
+                directory = %group_directory.display(),
+                error = %error,
+                error_debug = ?error,
+                "rejected invalid OpenRaft group configuration"
+            );
+            MultiRaftError::Other(anyhow::anyhow!(error.to_string()))
+        })?);
 
         let context = FsmFactoryContext {
             node_id: self.node_id,
             group_id: group,
         };
         let fsm = self.fsm_factory.create(context).map_err(|source| {
+            tracing::error!(
+                target: "multiraft::recovery",
+                operation = "group_start",
+                phase = "error",
+                node_id = self.node_id,
+                group_id = group,
+                transport,
+                storage,
+                directory = %group_directory.display(),
+                error = %source,
+                error_debug = ?source,
+                "failed to construct application FSM"
+            );
             MultiRaftError::Other(source.context(format!(
                 "create FSM for node {}, group {}",
                 context.node_id(),
@@ -1181,9 +1310,23 @@ impl<S: StateMachine> MultiRaft<S> {
             && self.config.snapshot_mode == SnapshotMode::StandbyOffload
         {
             let catalog = self.snapshot_rt.catalog.clone().ok_or_else(|| {
-                MultiRaftError::Other(anyhow::anyhow!(
+                let error = anyhow::anyhow!(
                     "StandbyOffload Standby requires non-empty data_dir for SnapshotCatalog"
-                ))
+                );
+                tracing::error!(
+                    target: "multiraft::recovery",
+                    operation = "group_start",
+                    phase = "error",
+                    node_id = self.node_id,
+                    group_id = group,
+                    transport,
+                    storage,
+                    directory = %group_directory.display(),
+                    error = %error,
+                    error_debug = ?error,
+                    "missing StandbyOffload snapshot catalog"
+                );
+                MultiRaftError::Other(error)
             })?;
             let rt = self.snapshot_rt.clone();
             let holder = sm_holder.clone();
@@ -1270,7 +1413,27 @@ impl<S: StateMachine> MultiRaft<S> {
                             hold_overlap: self.config.file_log_hold_overlap,
                         },
                     )
-                    .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("open file log: {e}")))?;
+                    .map_err(|error| {
+                        tracing::error!(
+                            target: "multiraft::recovery",
+                            operation = "group_start",
+                            phase = "error",
+                            node_id = self.node_id,
+                            group_id = group,
+                            transport,
+                            storage,
+                            directory = %dir.display(),
+                            error = %error,
+                            error_debug = ?error,
+                            "failed to open file-backed Raft log"
+                        );
+                        MultiRaftError::Other(anyhow::anyhow!(
+                            "open file log for node {}, group {} at {}: {error}",
+                            self.node_id,
+                            group,
+                            dir.display()
+                        ))
+                    })?;
                     openraft::Raft::new(
                         self.node_id,
                         config,
@@ -1305,7 +1468,27 @@ impl<S: StateMachine> MultiRaft<S> {
                             hold_overlap: self.config.file_log_hold_overlap,
                         },
                     )
-                    .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("open file log: {e}")))?;
+                    .map_err(|error| {
+                        tracing::error!(
+                            target: "multiraft::recovery",
+                            operation = "group_start",
+                            phase = "error",
+                            node_id = self.node_id,
+                            group_id = group,
+                            transport,
+                            storage,
+                            directory = %dir.display(),
+                            error = %error,
+                            error_debug = ?error,
+                            "failed to open file-backed Raft log"
+                        );
+                        MultiRaftError::Other(anyhow::anyhow!(
+                            "open file log for node {}, group {} at {}: {error}",
+                            self.node_id,
+                            group,
+                            dir.display()
+                        ))
+                    })?;
                     openraft::Raft::new(
                         self.node_id,
                         config,
@@ -1317,7 +1500,27 @@ impl<S: StateMachine> MultiRaft<S> {
                 }
             }
         }
-        .map_err(|e| MultiRaftError::Other(anyhow::anyhow!(e.to_string())))?;
+        .map_err(|error| {
+            tracing::error!(
+                target: "multiraft::recovery",
+                operation = "group_start",
+                phase = "error",
+                node_id = self.node_id,
+                group_id = group,
+                transport,
+                storage,
+                directory = %group_directory.display(),
+                error = %error,
+                error_debug = ?error,
+                "failed to recover or start local Raft group"
+            );
+            MultiRaftError::Other(anyhow::anyhow!(
+                "start Raft for node {}, group {} at {}: {error}",
+                self.node_id,
+                group,
+                group_directory.display()
+            ))
+        })?;
 
         {
             let mut g = self.groups.lock().unwrap();
@@ -1334,6 +1537,17 @@ impl<S: StateMachine> MultiRaft<S> {
 
         Self::spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
         Self::spawn_standby_throttle_watch(raft, self.standby_throttle.clone());
+        tracing::info!(
+            target: "multiraft::recovery",
+            operation = "group_start",
+            phase = "complete",
+            node_id = self.node_id,
+            group_id = group,
+            transport,
+            storage,
+            directory = %group_directory.display(),
+            "published local Raft group"
+        );
         Ok(())
     }
 

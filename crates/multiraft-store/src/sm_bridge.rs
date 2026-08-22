@@ -262,8 +262,28 @@ where
             data: data.clone(),
         };
 
+        let group_id = inner.group_id;
+        let last_log_index = meta.last_log_id.as_ref().map(|log_id| log_id.index());
+        let last_log_term = meta
+            .last_log_id
+            .as_ref()
+            .map(|log_id| log_id.committed_leader_id().term);
+        let snapshot_bytes = data.len() as u64;
         inner.current_snapshot = Some(snapshot);
         drop(inner);
+
+        tracing::info!(
+            target: "multiraft::recovery",
+            operation = "native_snapshot_build",
+            phase = "complete",
+            group_id,
+            snapshot_id = %meta.snapshot_id,
+            last_log_index = ?last_log_index,
+            last_log_term = ?last_log_term,
+            snapshot_bytes,
+            durability = "memory_only",
+            "built application snapshot"
+        );
 
         Ok(SnapshotOf::<TypeConfig, Cursor<Vec<u8>>> {
             meta,
