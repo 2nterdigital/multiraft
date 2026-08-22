@@ -14,7 +14,7 @@
 ## 特性
 
 - 同进程多 Group；peer 连接 **O(节点)**，非 O(Group)
-- `MultiRaft`：`propose` / `propose_batch` / `read_linearizable` / 领导权回调
+- `MultiRaft`：`propose` / `propose_batch` / `read_linearizable` / 归一化 Group 观察 / 领导权回调
 - 每 Group 文件持久化（可重启恢复）；sync 档位 **0/1/2**（与 Aeron 对齐）
 - Aeron 启发式热路径：类型化进程内 RPC、流水线 propose、合并 / 流式落盘
 - Standby learner 与成员变更，以及仅实验室使用的 snapshot catalog/checksum/ad 生成；实时 Standby 恢复已禁用
@@ -89,6 +89,7 @@ curl -s http://127.0.0.1:21103/groups/0/stale
 | `read_linearizable` | Linearizable 读 |
 | `read_stale` | 本地 + applied 水位（`enable_stale_queries`） |
 | `with_fsm` | 本地 / 可能 stale（调试 / 指标） |
+| `observe_group` | 仅本地控制面观察；latest/coalescing |
 
 详见 [docs/jepsen.zh-CN.md](docs/jepsen.zh-CN.md) · [English](docs/jepsen.md)。
 
@@ -145,6 +146,29 @@ let runtime = MultiRaft::<MyFsm>::start_with_factory(config, |context| {
 强引用环可能保留 FSM，因此不能保证及时释放。工厂必须避免不可逆副作用，并且在该
 已证明路径之外不得依赖及时 drop。相反，`try_initialize` 在发布后运行，可能在本地
 Group 已发布时返回错误。
+
+### 归一化 Group 观察
+
+`MultiRaft::observe_group(group)` 返回一个初始 `GroupObservation` 和一个单 owner 的
+`GroupObservationReceiver`。它只是对该本地 Raft 实例 OpenRaft `server_metrics()` 的
+无状态只读 adapter；不使用 full `metrics()`、`data_metrics()`、FSM 状态、Standby
+恢复状态、transport diagnostics，也不建立第二套 HA 状态。
+
+`GroupObservation` 暴露 `group_id`、`local_node_id`、`local_membership_role`、
+`server_state`、`leader_hint`、`flushed_vote`、`effective_membership` 与
+`committed_membership`。membership 分开保留 effective/committed，两者的 joint voter
+config 保持嵌套集合形状，membership log id 完整保留 `{term, node_id, index}`。节点
+地址被刻意省略。
+
+receiver 继承底层 watch 语义：latest value wins，中间控制面状态可被合并，没有
+history/replay，也没有 `current()`。关闭时返回类型化 `ObservationClosed`；shutdown
+或同 ID 重启后，旧 receiver 不会自动 rebind，调用方必须在新的 `MultiRaft` instance
+上重新订阅。
+
+leader 与 role 只是 observation。它们可作为路由 hint 和 desired-mode 输入，但不是
+写权限、读权限、availability、quorum、lease、epoch、generation 或 health 的证明。
+写入仍由 `propose` 结果校验，linearizable 读仍由 ReadIndex 校验。`on_leader_change()`
+继续作为既有 best-effort compatibility callback 保留。
 
 ---
 

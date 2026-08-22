@@ -17,7 +17,7 @@ downstream app): RMQ Leader propose + a pluggable matching FSM.
 ## Features
 
 - Multi-group Raft in one process; peer links **O(nodes)**, not O(groups)
-- `MultiRaft` facade: `propose`, `propose_batch`, `read_linearizable`, leader callbacks
+- `MultiRaft` facade: `propose`, `propose_batch`, `read_linearizable`, normalized group observation, leader callbacks
 - File-backed log / state / snapshot per group (restart recovery); sync levels **0/1/2** (Aeron-aligned)
 - Aeron-inspired hot path: typed in-process RPC, pipelined propose, coalesced / streamed file append
 - Standby learner and membership operations, plus lab-only snapshot catalog/checksum/ad generation; live standby restore is disabled
@@ -141,6 +141,7 @@ This lab flow exercises learner membership and catalog/checksum/advertisement ge
 | `read_linearizable` | Linearizable read (ReadIndex) |
 | `read_stale` | Local + applied watermark (`enable_stale_queries`) |
 | `with_fsm` | Local / may be stale — debug / metrics |
+| `observe_group` | Local control observation only; latest/coalescing |
 
 See [docs/jepsen.md](docs/jepsen.md) · [中文](docs/jepsen.zh-CN.md).
 
@@ -208,6 +209,34 @@ cycle can retain the FSM, so prompt release is not guaranteed. Factories must
 avoid irreversible side effects and must not rely on prompt drop outside that
 proven path. Conversely, `try_initialize` runs after publication and can return
 an error while the local group is already published.
+
+### Normalized group observation
+
+`MultiRaft::observe_group(group)` returns an initial `GroupObservation` plus a
+single-owner `GroupObservationReceiver`. It is a stateless, read-only adapter
+over OpenRaft `server_metrics()` for that exact local Raft instance; it does
+not use full `metrics()`, `data_metrics()`, FSM state, Standby restore state,
+transport diagnostics, or a second HA store.
+
+`GroupObservation` exposes `group_id`, `local_node_id`,
+`local_membership_role`, `server_state`, `leader_hint`, `flushed_vote`,
+`effective_membership`, and `committed_membership`. Membership keeps effective
+and committed views separate, preserves joint voter configs as nested sets, and
+retains complete membership log IDs as `{term, node_id, index}`. Node addresses
+are intentionally omitted.
+
+The receiver follows the underlying watch semantics: latest value wins,
+intermediate control states may be coalesced, there is no history or replay,
+and there is no `current()` method. Closure yields typed `ObservationClosed`;
+after shutdown or a same-id restart, the old receiver never rebinds, and callers
+must subscribe again on the new `MultiRaft` instance.
+
+Leader and role are observations only. They are useful routing hints and
+desired-mode inputs, not proofs of write permission, read permission,
+availability, quorum, lease, epoch, generation, or health. `propose` and
+ReadIndex remain the final checks for writes and linearizable reads.
+`on_leader_change()` remains as the existing best-effort compatibility
+callback.
 
 ---
 

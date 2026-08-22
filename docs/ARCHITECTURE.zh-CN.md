@@ -18,8 +18,8 @@
 
 ```text
 crates/
-├── multiraft-core/   # TypeConfig, ClusterConfig, MultiRaftError, ProposeOk
-├── multiraft-net/    # Shared GroupRouter / GrpcRouter + MultiRaft facade
+├── multiraft-core/   # TypeConfig, ClusterConfig, MultiRaftError, ProposeOk, ObservationClosed
+├── multiraft-net/    # Shared GroupRouter / GrpcRouter + MultiRaft facade + 归一化观察
 ├── multiraft-fsm/    # StateMachine trait (apply / snapshot / restore)
 ├── multiraft-store/  # Per-group file-backed log / state / snapshot
 └── multiraft-demo/   # 3-node × N-group CounterFsm + admin HTTP
@@ -27,8 +27,8 @@ crates/
 
 | Crate | 做 | 不做 |
 |-------|------|----------|
-| `multiraft-core` | 共享类型 / 错误 | 网络、存储 |
-| `multiraft-net` | `MultiRaft` API、O(nodes) 连接、通用 FSM 工厂注入 | 业务类型选择、命令语义、持久化业务元数据、业务 registry 或 discriminator |
+| `multiraft-core` | 共享类型 / 错误，包括类型化 observation closure | 网络、存储 |
+| `multiraft-net` | `MultiRaft` API、O(nodes) 连接、通用 FSM 工厂注入、backend-neutral Group 观察 | 业务类型选择、命令语义、持久化业务元数据、业务 registry、discriminator 或 HA policy |
 | `multiraft-fsm` | Trait + demo `CounterFsm` | 依赖撮合引擎 FSM |
 | `multiraft-store` | 每 Group 持久化 | 订单簿 |
 | `multiraft-demo` | 验收 / Jepsen 靶标 | 生产部署 |
@@ -70,12 +70,43 @@ RMQ (per-symbol)
 | `read_linearizable` | Linearizable 读（ReadIndex） |
 | `read_stale` | 本地 + applied 水位；需 `enable_stale_queries`（Standby 卸载） |
 | `with_fsm` | 本地 / 可能 stale — 调试 / 指标 |
+| `observe_group` | 仅本地控制面观察；latest/coalescing |
 | Cross-group | 无跨 symbol 事务 |
 
 失败 / 超时的 `propose` 结果**不确定** — 须用同一幂等键重试。
 
 详情：[specs/2026-07-18-multiraft-design.md](./specs/2026-07-18-multiraft-design.md) · [中文](./specs/2026-07-18-multiraft-design.zh-CN.md) §4.3.1，
 [jepsen.md](./jepsen.md) · [中文](./jepsen.zh-CN.md)。
+
+## 归一化 Group 观察
+
+`MultiRaft::observe_group(group)` 暴露一个初始 `GroupObservation` 和一个单 owner 的
+`GroupObservationReceiver`。它只是某个本地 Raft 实例上一条 OpenRaft
+`server_metrics()` receiver 的无状态 adapter。不读取 full `metrics()`、
+`data_metrics()`、FSM 数据、snapshot catalog、Standby 恢复状态或 transport
+diagnostics，也不创建后台 task、cache、fan-out 层、timer、persistence 或第二个 HA
+owner。
+
+归一化值包含：
+
+- `group_id`、`local_node_id`、`local_membership_role`；
+- `server_state`、`leader_hint`、`flushed_vote`；
+- `effective_membership` 与 `committed_membership`。
+
+`local_membership_role` 只从 effective membership 推导，绝不读取静态
+`ClusterConfig::role`。每个 membership observation 都把 joint voter configs 保留为
+`Vec<BTreeSet<NodeId>>`，learner 单独保留，并完整保留 membership log identity
+`{term, node_id, index}`。节点地址仍属于 peer catalog 配置，不是 HA fact，因此不暴露。
+
+receiver 继承 latest-value watch 语义：中间状态可能被合并，没有 history/replay，也没有
+`current()`。`ObservationClosed` 是类型化 terminal result。如果本地 Raft instance
+shutdown 后又以相同 node/group ID 重启，旧 receiver 仍保持 closed；consumer 必须在新的
+`MultiRaft` instance 上再次调用 `observe_group()`。
+
+leader hint 和 membership role 只是 observation，不是能力声明。它们不证明 writable、
+readable、available、healthy、quorum、lease、epoch 或 generation。真实写权限由
+`propose` 重新校验；真实 linearizable 读权限由 ReadIndex 重新校验。`on_leader_change()`
+继续作为旧的 best-effort compatibility callback 保留，本 observer 不改写它。
 
 ## 下游集成（二期）
 
