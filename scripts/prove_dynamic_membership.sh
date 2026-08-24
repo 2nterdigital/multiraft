@@ -607,11 +607,16 @@ assert_runtime_log_contract() {
     "$runtime_root"/node-*.log >"$merged" || true
   python3 - "$merged" "$old_to_demote" <<'PY' || {
 import pathlib
+import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
 old_to_demote = sys.argv[2]
-lines = path.read_text(encoding="utf-8").splitlines()
+ansi_csi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+lines = [
+    ansi_csi.sub("", line)
+    for line in path.read_text(encoding="utf-8").splitlines()
+]
 
 def require(marker, action, target):
     matches = [line for line in lines if marker in line]
