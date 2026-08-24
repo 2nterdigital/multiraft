@@ -201,6 +201,15 @@ struct GroupValueResp {
 }
 
 #[derive(Serialize)]
+struct LinearizableReadResp {
+    ok: bool,
+    group: u64,
+    node_id: u64,
+    value: i64,
+    consistency: &'static str,
+}
+
+#[derive(Serialize)]
 struct LinksResp {
     unique_peer_links: usize,
 }
@@ -757,6 +766,10 @@ async fn serve_admin(addr: SocketAddr, state: Arc<DemoState>) -> anyhow::Result<
             post(admin_demote_standby),
         )
         .route("/admin/groups/:group/status", get(admin_group_status))
+        .route(
+            "/admin/groups/:group/read_linearizable",
+            get(admin_read_linearizable),
+        )
         .route("/admin/catalog/:group", get(admin_catalog))
         .route(
             "/admin/best_snapshot_ad/:group",
@@ -851,6 +864,16 @@ async fn admin_add_standby(
         }
         match n.add_standby(group, standby_id).await {
             Ok(()) => {
+                let (local_voters, local_learners) = local_membership(n, group);
+                info!(
+                    action = "add_learner",
+                    group,
+                    actor_node = n.node_id(),
+                    target_node = standby_id,
+                    ?local_voters,
+                    ?local_learners,
+                    "demo learner add committed"
+                );
                 return Ok(Json(serde_json::json!({
                     "ok": true,
                     "group": group,
@@ -1066,14 +1089,7 @@ async fn admin_group_status(
         ));
     }
     let (applied_index, applied_term) = n.local_applied(group).await.unwrap_or((0, 0));
-    let voters: Vec<u64> = n
-        .voter_ids(group)
-        .map(|s| s.into_iter().collect())
-        .unwrap_or_default();
-    let learners: Vec<u64> = n
-        .learner_ids(group)
-        .map(|s| s.into_iter().collect())
-        .unwrap_or_default();
+    let (voters, learners) = local_membership(n, group);
     let mut throttle: Vec<u64> = n.standby_throttle_ids().into_iter().collect();
     throttle.sort_unstable();
     Ok(Json(serde_json::json!({
@@ -1089,6 +1105,73 @@ async fn admin_group_status(
         "stale_queries_enabled": n.stale_queries_enabled(),
         "standby_throttle_ids": throttle,
     })))
+}
+
+fn local_membership(node: &MultiRaft, group: u64) -> (Vec<u64>, Vec<u64>) {
+    let voters = node
+        .voter_ids(group)
+        .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default();
+    let learners = node
+        .learner_ids(group)
+        .map(|ids| ids.into_iter().collect())
+        .unwrap_or_default();
+    (voters, learners)
+}
+
+/// Force a ReadIndex-backed read and never fall back to a local FSM value.
+async fn admin_read_linearizable(
+    State(state): State<Arc<DemoState>>,
+    Path(group): Path<u64>,
+) -> Result<Json<LinearizableReadResp>, (StatusCode, Json<ErrResp>)> {
+    if !state.group_ids.contains(&group) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrResp {
+                ok: false,
+                error: format!("unknown group {group}"),
+            }),
+        ));
+    }
+
+    for node in &state.nodes {
+        match node.read_linearizable(group, |fsm| fsm.value(group)).await {
+            Ok(value) => {
+                info!(
+                    action = "read_linearizable",
+                    group,
+                    actor_node = node.node_id(),
+                    value,
+                    "demo linearizable read completed"
+                );
+                return Ok(Json(LinearizableReadResp {
+                    ok: true,
+                    group,
+                    node_id: node.node_id(),
+                    value,
+                    consistency: "linearizable",
+                }));
+            }
+            Err(MultiRaftError::NotLeader { .. }) => {}
+            Err(error) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ErrResp {
+                        ok: false,
+                        error: error.to_string(),
+                    }),
+                ));
+            }
+        }
+    }
+
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrResp {
+            ok: false,
+            error: "no local leader".into(),
+        }),
+    ))
 }
 
 async fn admin_catalog(
@@ -1195,6 +1278,16 @@ async fn admin_promote_standby(
         }
         match n.promote_standby(group, id).await {
             Ok(()) => {
+                let (local_voters, local_learners) = local_membership(n, group);
+                info!(
+                    action = "promote",
+                    group,
+                    actor_node = n.node_id(),
+                    target_node = id,
+                    ?local_voters,
+                    ?local_learners,
+                    "demo membership promotion committed"
+                );
                 return Ok(Json(serde_json::json!({
                     "ok": true,
                     "group": group,
@@ -1233,6 +1326,16 @@ async fn admin_demote_standby(
         }
         match n.demote_to_standby(group, id).await {
             Ok(()) => {
+                let (local_voters, local_learners) = local_membership(n, group);
+                info!(
+                    action = "demote",
+                    group,
+                    actor_node = n.node_id(),
+                    target_node = id,
+                    ?local_voters,
+                    ?local_learners,
+                    "demo membership demotion committed"
+                );
                 return Ok(Json(serde_json::json!({
                     "ok": true,
                     "group": group,
