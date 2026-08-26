@@ -101,8 +101,15 @@ impl Diag {
     }
 }
 
-/// Propose +1, retrying across local nodes until success. Records only the
-/// successful attempt's call/return window.
+/// Propose +1, retrying across local nodes until success.
+///
+/// The recorded operation window opens at the FIRST attempt's start, not the
+/// successful attempt's: an errored propose may still have committed (the
+/// leader can die after commit+apply but before the ack) and the retry then
+/// dedupes on `idem`, so the true effect can precede the last attempt.
+/// Recording only the last attempt's window shifted the window past the real
+/// commit point and produced false Illegal verdicts whenever another client
+/// legitimately read the committed value in between.
 async fn propose_inc_ok(
     nodes: &[MultiRaft],
     group: u64,
@@ -114,6 +121,8 @@ async fn propose_inc_ok(
 ) {
     let data = CounterFsm::encode_add(1, idem);
     let deadline = Instant::now() + Duration::from_secs(30);
+    // Ambiguous-effect window: opened once, before the first attempt.
+    let call = now_ns(t0);
     loop {
         // Prefer current leader, then try everyone (NotLeader race / failover).
         let mut order: Vec<&MultiRaft> = Vec::with_capacity(nodes.len());
@@ -129,7 +138,6 @@ async fn propose_inc_ok(
         }
 
         for n in order {
-            let call = now_ns(t0);
             match n.propose(group, data.clone()).await {
                 Ok(_) => {
                     let ret = now_ns(t0);
