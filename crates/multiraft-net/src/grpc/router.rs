@@ -1,11 +1,8 @@
 //! Outbound gRPC [`GroupRouter`](openraft_multi::GroupRouter) with per-peer channel cache.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::Mutex;
 
 use openraft::alias::SnapshotOf;
 use openraft::error::RPCError;
@@ -23,14 +20,12 @@ use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::OptionalSend;
 use openraft_multi::GroupRouter;
-use tonic::transport::Channel;
-use tonic::transport::Endpoint;
 
-use crate::conn_metrics::ConnMetrics;
 use crate::decode;
 use crate::encode;
 use crate::grpc::proto::raft_service_client::RaftServiceClient;
 use crate::grpc::proto::RaftRequest;
+use crate::grpc::GrpcPeerChannelPool;
 use crate::standby_throttle::StandbyThrottle;
 use multiraft_core::typ;
 use multiraft_core::typ::RaftError;
@@ -54,9 +49,7 @@ impl std::error::Error for GrpcError {}
 #[derive(Clone)]
 pub struct GrpcRouter {
     self_id: NodeId,
-    peers: Arc<HashMap<NodeId, SocketAddr>>,
-    channels: Arc<Mutex<HashMap<NodeId, Channel>>>,
-    metrics: ConnMetrics,
+    channels: GrpcPeerChannelPool,
     throttle: StandbyThrottle,
 }
 
@@ -72,12 +65,9 @@ impl GrpcRouter {
         self_id: NodeId,
         throttle: StandbyThrottle,
     ) -> Self {
-        let peers: HashMap<NodeId, SocketAddr> = peers.into_iter().collect();
         Self {
             self_id,
-            peers: Arc::new(peers),
-            channels: Arc::new(Mutex::new(HashMap::new())),
-            metrics: ConnMetrics::new(),
+            channels: GrpcPeerChannelPool::new(peers),
             throttle,
         }
     }
@@ -99,38 +89,7 @@ impl GrpcRouter {
 
     /// Distinct peer channels created (O(nodes), not O(groups)).
     pub fn unique_peer_links(&self) -> usize {
-        self.metrics.unique_peer_links()
-    }
-
-    async fn channel_for(&self, peer: NodeId) -> Result<Channel, Unreachable<TypeConfig>> {
-        {
-            let channels = self.channels.lock().unwrap();
-            if let Some(ch) = channels.get(&peer) {
-                return Ok(ch.clone());
-            }
-        }
-
-        let addr = self.peers.get(&peer).copied().ok_or_else(|| {
-            Unreachable::new(&GrpcError(format!("peer {} not in cluster config", peer)))
-        })?;
-
-        let endpoint = Endpoint::from_shared(format!("http://{addr}"))
-            .map_err(|e| Unreachable::new(&GrpcError(e.to_string())))?;
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| Unreachable::new(&GrpcError(format!("connect {addr}: {e}"))))?;
-
-        {
-            let mut channels = self.channels.lock().unwrap();
-            // Another task may have inserted first — reuse that channel.
-            if let Some(existing) = channels.get(&peer) {
-                return Ok(existing.clone());
-            }
-            channels.insert(peer, channel.clone());
-        }
-        self.metrics.record_peer(peer);
-        Ok(channel)
+        self.channels.unique_peer_links()
     }
 
     async fn send<Req, Resp>(
@@ -146,7 +105,11 @@ impl GrpcRouter {
     {
         let _standby_permit = self.throttle.before_send(to_node).await;
 
-        let channel = self.channel_for(to_node).await?;
+        let channel = self
+            .channels
+            .channel(to_node)
+            .await
+            .map_err(|error| Unreachable::new(&GrpcError(error.to_string())))?;
         let mut client = RaftServiceClient::new(channel);
 
         let encoded_req = encode(&req);
