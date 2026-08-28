@@ -10,5 +10,9 @@ pub mod proto {
     tonic::include_proto!("multiraft");
 }
 
+pub mod node_rpc {
+    tonic::include_proto!("multiraft.node_rpc");
+}
+
 pub use router::GrpcRouter;
 pub use server::GrpcServer;

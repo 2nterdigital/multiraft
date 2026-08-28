@@ -1,0 +1,16 @@
+syntax = "proto3";
+package multiraft.node_rpc;
+
+service NodeRpcService {
+  rpc Call(NodeRpcRequest) returns (NodeRpcResponse);
+}
+
+message NodeRpcRequest {
+  uint32 service_id = 1;
+  uint32 method_id = 2;
+  bytes payload = 3;
+}
+
+message NodeRpcResponse {
+  bytes payload = 1;
+}
