@@ -108,13 +108,6 @@ async fn call_marker(channel: Channel) -> Vec<u8> {
         .payload
 }
 
-fn unused_local_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused address");
-    let addr = listener.local_addr().expect("unused local address");
-    drop(listener);
-    addr
-}
-
 #[tokio::test]
 async fn unknown_peer_returns_the_typed_peer_identity() {
     let pool = GrpcPeerChannelPool::new(Vec::new());
@@ -129,7 +122,7 @@ async fn unknown_peer_returns_the_typed_peer_identity() {
 
 #[tokio::test]
 async fn configured_unreachable_peer_returns_the_typed_connect_source() {
-    let pool = GrpcPeerChannelPool::new(vec![(3, unused_local_addr())]);
+    let pool = GrpcPeerChannelPool::new(vec![(3, SocketAddr::from(([127, 0, 0, 1], 0)))]);
     let error = tokio::time::timeout(Duration::from_secs(2), pool.channel(3))
         .await
         .expect("connection attempt must finish")
