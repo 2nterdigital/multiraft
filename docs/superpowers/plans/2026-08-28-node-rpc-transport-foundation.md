@@ -37,7 +37,7 @@
 - Consumes: existing tonic/prost build pipeline and `tokio_stream::wrappers::TcpListenerStream`.
 - Produces: public `multiraft_net::node_rpc` generated module containing `NodeRpcRequest`, `NodeRpcResponse`, `node_rpc_service_client::NodeRpcServiceClient`, and `node_rpc_service_server::{NodeRpcService, NodeRpcServiceServer}`.
 
-- [ ] **Step 1: Write the failing generated-service integration test**
+- [x] **Step 1: Write the failing generated-service integration test**
 
 Create `crates/multiraft-net/tests/node_rpc_service.rs` with a real temporary tonic server. The test handler echoes the request payload for nonzero IDs and returns `Status::unimplemented` when either ID is zero. The two required tests are:
 
@@ -82,7 +82,7 @@ async fn generated_node_rpc_preserves_handler_tonic_status() {
 
 `TestNodeRpcServer` must bind `127.0.0.1:0`, serve with `serve_with_incoming_shutdown`, and retain a oneshot shutdown sender plus JoinHandle so every test explicitly stops and joins the real server.
 
-- [ ] **Step 2: Run the focused test to verify RED**
+- [x] **Step 2: Run the focused test to verify RED**
 
 Run:
 
@@ -92,7 +92,7 @@ cargo test -p multiraft-net --test node_rpc_service
 
 Expected: compilation fails because `multiraft_net::node_rpc` and its generated types do not exist. Record that this is the intended missing-feature failure, not a test typo.
 
-- [ ] **Step 3: Add the exact proto and code-generation surface**
+- [x] **Step 3: Add the exact proto and code-generation surface**
 
 Create `proto/node_rpc.proto` with exactly:
 
@@ -117,7 +117,7 @@ message NodeRpcResponse {
 
 Change `build.rs` to compile both proto files in one existing tonic-build invocation. Add a generated `node_rpc` module in `grpc/mod.rs` using `tonic::include_proto!("multiraft.node_rpc")`, and re-export that module from the crate root as `multiraft_net::node_rpc`. Do not add a registry, wrapper request, status field, or server task.
 
-- [ ] **Step 4: Run GREEN and focused regressions**
+- [x] **Step 4: Run GREEN and focused regressions**
 
 Run:
 
@@ -128,11 +128,11 @@ cargo test -p multiraft-net --test grpc_cluster
 
 Expected: `node_rpc_service` runs exactly two tests and both pass; `grpc_cluster` keeps its nonzero existing test set green, proving the independent proto did not replace `RaftService`.
 
-- [ ] **Step 5: Refactor test-only server cleanup and re-run**
+- [x] **Step 5: Refactor test-only server cleanup and re-run**
 
 Keep all startup/shutdown helpers inside `node_rpc_service.rs`; remove duplicated response construction, keep assertions on real generated client/server behavior, and rerun the two commands from Step 4.
 
-- [ ] **Step 6: Verify and commit Task 1**
+- [x] **Step 6: Verify and commit Task 1**
 
 Run `cargo fmt --all -- --check`, `cargo check -p multiraft-net --all-targets`, `cargo test -p multiraft-net --test node_rpc_service`, and `git diff --check`. After fresh passing evidence, commit only Task 1 files:
 
@@ -152,7 +152,7 @@ git commit -m "feat(net): add opaque node rpc service"
 - Consumes: `multiraft_core::{NodeId}`, `tonic::transport::{Channel, Endpoint}`, existing `ConnMetrics`, and Task 1's generated Node RPC client/server for real connectivity tests.
 - Produces: `GrpcPeerChannelPool::{new, channel, unique_peer_links}` and `GrpcPeerChannelError::{UnknownPeer, Connect}` at the `multiraft_net` crate root.
 
-- [ ] **Step 1: Write the failing pool integration tests**
+- [x] **Step 1: Write the failing pool integration tests**
 
 Create `crates/multiraft-net/tests/grpc_channel_pool.rs`. Reuse a test-local real Node RPC echo server shape (do not add a production or shared test-support module). Add these observable tests:
 
@@ -200,7 +200,7 @@ async fn separate_pools_keep_same_node_id_address_catalogs_isolated() {
 
 The marker server returns its configured literal byte so the isolation assertion cannot be satisfied by the wrong address.
 
-- [ ] **Step 2: Run the focused test to verify RED**
+- [x] **Step 2: Run the focused test to verify RED**
 
 Run:
 
@@ -210,7 +210,7 @@ cargo test -p multiraft-net --test grpc_channel_pool
 
 Expected: compilation fails because `GrpcPeerChannelPool` and `GrpcPeerChannelError` do not exist.
 
-- [ ] **Step 3: Implement the minimal public pool and typed error**
+- [x] **Step 3: Implement the minimal public pool and typed error**
 
 Implement `channel_pool.rs` with the confirmed public signatures. Use `Arc<HashMap<NodeId, SocketAddr>>`, `Arc<Mutex<HashMap<NodeId, Channel>>>`, and existing `ConnMetrics`. Never hold the mutex across `.await`: check cache and drop the guard, connect, then reacquire and reuse an entry another task inserted first.
 
@@ -218,7 +218,7 @@ Implement `Debug`, `Display`, and `std::error::Error` manually without adding a 
 
 Export the module from `grpc/mod.rs` and re-export both public types from `lib.rs`.
 
-- [ ] **Step 4: Run GREEN and public API checks**
+- [x] **Step 4: Run GREEN and public API checks**
 
 Run:
 
@@ -227,13 +227,13 @@ cargo test -p multiraft-net --test grpc_channel_pool
 cargo check -p multiraft-net --all-targets
 ```
 
-Expected: the focused file runs exactly three tests and all pass; the complete crate public API compiles for all targets.
+Expected: the focused file runs exactly four tests and all pass; the complete crate public API compiles for all targets. The fourth test covers the confirmed `Connect` error and its tonic source.
 
-- [ ] **Step 5: Refactor without adding behavior**
+- [x] **Step 5: Refactor without adding behavior**
 
 Remove repeated endpoint/error construction inside `channel_pool.rs`, ensure error messages begin lowercase and preserve the source chain, keep the lock scopes visibly synchronous, and rerun Step 4.
 
-- [ ] **Step 6: Verify and commit Task 2**
+- [x] **Step 6: Verify and commit Task 2**
 
 Run `cargo fmt --all -- --check`, `cargo test -p multiraft-net --test grpc_channel_pool`, `cargo clippy -p multiraft-net --all-targets -- -D warnings`, and `git diff --check`. After fresh passing evidence, commit only Task 2 files:
 
@@ -253,7 +253,7 @@ git commit -m "feat(net): expose peer grpc channel pool"
 - Consumes: Task 2's `GrpcPeerChannelPool` and typed error.
 - Produces: unchanged public `GrpcRouter` constructors, `GroupRouter` behavior, `unique_peer_links`, Raft request wire, throttle, backoff, and OpenRaft transport-error mapping.
 
-- [ ] **Step 1: Establish the pre-refactor characterization baseline**
+- [x] **Step 1: Establish the pre-refactor characterization baseline**
 
 Run the real existing tests before changing `router.rs`:
 
@@ -264,7 +264,7 @@ cargo test -p multiraft-net --test shared_connections
 
 Record the nonzero test counts and green baseline. This is the REFACTOR phase of Task 2's already-proven Channel cache behavior; do not add a source-shape test.
 
-- [ ] **Step 2: Replace only peer-channel ownership**
+- [x] **Step 2: Replace only peer-channel ownership**
 
 Change `GrpcRouter` from separate `peers`, `channels`, and `metrics` fields to:
 
@@ -278,7 +278,7 @@ pub struct GrpcRouter {
 
 `with_throttle` creates the pool from the existing peer vector. `unique_peer_links` delegates to the pool. Remove the private duplicated `channel_for`; `send` calls `self.channels.channel(to_node)` and maps either pool error into the existing `GrpcError(error.to_string()) -> Unreachable<TypeConfig>` path. Do not change request encoding, path, group, response decoding, tracing fields, throttle acquisition, or backoff.
 
-- [ ] **Step 3: Run focused regressions after the refactor**
+- [x] **Step 3: Run focused regressions after the refactor**
 
 Run:
 
@@ -290,7 +290,7 @@ cargo test -p multiraft-net --test shared_connections
 
 Expected: the three new pool tests, two existing gRPC cluster tests, and one existing shared-connection test all run and pass.
 
-- [ ] **Step 4: Run the wider network regression**
+- [x] **Step 4: Run the wider network regression**
 
 Run:
 
@@ -300,7 +300,7 @@ cargo test -p multiraft-net
 
 Expected: every non-ignored `multiraft-net` test passes, including existing failover, observation, factory, recovery, Standby containment, and snapshot cases. Do not reinterpret the local result as laboratory evidence.
 
-- [ ] **Step 5: Verify and commit Task 3**
+- [x] **Step 5: Verify and commit Task 3**
 
 Run `cargo fmt --all -- --check`, `cargo check -p multiraft-net --all-targets`, `cargo clippy -p multiraft-net --all-targets -- -D warnings`, and `git diff --check`. After fresh passing evidence, commit only `router.rs`:
 
@@ -318,11 +318,11 @@ git commit -m "refactor(net): share peer grpc channel cache"
 - Consumes: all Task 1-3 commits.
 - Produces: reviewed Multi-Raft branch ready for an owner decision about push and later ech0 pin alignment.
 
-- [ ] **Step 1: Audit scope and public contract**
+- [x] **Step 1: Audit scope and public contract**
 
 Inspect `git diff 1543c05562970c4b458310820e62088ad42a8cf4...HEAD` and prove it contains only the confirmed design/plan, Node RPC proto/codegen/export, Channel pool/tests, and Raft-router refactor. Verify `multiraft.proto`, `grpc/server.rs`, and `multiraft.rs` are unchanged and search for accidental Presence, TLS, retry, timeout, batch, capacity, registry, or new server-owner code.
 
-- [ ] **Step 2: Run full workspace gates**
+- [x] **Step 2: Run full workspace gates**
 
 Run:
 
@@ -336,10 +336,10 @@ git diff --check 1543c05562970c4b458310820e62088ad42a8cf4...HEAD
 
 Expected: all commands exit 0; every focused/new test selected a nonzero set; ignored manual benchmarks remain reported rather than silently executed or promoted.
 
-- [ ] **Step 3: Review and completion evidence**
+- [x] **Step 3: Review and completion evidence**
 
 Review requirement conformance first and code quality second. Confirm each new public item is documented, each pool error is matchable and source-preserving, no lock crosses `.await`, the two pool instances remain independent, Raft wire behavior is unchanged, and local tests are not described as capability-ledger evidence.
 
-- [ ] **Step 4: Commit any verified plan-status update and stop**
+- [x] **Step 4: Commit any verified plan-status update and stop**
 
 If plan checkbox updates are committed, include only this plan file after all evidence is fresh. Do not push, merge, update ech0's pin, run the laboratory, release, or start Presence implementation. Report the branch commits and wait for the owner's next delivery decision.
