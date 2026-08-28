@@ -55,6 +55,15 @@ pub struct ProposeOk {
     pub term: u64,
 }
 
+/// Successful propose with the opaque application response produced by the
+/// exact committed and applied log entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposeApplied {
+    pub index: u64,
+    pub term: u64,
+    pub effects: Vec<u8>,
+}
+
 /// Result of a local FSM read for Standby service offload.
 ///
 /// Never linearizable: `applied_index` is this node's last applied log only.

@@ -38,7 +38,9 @@ impl StateMachine for ProbeFsm {
             .try_into()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "probe delta"))?;
         self.value += i64::from_le_bytes(bytes);
-        Ok(ApplyOut::default())
+        Ok(ApplyOut {
+            effects: self.value.to_le_bytes().to_vec(),
+        })
     }
 
     fn snapshot(&self, _group: u64) -> Result<Vec<u8>, Self::Error> {
@@ -101,6 +103,33 @@ async fn start_with_factory_closure_applies_probe_fsm() {
         .expect("propose");
     assert_eq!(node.with_fsm(9, ProbeFsm::value).await, Some(7));
     assert_eq!(node.with_fsm(10, ProbeFsm::value).await, Some(0));
+    node.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn propose_with_effects_returns_the_matching_applied_fsm_response() {
+    let config = ClusterConfig::for_test(1, &[1]);
+    let node = MultiRaft::start_with_factory(config, |_| Ok(ProbeFsm::new()))
+        .await
+        .expect("start custom fsm");
+    node.create_group(11, &[1]).await.expect("create group");
+
+    let first = node
+        .propose_with_effects(11, ProbeFsm::encode_add(7))
+        .await
+        .expect("first propose with effects");
+    assert!(first.index > 0);
+    assert!(first.term > 0);
+    assert_eq!(first.effects, 7i64.to_le_bytes());
+
+    let second = node
+        .propose_with_effects(11, ProbeFsm::encode_add(-2))
+        .await
+        .expect("second propose with effects");
+    assert!(second.index > first.index);
+    assert!(second.term >= first.term);
+    assert_eq!(second.effects, 5i64.to_le_bytes());
+
     node.shutdown().await.expect("shutdown");
 }
 

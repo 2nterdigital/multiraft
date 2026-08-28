@@ -52,6 +52,7 @@ use multiraft_core::GroupId;
 use multiraft_core::MultiRaftError;
 use multiraft_core::NodeId;
 use multiraft_core::NodeRole;
+use multiraft_core::ProposeApplied;
 use multiraft_core::ProposeOk;
 use multiraft_core::RecoverOutcome;
 use multiraft_core::Request;
@@ -841,6 +842,23 @@ impl<S: StateMachine> MultiRaft<S> {
         Self::client_write_one(&raft, data).await
     }
 
+    /// Propose application bytes and return the opaque application response
+    /// produced by the exact committed and applied log entry.
+    ///
+    /// Like [`Self::propose`], timeout or disconnect leaves the write outcome
+    /// unknown. Effects are returned only when this invocation receives a
+    /// successful committed-and-applied response.
+    pub async fn propose_with_effects(
+        &self,
+        group: u64,
+        data: Vec<u8>,
+    ) -> Result<ProposeApplied, MultiRaftError> {
+        let raft = self
+            .raft(group)
+            .ok_or(MultiRaftError::UnknownGroup(group))?;
+        Self::client_write_one_with_effects(&raft, data).await
+    }
+
     /// Pipeline many proposes: **one Raft entry per payload**, concurrent `client_write`.
     ///
     /// Returns `Ok` only if **all** entries succeed. On any failure (including
@@ -907,10 +925,23 @@ impl<S: StateMachine> MultiRaft<S> {
     }
 
     async fn client_write_one(raft: &Raft<S>, data: Vec<u8>) -> Result<ProposeOk, MultiRaftError> {
+        Self::client_write_one_with_effects(raft, data)
+            .await
+            .map(|applied| ProposeOk {
+                index: applied.index,
+                term: applied.term,
+            })
+    }
+
+    async fn client_write_one_with_effects(
+        raft: &Raft<S>,
+        data: Vec<u8>,
+    ) -> Result<ProposeApplied, MultiRaftError> {
         match raft.client_write(Request::new(data)).await {
-            Ok(resp) => Ok(ProposeOk {
+            Ok(resp) => Ok(ProposeApplied {
                 index: resp.log_id.index(),
                 term: resp.log_id.committed_leader_id().term,
+                effects: resp.data.effects,
             }),
             Err(e) => {
                 if let Some(fwd) = e.forward_to_leader() {
