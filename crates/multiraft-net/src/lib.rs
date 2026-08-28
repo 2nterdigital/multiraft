@@ -30,6 +30,8 @@ pub use group_observation::MembershipObservation;
 pub use group_observation::ObservedLogId;
 pub use group_observation::VoteObservation;
 pub use grpc::node_rpc;
+pub use grpc::GrpcPeerChannelError;
+pub use grpc::GrpcPeerChannelPool;
 pub use grpc::GrpcRouter;
 pub use grpc::GrpcServer;
 pub use multiraft::wait_for_leader;
