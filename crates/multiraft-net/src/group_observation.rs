@@ -55,6 +55,17 @@ pub struct VoteObservation {
     pub committed: bool,
 }
 
+impl VoteObservation {
+    /// Creates a stable normalized vote observation.
+    pub const fn new(term: u64, node_id: NodeId, committed: bool) -> Self {
+        Self {
+            term,
+            node_id,
+            committed,
+        }
+    }
+}
+
 /// Normalized membership plus the log id that carried it.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +78,21 @@ pub struct MembershipObservation {
     pub learner_ids: BTreeSet<NodeId>,
 }
 
+impl MembershipObservation {
+    /// Creates a normalized membership observation without flattening joint consensus.
+    pub fn new(
+        log_id: Option<ObservedLogId>,
+        voter_configs: Vec<BTreeSet<NodeId>>,
+        learner_ids: BTreeSet<NodeId>,
+    ) -> Self {
+        Self {
+            log_id,
+            voter_configs,
+            learner_ids,
+        }
+    }
+}
+
 /// Complete committed log identity for an observed membership entry.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +103,17 @@ pub struct ObservedLogId {
     pub node_id: NodeId,
     /// Log index.
     pub index: u64,
+}
+
+impl ObservedLogId {
+    /// Creates a complete observed log identity.
+    pub const fn new(term: u64, node_id: NodeId, index: u64) -> Self {
+        Self {
+            term,
+            node_id,
+            index,
+        }
+    }
 }
 
 /// Local node role derived from effective membership only.
@@ -271,6 +308,21 @@ mod tests {
             membership_config: effective_membership,
             committed_membership_config: committed_membership,
         }
+    }
+
+    #[test]
+    fn public_observation_constructors_preserve_joint_identity() {
+        let log_id = ObservedLogId::new(7, 2, 11);
+        let vote = VoteObservation::new(9, 2, true);
+        let membership =
+            MembershipObservation::new(Some(log_id), vec![set(&[1, 2]), set(&[2, 3])], set(&[4]));
+
+        assert_eq!(vote.term, 9);
+        assert_eq!(vote.node_id, 2);
+        assert!(vote.committed);
+        assert_eq!(membership.log_id, Some(log_id));
+        assert_eq!(membership.voter_configs, vec![set(&[1, 2]), set(&[2, 3])]);
+        assert_eq!(membership.learner_ids, set(&[4]));
     }
 
     #[test]
