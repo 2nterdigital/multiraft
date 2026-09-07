@@ -15,6 +15,7 @@ use openraft::StoredMembership;
 
 type RawStoredMembership =
     StoredMembership<<TypeConfig as openraft::RaftTypeConfig>::LeaderId, NodeId, BasicNode>;
+type RawLogId = openraft::alias::LogIdOf<TypeConfig>;
 type RawServerMetricsReceiver = WatchReceiverOf<TypeConfig, RaftServerMetrics<TypeConfig>>;
 
 /// Latest normalized server-side observation for one local Raft Group.
@@ -149,13 +150,7 @@ pub(crate) fn normalize_server_metrics(
     group_id: GroupId,
     metrics: &RaftServerMetrics<TypeConfig>,
 ) -> Result<GroupObservation, ObservationClosed> {
-    let server_state = match metrics.state {
-        openraft::ServerState::Learner => GroupServerState::Learner,
-        openraft::ServerState::Follower => GroupServerState::Follower,
-        openraft::ServerState::Candidate => GroupServerState::Candidate,
-        openraft::ServerState::Leader => GroupServerState::Leader,
-        openraft::ServerState::Shutdown => return Err(ObservationClosed::new(group_id)),
-    };
+    let server_state = normalize_server_state(group_id, metrics.state)?;
     let effective_membership = normalize_membership(&metrics.membership_config);
     let local_membership_role = local_membership_role(metrics.id, &effective_membership);
 
@@ -175,18 +170,33 @@ pub(crate) fn normalize_server_metrics(
     })
 }
 
-fn normalize_membership(membership: &RawStoredMembership) -> MembershipObservation {
+pub(crate) fn normalize_server_state(
+    group_id: GroupId,
+    state: openraft::ServerState,
+) -> Result<GroupServerState, ObservationClosed> {
+    match state {
+        openraft::ServerState::Learner => Ok(GroupServerState::Learner),
+        openraft::ServerState::Follower => Ok(GroupServerState::Follower),
+        openraft::ServerState::Candidate => Ok(GroupServerState::Candidate),
+        openraft::ServerState::Leader => Ok(GroupServerState::Leader),
+        openraft::ServerState::Shutdown => Err(ObservationClosed::new(group_id)),
+    }
+}
+
+pub(crate) fn normalize_membership(membership: &RawStoredMembership) -> MembershipObservation {
     MembershipObservation {
-        log_id: membership.log_id().as_ref().map(|log_id| {
-            let leader_id = log_id.committed_leader_id();
-            ObservedLogId {
-                term: leader_id.term(),
-                node_id: *leader_id.node_id(),
-                index: log_id.index(),
-            }
-        }),
+        log_id: membership.log_id().as_ref().map(normalize_log_id),
         voter_configs: membership.membership().get_joint_config().clone(),
         learner_ids: membership.membership().learner_ids().collect(),
+    }
+}
+
+pub(crate) fn normalize_log_id(log_id: &RawLogId) -> ObservedLogId {
+    let leader_id = log_id.committed_leader_id();
+    ObservedLogId {
+        term: leader_id.term(),
+        node_id: *leader_id.node_id(),
+        index: log_id.index(),
     }
 }
 

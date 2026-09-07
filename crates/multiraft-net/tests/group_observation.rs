@@ -7,6 +7,8 @@ use multiraft_core::ClusterConfig;
 use multiraft_core::MultiRaftError;
 use multiraft_core::NodeRole;
 use multiraft_net::wait_for_leader;
+use multiraft_net::GroupControlRequestResult;
+use multiraft_net::GroupControlSample;
 use multiraft_net::GroupObservation;
 use multiraft_net::GroupObservationReceiver;
 use multiraft_net::GroupServerState;
@@ -16,6 +18,7 @@ use multiraft_net::MultiRaft;
 use multiraft_net::ObservationClosed;
 use multiraft_net::ObservedLogId;
 use multiraft_net::SharedFabric;
+use multiraft_net::TargetQualification;
 use multiraft_net::VoteObservation;
 
 fn assert_debug_clone_eq<T: std::fmt::Debug + Clone + PartialEq + Eq>() {}
@@ -65,6 +68,39 @@ async fn start_on_fabric(fabric: &SharedFabric, configs: &[ClusterConfig]) -> Ve
         );
     }
     nodes
+}
+
+async fn wait_for_qualified_target(
+    leader: &MultiRaft,
+    group: u64,
+    peer_ids: &[u64],
+    target: u64,
+) -> GroupControlSample {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let sample = leader
+            .read_group_control_sample(
+                group,
+                peer_ids,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("group control sample");
+        if matches!(
+            sample.target_qualifications.get(&target),
+            Some(TargetQualification::Qualified { .. })
+        ) {
+            return sample;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for target {target} to become qualified: {:?}",
+                sample.target_qualifications
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[test]
@@ -384,4 +420,67 @@ async fn shutdown_closes_old_observer_and_restart_requires_resubscribe() {
         new_receiver.changed().now_or_never().is_none(),
         "new receiver should start from a marked-seen initial sample"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_transfer_reuses_existing_observation_stream() {
+    let peer_ids = [1u64, 2, 3];
+    let group = 44;
+    let configs: Vec<_> = peer_ids
+        .iter()
+        .map(|&id| ClusterConfig::for_test(id, &peer_ids))
+        .collect();
+    let nodes = MultiRaft::start_cluster(configs)
+        .await
+        .expect("start_cluster");
+    for node in &nodes {
+        node.create_group(group, &peer_ids)
+            .await
+            .expect("create_group");
+    }
+    let leader_id = wait_for_leader(&nodes, group, Duration::from_secs(10))
+        .await
+        .expect("leader");
+    let target = *peer_ids
+        .iter()
+        .find(|&&node_id| node_id != leader_id)
+        .expect("target");
+    let leader = nodes
+        .iter()
+        .find(|node| node.node_id() == leader_id)
+        .expect("leader handle");
+    let target_node = nodes
+        .iter()
+        .find(|node| node.node_id() == target)
+        .expect("target handle");
+    let (_initial, mut receiver) = target_node.observe_group(group).expect("observe target");
+
+    leader
+        .propose(group, multiraft_fsm::CounterFsm::encode_add(1, 44_001))
+        .await
+        .expect("drive replication");
+    let sample = wait_for_qualified_target(leader, group, &peer_ids, target).await;
+    let preconditions = sample.observed_preconditions_for(target);
+    let result = leader
+        .try_transfer_group_leader(
+            &preconditions,
+            &peer_ids,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        GroupControlRequestResult::TriggerQueued { .. }
+    ));
+
+    let observed = wait_for_observer_change(&mut receiver, Duration::from_secs(10), |obs| {
+        obs.local_node_id == target
+            && obs.server_state == GroupServerState::Leader
+            && obs.leader_hint == Some(target)
+    })
+    .await;
+
+    assert_eq!(observed.local_node_id, target);
+    assert_eq!(observed.leader_hint, Some(target));
 }

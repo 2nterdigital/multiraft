@@ -7,10 +7,16 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use multiraft_core::ClusterConfig;
 use multiraft_core::TypeConfig;
 use multiraft_fsm::CounterFsm;
 use multiraft_net::create_node;
+use multiraft_net::wait_for_leader;
+use multiraft_net::GroupControlRequestResult;
+use multiraft_net::GroupControlSample;
+use multiraft_net::MultiRaft;
 use multiraft_net::Router;
+use multiraft_net::TargetQualification;
 use multiraft_store::Request;
 use openraft::async_runtime::WatchReceiver;
 use openraft::type_config::TypeConfigExt;
@@ -105,5 +111,109 @@ async fn peer_connections_are_o_nodes_not_o_groups() {
     assert_eq!(
         links, 3,
         "in-process shared router should open exactly one channel per node"
+    );
+}
+
+async fn wait_for_qualified_target(
+    leader: &MultiRaft,
+    group: u64,
+    peer_ids: &[u64],
+    target: u64,
+) -> GroupControlSample {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let sample = leader
+            .read_group_control_sample(
+                group,
+                peer_ids,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("group control sample");
+        if matches!(
+            sample.target_qualifications.get(&target),
+            Some(TargetQualification::Qualified { .. })
+        ) {
+            return sample;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for target {target} to become qualified: {:?}",
+                sample.target_qualifications
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_control_transfer_reuses_shared_router_links() {
+    let peer_ids = [1u64, 2, 3];
+    let configs: Vec<_> = peer_ids
+        .iter()
+        .map(|&id| ClusterConfig::for_test(id, &peer_ids))
+        .collect();
+    let nodes = MultiRaft::start_cluster(configs)
+        .await
+        .expect("start_cluster");
+    let groups: Vec<u64> = (1..=10).collect();
+    for &group in &groups {
+        for node in &nodes {
+            node.create_group(group, &peer_ids)
+                .await
+                .expect("create_group");
+        }
+    }
+    for &group in &groups {
+        let _ = wait_for_leader(&nodes, group, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|| panic!("leader for group {group}"));
+    }
+
+    let before = nodes[0].unique_peer_links();
+    assert_eq!(before, 3, "start_cluster registers one channel per node");
+
+    let group = groups[0];
+    let leader_id = wait_for_leader(&nodes, group, Duration::from_secs(10))
+        .await
+        .expect("leader");
+    let leader = nodes
+        .iter()
+        .find(|node| node.node_id() == leader_id)
+        .expect("leader handle");
+    let target = *peer_ids
+        .iter()
+        .find(|&&node_id| node_id != leader_id)
+        .expect("target");
+    leader
+        .propose(group, CounterFsm::encode_add(1, 90_001))
+        .await
+        .expect("drive replication");
+    let sample = wait_for_qualified_target(leader, group, &peer_ids, target).await;
+    let preconditions = sample.observed_preconditions_for(target);
+
+    let result = leader
+        .try_transfer_group_leader(
+            &preconditions,
+            &peer_ids,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        GroupControlRequestResult::TriggerQueued { .. }
+    ));
+    let _ = wait_for_leader(&nodes, group, Duration::from_secs(10)).await;
+
+    let after = nodes[0].unique_peer_links();
+    assert_eq!(
+        after, before,
+        "control transfer must reuse the shared in-process router"
+    );
+    assert!(
+        after < groups.len(),
+        "peer links must not scale with controlled groups"
     );
 }
