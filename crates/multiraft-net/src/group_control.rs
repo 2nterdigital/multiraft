@@ -1,4 +1,6 @@
 //! Best-effort local group-control sampling.
+// Full membership observations are part of the public diagnostic contract.
+#![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

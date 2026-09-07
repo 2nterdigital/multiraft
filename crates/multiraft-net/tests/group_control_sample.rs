@@ -84,10 +84,11 @@ async fn wait_for_specific_leader(
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         for node in nodes {
-            if node.node_id() == expected && node.is_leader(group) {
-                if node.leader(group) == Some(expected) {
-                    return;
-                }
+            if node.node_id() == expected
+                && node.is_leader(group)
+                && node.leader(group) == Some(expected)
+            {
+                return;
             }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
