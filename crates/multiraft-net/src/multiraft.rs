@@ -32,6 +32,8 @@ use std::sync::atomic::AtomicUsize;
 #[cfg(test)]
 use std::sync::atomic::Ordering as AtomicOrdering;
 
+use crate::group_control::GroupControlSample;
+use crate::group_control::GroupControlSampleError;
 use crate::group_observation::initial_group_observation;
 use crate::group_observation::GroupObservation;
 use crate::group_observation::GroupObservationReceiver;
@@ -46,6 +48,10 @@ use crate::router::Router;
 use crate::snapshot_fetch::pull_snapshot_chunked;
 use crate::standby_throttle::StandbyThrottle;
 use crate::FsmFactoryContext;
+use crate::GroupControlLayoutObservation;
+use crate::GroupControlPreconditions;
+use crate::GroupControlRequestEcho;
+use crate::GroupControlRequestResult;
 use crate::StateMachineFactory;
 use multiraft_core::ClusterConfig;
 use multiraft_core::GroupId;
@@ -985,6 +991,87 @@ impl<S: StateMachine> MultiRaft<S> {
                 )))
             }
         }
+    }
+
+    /// Best-effort control sample for one existing local Group.
+    ///
+    /// This combines two public state point reads, one ReadIndex confirmation
+    /// and one public metrics read from the same existing Raft handle. It does
+    /// not read the application FSM and does not create missing groups.
+    pub async fn read_group_control_sample(
+        &self,
+        group: GroupId,
+        expected_voters: &[NodeId],
+        max_sample_age: Duration,
+        max_target_ack_age: Duration,
+    ) -> Result<GroupControlSample, GroupControlSampleError> {
+        let raft = self
+            .raft(group)
+            .ok_or(GroupControlSampleError::UnknownGroup { group_id: group })?;
+
+        crate::group_control::read_group_control_sample(
+            &raft,
+            group,
+            self.node_id,
+            expected_voters,
+            max_sample_age,
+            max_target_ack_age,
+        )
+        .await
+    }
+
+    /// Submit one best-effort leadership transfer request after rechecking the
+    /// observed control preconditions against a fresh public sample.
+    pub async fn try_transfer_group_leader(
+        &self,
+        preconditions: &GroupControlPreconditions,
+        expected_voters: &[NodeId],
+        max_sample_age: Duration,
+        max_target_ack_age: Duration,
+    ) -> GroupControlRequestResult {
+        let group = preconditions.group_id;
+        let raft = match self.raft(group) {
+            Some(raft) => raft,
+            None => {
+                return GroupControlRequestResult::PrecheckRejected {
+                    echo: preconditions.echo(),
+                    reason: crate::group_control::GroupControlPrecheckRejection::Sample(
+                        GroupControlSampleError::UnknownGroup { group_id: group },
+                    ),
+                };
+            }
+        };
+
+        crate::group_control::submit_group_control_transfer(
+            &raft,
+            group,
+            self.node_id,
+            preconditions,
+            expected_voters,
+            max_sample_age,
+            max_target_ack_age,
+        )
+        .await
+    }
+
+    /// Classify the current independently observed layout for a previous
+    /// wrapper request. This does not reinterpret the request result.
+    pub async fn observe_group_control_layout(
+        &self,
+        echo: GroupControlRequestEcho,
+        expected_voters: &[NodeId],
+        max_sample_age: Duration,
+        max_target_ack_age: Duration,
+    ) -> GroupControlLayoutObservation {
+        let sample_result = self
+            .read_group_control_sample(
+                echo.group_id,
+                expected_voters,
+                max_sample_age,
+                max_target_ack_age,
+            )
+            .await;
+        crate::group_control::classify_group_control_layout(echo, sample_result.as_ref())
     }
 
     pub fn is_leader(&self, group: u64) -> bool {

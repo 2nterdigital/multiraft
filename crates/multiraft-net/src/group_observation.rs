@@ -15,6 +15,7 @@ use openraft::StoredMembership;
 
 type RawStoredMembership =
     StoredMembership<<TypeConfig as openraft::RaftTypeConfig>::LeaderId, NodeId, BasicNode>;
+type RawLogId = openraft::alias::LogIdOf<TypeConfig>;
 type RawServerMetricsReceiver = WatchReceiverOf<TypeConfig, RaftServerMetrics<TypeConfig>>;
 
 /// Latest normalized server-side observation for one local Raft Group.
@@ -54,6 +55,17 @@ pub struct VoteObservation {
     pub committed: bool,
 }
 
+impl VoteObservation {
+    /// Creates a stable normalized vote observation.
+    pub const fn new(term: u64, node_id: NodeId, committed: bool) -> Self {
+        Self {
+            term,
+            node_id,
+            committed,
+        }
+    }
+}
+
 /// Normalized membership plus the log id that carried it.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +78,21 @@ pub struct MembershipObservation {
     pub learner_ids: BTreeSet<NodeId>,
 }
 
+impl MembershipObservation {
+    /// Creates a normalized membership observation without flattening joint consensus.
+    pub fn new(
+        log_id: Option<ObservedLogId>,
+        voter_configs: Vec<BTreeSet<NodeId>>,
+        learner_ids: BTreeSet<NodeId>,
+    ) -> Self {
+        Self {
+            log_id,
+            voter_configs,
+            learner_ids,
+        }
+    }
+}
+
 /// Complete committed log identity for an observed membership entry.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +103,17 @@ pub struct ObservedLogId {
     pub node_id: NodeId,
     /// Log index.
     pub index: u64,
+}
+
+impl ObservedLogId {
+    /// Creates a complete observed log identity.
+    pub const fn new(term: u64, node_id: NodeId, index: u64) -> Self {
+        Self {
+            term,
+            node_id,
+            index,
+        }
+    }
 }
 
 /// Local node role derived from effective membership only.
@@ -149,13 +187,7 @@ pub(crate) fn normalize_server_metrics(
     group_id: GroupId,
     metrics: &RaftServerMetrics<TypeConfig>,
 ) -> Result<GroupObservation, ObservationClosed> {
-    let server_state = match metrics.state {
-        openraft::ServerState::Learner => GroupServerState::Learner,
-        openraft::ServerState::Follower => GroupServerState::Follower,
-        openraft::ServerState::Candidate => GroupServerState::Candidate,
-        openraft::ServerState::Leader => GroupServerState::Leader,
-        openraft::ServerState::Shutdown => return Err(ObservationClosed::new(group_id)),
-    };
+    let server_state = normalize_server_state(group_id, metrics.state)?;
     let effective_membership = normalize_membership(&metrics.membership_config);
     let local_membership_role = local_membership_role(metrics.id, &effective_membership);
 
@@ -175,18 +207,33 @@ pub(crate) fn normalize_server_metrics(
     })
 }
 
-fn normalize_membership(membership: &RawStoredMembership) -> MembershipObservation {
+pub(crate) fn normalize_server_state(
+    group_id: GroupId,
+    state: openraft::ServerState,
+) -> Result<GroupServerState, ObservationClosed> {
+    match state {
+        openraft::ServerState::Learner => Ok(GroupServerState::Learner),
+        openraft::ServerState::Follower => Ok(GroupServerState::Follower),
+        openraft::ServerState::Candidate => Ok(GroupServerState::Candidate),
+        openraft::ServerState::Leader => Ok(GroupServerState::Leader),
+        openraft::ServerState::Shutdown => Err(ObservationClosed::new(group_id)),
+    }
+}
+
+pub(crate) fn normalize_membership(membership: &RawStoredMembership) -> MembershipObservation {
     MembershipObservation {
-        log_id: membership.log_id().as_ref().map(|log_id| {
-            let leader_id = log_id.committed_leader_id();
-            ObservedLogId {
-                term: leader_id.term(),
-                node_id: *leader_id.node_id(),
-                index: log_id.index(),
-            }
-        }),
+        log_id: membership.log_id().as_ref().map(normalize_log_id),
         voter_configs: membership.membership().get_joint_config().clone(),
         learner_ids: membership.membership().learner_ids().collect(),
+    }
+}
+
+pub(crate) fn normalize_log_id(log_id: &RawLogId) -> ObservedLogId {
+    let leader_id = log_id.committed_leader_id();
+    ObservedLogId {
+        term: leader_id.term(),
+        node_id: *leader_id.node_id(),
+        index: log_id.index(),
     }
 }
 
@@ -261,6 +308,21 @@ mod tests {
             membership_config: effective_membership,
             committed_membership_config: committed_membership,
         }
+    }
+
+    #[test]
+    fn public_observation_constructors_preserve_joint_identity() {
+        let log_id = ObservedLogId::new(7, 2, 11);
+        let vote = VoteObservation::new(9, 2, true);
+        let membership =
+            MembershipObservation::new(Some(log_id), vec![set(&[1, 2]), set(&[2, 3])], set(&[4]));
+
+        assert_eq!(vote.term, 9);
+        assert_eq!(vote.node_id, 2);
+        assert!(vote.committed);
+        assert_eq!(membership.log_id, Some(log_id));
+        assert_eq!(membership.voter_configs, vec![set(&[1, 2]), set(&[2, 3])]);
+        assert_eq!(membership.learner_ids, set(&[4]));
     }
 
     #[test]

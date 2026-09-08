@@ -95,10 +95,10 @@ impl TestNodeRpcServer {
     }
 }
 
-async fn call_marker(channel: Channel) -> Vec<u8> {
+async fn call_marker_for_service(channel: Channel, service_id: u32) -> Vec<u8> {
     NodeRpcServiceClient::new(channel)
         .call(NodeRpcRequest {
-            service_id: 1,
+            service_id,
             method_id: 1,
             payload: Vec::new(),
         })
@@ -106,6 +106,10 @@ async fn call_marker(channel: Channel) -> Vec<u8> {
         .expect("marker Node RPC call")
         .into_inner()
         .payload
+}
+
+async fn call_marker(channel: Channel) -> Vec<u8> {
+    call_marker_for_service(channel, 1).await
 }
 
 #[tokio::test]
@@ -171,4 +175,23 @@ async fn separate_pools_keep_same_node_id_address_catalogs_isolated() {
     assert_eq!(pool_b.unique_peer_links(), 1);
     server_a.shutdown().await;
     server_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn business_and_control_services_share_cached_peer_channel() {
+    let server = TestNodeRpcServer::start(vec![8]).await;
+    let pool = GrpcPeerChannelPool::new(vec![(1, server.addr())]);
+
+    assert_eq!(
+        call_marker_for_service(pool.channel(1).await.expect("business Channel"), 1).await,
+        vec![8]
+    );
+    assert_eq!(
+        call_marker_for_service(pool.channel(1).await.expect("control Channel"), 8).await,
+        vec![8]
+    );
+
+    assert_eq!(pool.unique_peer_links(), 1);
+    assert_eq!(server.accepted_connections(), 1);
+    server.shutdown().await;
 }
