@@ -472,15 +472,12 @@ async fn promote_then_demote_standby_membership() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let Some(voters_set) = voters
-            .iter()
-            .chain(std::iter::once(&standby))
-            .find_map(|n| n.voter_ids(group))
-        else {
+        // The target must observe its own demotion before checking stability.
+        let Some(voters_set) = standby.voter_ids(group) else {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        if !voters_set.contains(&standby_id) {
+        if !voters_set.contains(&standby_id) && !standby.is_leader(group) {
             break;
         }
         if std::time::Instant::now() >= deadline {

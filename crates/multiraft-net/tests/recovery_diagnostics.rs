@@ -198,7 +198,7 @@ async fn file_group_lifecycle_reports_start_recovery_and_shutdown() {
                 && event.get("group_id").map(String::as_str) == Some("9")
                 && event.get("storage").map(String::as_str) == Some("file")
                 && event.get("directory").map(String::as_str) == Some(expected_directory.as_str())
-                && event.get("snapshot_policy").map(String::as_str) == Some("logs_since_last")
+                && event.get("snapshot_policy").map(String::as_str) == Some("never")
         }),
         "group start diagnostic omitted recovery inputs: {group_events:?}"
     );

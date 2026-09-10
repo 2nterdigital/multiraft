@@ -20,7 +20,6 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -90,6 +89,15 @@ use openraft::ReadPolicy;
 #[cfg(test)]
 use tokio::sync::Notify;
 
+mod lifecycle;
+mod maintenance;
+pub use maintenance::{
+    CompactionProgress, CompactionRejection, CompactionSubmission, DurableSnapshotObservation,
+    LocalStorageStatus, NATIVE_SNAPSHOT_COMPACTION_CONTRACT,
+};
+mod snapshot_runtime;
+use snapshot_runtime::SnapshotRuntime;
+
 type LeaderCb = Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>;
 type SnapshotReadyCb = Arc<dyn Fn(SnapshotAdvertisement) + Send + Sync + 'static>;
 
@@ -101,71 +109,6 @@ struct DaisySpawnProbe {
     spawned: Arc<Notify>,
     permit_first_tick: Arc<Notify>,
     ticks: Arc<AtomicUsize>,
-}
-
-/// Shared snapshot catalog / ads for one MultiRaft node.
-struct SnapshotRuntime {
-    catalog: Option<Arc<SnapshotCatalog>>,
-    ads: Mutex<Vec<SnapshotAdvertisement>>,
-    serialize_delay: Mutex<Option<Duration>>,
-    data_dir: PathBuf,
-    admin_advertise_addr: Option<std::net::SocketAddr>,
-    on_snapshot_ready: Mutex<Option<SnapshotReadyCb>>,
-}
-
-impl SnapshotRuntime {
-    fn new(config: &ClusterConfig) -> Arc<Self> {
-        let catalog = if config.snapshot_mode == SnapshotMode::StandbyOffload
-            && !config.data_dir.as_os_str().is_empty()
-        {
-            let root = config.data_dir.join("snapshots");
-            let _ = fs::create_dir_all(&root);
-            Some(Arc::new(SnapshotCatalog::new(root, config.snapshot_keep)))
-        } else {
-            None
-        };
-        Arc::new(Self {
-            catalog,
-            ads: Mutex::new(Self::load_ads(&config.data_dir)),
-            serialize_delay: Mutex::new(None),
-            data_dir: config.data_dir.clone(),
-            admin_advertise_addr: config.admin_advertise_addr,
-            on_snapshot_ready: Mutex::new(None),
-        })
-    }
-
-    fn load_ads(data_dir: &std::path::Path) -> Vec<SnapshotAdvertisement> {
-        if data_dir.as_os_str().is_empty() {
-            return Vec::new();
-        }
-        let path = data_dir.join("snapshot_ads.json");
-        match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    fn persist_ads(&self) {
-        if self.data_dir.as_os_str().is_empty() {
-            return;
-        }
-        let ads = self.ads.lock().unwrap().clone();
-        if let Ok(bytes) = serde_json::to_vec_pretty(&ads) {
-            let _ = fs::write(self.data_dir.join("snapshot_ads.json"), bytes);
-        }
-    }
-
-    fn record_ad(&self, ad: SnapshotAdvertisement) {
-        {
-            let mut ads = self.ads.lock().unwrap();
-            ads.retain(|a| !(a.group == ad.group && a.snapshot_id == ad.snapshot_id));
-            ads.push(ad.clone());
-        }
-        self.persist_ads();
-        if let Some(cb) = self.on_snapshot_ready.lock().unwrap().clone() {
-            cb(ad);
-        }
-    }
 }
 
 /// Coordinates `create_group` so membership is initialized once all peers are local.
@@ -341,6 +284,9 @@ impl<S: StateMachine> MultiRaft<S> {
         glue: ClusterGlue,
         factory: Arc<dyn StateMachineFactory<S>>,
     ) -> anyhow::Result<Self> {
+        config
+            .validate_snapshot_storage()
+            .map_err(anyhow::Error::msg)?;
         let groups: GroupMap<S> = Arc::new(Mutex::new(BTreeMap::new()));
         let (node, _tx) = Node::with_groups(config.node_id, router.clone(), groups.clone());
         TypeConfig::spawn(node.run());
@@ -366,6 +312,9 @@ impl<S: StateMachine> MultiRaft<S> {
         config: ClusterConfig,
         factory: Arc<dyn StateMachineFactory<S>>,
     ) -> anyhow::Result<Self> {
+        config
+            .validate_snapshot_storage()
+            .map_err(anyhow::Error::msg)?;
         let self_addr = config
             .peers
             .iter()
@@ -384,9 +333,16 @@ impl<S: StateMachine> MultiRaft<S> {
         let snapshot_rt = SnapshotRuntime::new(&config);
 
         let groups_for_server = groups.clone();
+        let snapshot_cap = config.max_snapshot_bytes;
         let listener = tokio::net::TcpListener::bind(self_addr).await?;
         tokio::spawn(async move {
-            if let Err(e) = GrpcServer::serve_with_listener(listener, groups_for_server).await {
+            if let Err(e) = GrpcServer::serve_with_listener_and_snapshot_limit(
+                listener,
+                groups_for_server,
+                snapshot_cap,
+            )
+            .await
+            {
                 tracing::error!("grpc server on {self_addr} exited: {e:#}");
             }
         });
@@ -1134,51 +1090,13 @@ impl<S: StateMachine> MultiRaft<S> {
     /// For in-process mode, also unregisters this node from the shared [`Router`]
     /// so peers observe it as unreachable (used by demo admin leader-loss simulation).
     pub async fn shutdown(&self) -> Result<(), MultiRaftError> {
-        let rafts: Vec<(GroupId, Raft<S>)> = self
-            .groups
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(&group_id, group)| (group_id, group.raft.clone()))
-            .collect();
-        tracing::info!(
-            target: "multiraft::recovery",
-            operation = "node_shutdown",
-            phase = "start",
-            node_id = self.node_id,
-            group_count = rafts.len() as u64,
-            "shutting down Multi-Raft node"
-        );
-        for (group_id, raft) in rafts {
-            if let Err(error) = raft.shutdown().await {
-                tracing::error!(
-                    target: "multiraft::recovery",
-                    operation = "node_shutdown",
-                    phase = "error",
-                    node_id = self.node_id,
-                    group_id,
-                    error = %error,
-                    error_debug = ?error,
-                    "failed to shut down Raft group"
-                );
-                return Err(MultiRaftError::Other(anyhow::anyhow!(
-                    "shutdown group {group_id}: {error}"
-                )));
-            }
-        }
-        self.groups.lock().unwrap().clear();
-        if let NetBackend::InProcess { router, .. } = &self.net {
-            let _ = router.unregister_node(self.node_id);
-        }
-        tracing::info!(
-            target: "multiraft::recovery",
-            operation = "node_shutdown",
-            phase = "complete",
-            node_id = self.node_id,
-            remaining_groups = 0_u64,
-            "shut down Multi-Raft node"
-        );
-        Ok(())
+        tokio::time::timeout(Duration::from_secs(30), self.shutdown_owned_groups())
+            .await
+            .map_err(|_| {
+                MultiRaftError::Other(anyhow::anyhow!(
+                    "native shutdown did not quiesce within deadline"
+                ))
+            })?
     }
 
     /// Wait until the state machine has recovered at least the persisted commit
@@ -1313,16 +1231,10 @@ impl<S: StateMachine> MultiRaft<S> {
     }
 
     async fn spawn_local_group(&self, group: GroupId) -> Result<(), MultiRaftError> {
-        let (snapshot_policy, snapshot_policy_name) =
-            if self.config.snapshot_mode == SnapshotMode::StandbyOffload {
-                // Voters/standby never auto hot-snapshot; Standby builds via trigger log.
-                (openraft::SnapshotPolicy::Never, "never")
-            } else {
-                (
-                    openraft::SnapshotPolicy::LogsSinceLast(5000),
-                    "logs_since_last",
-                )
-            };
+        // Every admitted mode is manual-only. Native protocol snapshots still
+        // use the configured provider; Disabled has no legacy 5000-log policy.
+        let snapshot_policy = openraft::SnapshotPolicy::Never;
+        let snapshot_policy_name = "never";
         let storage = if self.config.data_dir.as_os_str().is_empty() {
             "memory"
         } else {
@@ -1356,7 +1268,12 @@ impl<S: StateMachine> MultiRaft<S> {
             heartbeat_interval: self.config.heartbeat_interval_ms,
             election_timeout_min: self.config.election_timeout_min_ms,
             election_timeout_max: self.config.election_timeout_max_ms,
-            max_in_snapshot_log_to_keep: 0,
+            max_in_snapshot_log_to_keep: if self.config.snapshot_mode == SnapshotMode::NativeDurable
+            {
+                self.config.retain_log_entries
+            } else {
+                0
+            },
             snapshot_policy,
             // Wipe/restart chaos and follower catch-up can present a shorter log
             // than the leader last matched; without this openraft panics.
@@ -1495,15 +1412,51 @@ impl<S: StateMachine> MultiRaft<S> {
             None
         };
 
-        let state_machine_store = StateMachineStore::with_options(
-            group,
-            fsm,
-            SmOptions {
-                allow_hot_build,
-                catalog: self.snapshot_rt.catalog.clone(),
-                on_standby_trigger,
-            },
-        );
+        if self.config.snapshot_mode != SnapshotMode::NativeDurable
+            && !self.config.data_dir.as_os_str().is_empty()
+        {
+            let native_root = self
+                .config
+                .data_dir
+                .join("snapshots")
+                .join(group.to_string())
+                .join("native-v1");
+            match std::fs::symlink_metadata(native_root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(MultiRaftError::Other(error.into())),
+                Ok(_) => {
+                    return Err(MultiRaftError::Other(anyhow::anyhow!(
+                        "root requires native durable snapshot provider"
+                    )))
+                }
+            }
+        }
+        let state_machine_store = if self.config.snapshot_mode == SnapshotMode::NativeDurable {
+            StateMachineStore::with_native_options(
+                group,
+                fsm,
+                multiraft_store::NativeSmOptions {
+                    catalog: self
+                        .snapshot_rt
+                        .catalog
+                        .clone()
+                        .expect("validated durable catalog"),
+                    max_snapshot_bytes: self.config.max_snapshot_bytes,
+                    build_budget: self.snapshot_rt.build_budget.clone(),
+                },
+            )
+            .map_err(|error| MultiRaftError::Other(error.into()))?
+        } else {
+            StateMachineStore::with_options(
+                group,
+                fsm,
+                SmOptions {
+                    allow_hot_build,
+                    catalog: self.snapshot_rt.catalog.clone(),
+                    on_standby_trigger,
+                },
+            )
+        };
         let _ = sm_holder.set(state_machine_store.clone());
 
         let raft = match &self.net {

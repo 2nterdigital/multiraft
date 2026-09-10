@@ -72,11 +72,18 @@ pub struct NodeMessage {
 }
 
 /// Multi-Raft router: one channel per node, shared by all groups on that node.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Router {
     pub nodes: Arc<Mutex<BTreeMap<NodeId, NodeTx>>>,
     metrics: ConnMetrics,
     throttle: StandbyThrottle,
+    snapshot_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Router {
@@ -85,6 +92,7 @@ impl Router {
             nodes: Arc::new(Mutex::new(BTreeMap::new())),
             metrics: ConnMetrics::new(),
             throttle: StandbyThrottle::default(),
+            snapshot_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -190,10 +198,33 @@ impl Router {
         meta: typ::SnapshotMeta,
         data: Vec<u8>,
     ) -> Result<SnapshotResponse<TypeConfig>, Unreachable<TypeConfig>> {
-        match self
-            .send_call(to_node, to_group, RaftCall::Snapshot { vote, meta, data })
-            .await?
+        let permit = self
+            .snapshot_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Unreachable::new(&RouterError("native snapshot send busy".into())))?;
+        if data.len() > 64 * 1024 * 1024
+            || bincode::serialized_size(&(vote, &meta, &data)).map_or(true, |size| {
+                size > 65 * 1024 * 1024
+                    || size.saturating_sub(data.len() as u64 + 8) > 1024 * 1024 - 1024
+            })
         {
+            return Err(Unreachable::new(&RouterError(
+                "native snapshot wire limit".into(),
+            )));
+        }
+        let router = self.clone();
+        let reply = tokio::spawn(async move {
+            let _permit = permit;
+            router
+                .send_call(to_node, to_group, RaftCall::Snapshot { vote, meta, data })
+                .await
+        })
+        .await
+        .map_err(|_| {
+            Unreachable::new(&RouterError("native snapshot send task stopped".into()))
+        })??;
+        match reply {
             RaftReply::Snapshot(Ok(r)) => Ok(r),
             RaftReply::Snapshot(Err(e)) => Err(Unreachable::new(&RouterError(e.to_string()))),
             RaftReply::MissingGroup => Err(Unreachable::new(&RouterError("missing group".into()))),

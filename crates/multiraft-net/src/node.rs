@@ -131,10 +131,10 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
         response_tx,
     } = msg;
 
-    let raft = {
+    let (raft, snapshot_cap) = {
         let g = groups.lock().unwrap();
         match g.get(&group_id) {
-            Some(app) => app.raft.clone(),
+            Some(app) => (app.raft.clone(), app.state_machine.snapshot_byte_limit()),
             None => {
                 let _ = response_tx.send(RaftReply::MissingGroup);
                 return;
@@ -146,6 +146,15 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
         RaftCall::Vote(req) => RaftReply::Vote(raft.vote(req).await),
         RaftCall::Append(req) => RaftReply::Append(raft.append_entries(req).await),
         RaftCall::Snapshot { vote, meta, data } => {
+            if data.len() > snapshot_cap
+                || bincode::serialized_size(&(vote, &meta, &data))
+                    .map_or(true, |size| size > (snapshot_cap + 1024 * 1024) as u64)
+            {
+                let _ = response_tx.send(RaftReply::Snapshot(Err(RaftError::<Infallible>::Fatal(
+                    openraft::error::Fatal::Stopped,
+                ))));
+                return;
+            }
             let snapshot = Snapshot {
                 meta,
                 snapshot: Cursor::new(data),
@@ -193,6 +202,7 @@ where
             election_timeout_min: 300,
             election_timeout_max: 600,
             max_in_snapshot_log_to_keep: 0,
+            snapshot_policy: openraft::SnapshotPolicy::Never,
             ..Default::default()
         };
         let config = Arc::new(config.validate().unwrap());

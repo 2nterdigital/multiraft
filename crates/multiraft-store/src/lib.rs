@@ -17,8 +17,10 @@ pub use sm_bridge::build_standby_snapshot_async;
 pub use sm_bridge::SmOptions;
 pub use sm_bridge::StateMachineStore;
 pub use sm_bridge::TriggerCb;
+pub use sm_bridge::{NativeBuildReservation, NativeCaptureError, NativeSmOptions};
 pub use snapshot_catalog::CatalogEntry;
 pub use snapshot_catalog::SnapshotCatalog;
+pub use snapshot_catalog::{NativeSnapshot, NativeSnapshotInfo, NativeSnapshotStage};
 pub use stub_network::StubNetworkFactory;
 
 pub use multiraft_core::GroupId;

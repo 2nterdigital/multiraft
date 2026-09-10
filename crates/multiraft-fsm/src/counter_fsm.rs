@@ -58,6 +58,50 @@ impl StateMachine for CounterFsm {
         Ok(serde_json::to_vec(&(v, seen)).unwrap())
     }
 
+    fn freeze_bounded(
+        &self,
+        group: GroupId,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, crate::CaptureError<Self::Error>> {
+        // Serialize the borrowed set directly: no unbounded intermediate Vec of IDs.
+        struct Limited {
+            bytes: Vec<u8>,
+            max: usize,
+            refused: bool,
+        }
+        impl std::io::Write for Limited {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > self.max.saturating_sub(self.bytes.len()) {
+                    self.refused = true;
+                    return Err(std::io::Error::other("snapshot byte limit"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let empty = HashSet::new();
+        let seen = self.seen.get(&group).unwrap_or(&empty);
+        let mut writer = Limited {
+            bytes: Vec::new(),
+            max: max_bytes,
+            refused: false,
+        };
+        if let Err(error) = serde_json::to_writer(&mut writer, &(self.value(group), seen)) {
+            if writer.refused {
+                return Err(crate::CaptureError::Refused(
+                    crate::CaptureRefusal::SizeLimit,
+                ));
+            }
+            return Err(crate::CaptureError::Application(CounterError::Decode(
+                error.to_string(),
+            )));
+        }
+        Ok(writer.bytes)
+    }
+
     fn restore(&mut self, group: GroupId, snapshot: &[u8]) -> Result<(), Self::Error> {
         let (v, seen): (i64, Vec<u64>) =
             serde_json::from_slice(snapshot).map_err(|e| CounterError::Decode(e.to_string()))?;

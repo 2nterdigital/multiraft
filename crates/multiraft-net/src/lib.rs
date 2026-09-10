@@ -48,6 +48,10 @@ pub use grpc::GrpcServer;
 pub use multiraft::wait_for_leader;
 pub use multiraft::MultiRaft;
 pub use multiraft::SharedFabric;
+pub use multiraft::{
+    CompactionProgress, CompactionRejection, CompactionSubmission, DurableSnapshotObservation,
+    LocalStorageStatus, NATIVE_SNAPSHOT_COMPACTION_CONTRACT,
+};
 pub use multiraft_core::ObservationClosed;
 pub use network::GrpcNetworkFactory;
 pub use network::NetworkFactory;

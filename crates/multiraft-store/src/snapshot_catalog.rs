@@ -1,4 +1,7 @@
-//! Durable snapshot catalog: `{root}/{group}/{index}-{term}/`.
+mod native;
+pub use native::{NativeSnapshot, NativeSnapshotInfo, NativeSnapshotStage};
+
+// Durable snapshot catalog: `{root}/{group}/{index}-{term}/`.
 
 use std::fs;
 use std::io;
@@ -39,6 +42,7 @@ struct MetaFile {
 pub struct SnapshotCatalog {
     root: PathBuf,
     keep: usize,
+    native_activation: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl SnapshotCatalog {
@@ -46,6 +50,7 @@ impl SnapshotCatalog {
         Self {
             root: root.into(),
             keep: keep.max(1),
+            native_activation: Default::default(),
         }
     }
 

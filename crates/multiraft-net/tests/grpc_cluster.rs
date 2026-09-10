@@ -54,10 +54,8 @@ async fn wait_for_leader_for<S: StateMachine>(
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         for node in nodes {
-            if let Some(leader) = node.leader(group) {
-                if nodes.iter().any(|node| node.is_leader(group)) {
-                    return Some(leader);
-                }
+            if node.is_leader(group) {
+                return Some(node.node_id());
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -171,16 +169,26 @@ async fn grpc_three_node_custom_factory_propose() {
             .await
             .expect("create group");
     }
-    let leader = wait_for_leader_for(&nodes, 21, Duration::from_secs(15))
-        .await
-        .expect("gRPC leader");
-    nodes
-        .iter()
-        .find(|node| node.node_id() == leader)
-        .expect("leader")
-        .propose(21, 7i64.to_le_bytes().to_vec())
-        .await
-        .expect("propose");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let leader = wait_for_leader_for(&nodes, 21, remaining)
+            .await
+            .expect("gRPC leader");
+        let node = nodes.iter().find(|node| node.node_id() == leader).unwrap();
+        match node.propose(21, 7i64.to_le_bytes().to_vec()).await {
+            Ok(_) => break,
+            // Retry only a definite forwarding rejection, never an unknown write.
+            Err(multiraft_core::MultiRaftError::NotLeader { .. }) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "leader changed throughout proposal deadline"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("propose: {error:?}"),
+        }
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         let mut values = Vec::new();

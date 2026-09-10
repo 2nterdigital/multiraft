@@ -17,11 +17,13 @@ pub enum NodeRole {
 /// How snapshots are produced on this cluster.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SnapshotMode {
-    /// Legacy: voters may sync-dump FSM in `build_snapshot`.
+    /// No policy-driven snapshots or manual compaction.
     #[default]
     Disabled,
     /// Voters never hot-dump FSM; Standby builds durable snapshots asynchronously.
     StandbyOffload,
+    /// Durable native checkpoints with manually requested compaction.
+    NativeDurable,
 }
 
 /// Local file-log durability after each durable write (aligned with Aeron Archive/Cluster
@@ -76,6 +78,10 @@ pub struct ClusterConfig {
     pub role: NodeRole,
     /// Snapshot policy; see [`SnapshotMode`].
     pub snapshot_mode: SnapshotMode,
+    /// Covered native logs to retain after a checkpoint (0..=65,536).
+    pub retain_log_entries: u64,
+    /// Application snapshot byte cap (1..=64 MiB), subject to stricter FSM limits.
+    pub max_snapshot_bytes: usize,
     /// How many durable catalog snapshots to retain per group (StandbyOffload).
     pub snapshot_keep: usize,
     /// Admin HTTP bind / advertise address for snapshot fetch URLs (demo / recovery).
@@ -125,6 +131,27 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
+    /// Reject unsupported durable-native configurations before runtime publication.
+    pub fn validate_snapshot_storage(&self) -> Result<(), &'static str> {
+        if self.retain_log_entries > 65_536
+            || self.max_snapshot_bytes == 0
+            || self.max_snapshot_bytes > 64 * 1024 * 1024
+        {
+            return Err("snapshot limits outside supported bounds");
+        }
+        if self.snapshot_mode == SnapshotMode::NativeDurable {
+            if self.data_dir.as_os_str().is_empty()
+                || self.file_log_sync_level == FileLogSyncLevel::Os
+            {
+                return Err("native durable snapshots require Data-or-stronger file logs");
+            }
+            if self.role != NodeRole::Voter {
+                return Err("native durable snapshots require native voter mode");
+            }
+        }
+        Ok(())
+    }
+
     /// Sensible defaults for local / in-process tests (memory log).
     pub fn for_test(node_id: NodeId, peer_ids: &[NodeId]) -> Self {
         let peers = peer_ids
@@ -147,6 +174,8 @@ impl ClusterConfig {
             election_timeout_max_ms: 600,
             role: NodeRole::Voter,
             snapshot_mode: SnapshotMode::Disabled,
+            retain_log_entries: 1024,
+            max_snapshot_bytes: 64 * 1024 * 1024,
             snapshot_keep: 2,
             admin_advertise_addr: None,
             standby_max_inflight: 8,

@@ -2,6 +2,9 @@
 //!
 //! Adapted from openraft `examples/sm-mem` at tag `v0.10.0-alpha.30`.
 
+mod native;
+pub use native::{NativeBuildReservation, NativeCaptureError, NativeSmOptions, SnapshotBuilder};
+
 use std::io;
 use std::io::Cursor;
 use std::sync::atomic::AtomicU64;
@@ -81,6 +84,7 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
 pub struct StateMachineStore<S: StateMachine> {
     group_id: GroupId,
     inner: Arc<Mutex<StateMachineStoreInner<S>>>,
+    native: Option<Arc<native::NativeRuntime>>,
     allow_hot_build: bool,
     catalog: Option<Arc<SnapshotCatalog>>,
     on_standby_trigger: Option<TriggerCb>,
@@ -102,6 +106,7 @@ impl<S: StateMachine> Clone for StateMachineStore<S> {
         Self {
             group_id: self.group_id,
             inner: self.inner.clone(),
+            native: self.native.clone(),
             allow_hot_build: self.allow_hot_build,
             catalog: self.catalog.clone(),
             on_standby_trigger: self.on_standby_trigger.clone(),
@@ -126,6 +131,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         Self {
             group_id,
             inner: Arc::new(Mutex::new(StateMachineStoreInner::new(group_id, fsm))),
+            native: None,
             allow_hot_build: opts.allow_hot_build,
             catalog: opts.catalog,
             on_standby_trigger: opts.on_standby_trigger,
@@ -215,6 +221,22 @@ where
     async fn build_snapshot(
         &mut self,
     ) -> Result<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>, io::Error> {
+        if self.native.is_some() {
+            return self
+                .prepare_builder(true)
+                .await
+                .expect("forced builder")
+                .build_snapshot()
+                .await;
+        }
+        self.build_legacy_snapshot().await
+    }
+}
+
+impl<S: StateMachine> StateMachineStore<S> {
+    async fn build_legacy_snapshot(
+        &mut self,
+    ) -> io::Result<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>> {
         if !self.allow_hot_build {
             // StandbyOffload: never sync-dump FSM; serve only an OpenRaft snapshot.
             {
@@ -299,7 +321,7 @@ where
         openraft::RaftTypeConfig<D = Request, R = Response, Entry = DefaultEntryOf<TypeConfig>>,
 {
     type SnapshotData = Cursor<Vec<u8>>;
-    type SnapshotBuilder = Self;
+    type SnapshotBuilder = SnapshotBuilder<S>;
 
     async fn applied_state(
         &mut self,
@@ -318,9 +340,29 @@ where
         {
             let mut inner = self.inner.lock().await;
 
+            if self.native_is_closing() {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "native state machine closed",
+                ));
+            }
             while let Some((entry, responder)) = entries.try_next().await? {
                 tracing::trace!(%entry.log_id, "replicate to sm");
 
+                if self.native.is_some() {
+                    let expected = inner
+                        .last_applied_log
+                        .map_or(Some(0), |id| id.index.checked_add(1));
+                    if expected != Some(entry.log_id.index) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "native application log gap: expected {expected:?}, got {}",
+                                entry.log_id.index
+                            ),
+                        ));
+                    }
+                }
                 inner.last_applied_log = Some(entry.log_id);
 
                 let response = match &entry.payload {
@@ -376,6 +418,11 @@ where
         meta: &SnapshotMetaOf<TypeConfig>,
         snapshot: Self::SnapshotData,
     ) -> Result<(), io::Error> {
+        if self.native.is_some() {
+            return self
+                .install_native_snapshot(meta, snapshot.into_inner())
+                .await;
+        }
         tracing::info!(
             { snapshot_size = snapshot.get_ref().len() },
             "decoding snapshot for installation"
@@ -419,6 +466,9 @@ where
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<SnapshotOf<TypeConfig, Self::SnapshotData>>, io::Error> {
+        if self.native.is_some() {
+            return self.load_native_snapshot().await;
+        }
         let inner = self.inner.lock().await;
         match &inner.current_snapshot {
             Some(snapshot) => {
@@ -432,7 +482,11 @@ where
         }
     }
 
+    async fn try_create_snapshot_builder(&mut self, force: bool) -> Option<Self::SnapshotBuilder> {
+        self.prepare_builder(force).await
+    }
+
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        self.clone()
+        self.prepare_builder(true).await.expect("forced builder")
     }
 }

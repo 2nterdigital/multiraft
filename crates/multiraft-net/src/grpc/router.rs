@@ -21,7 +21,6 @@ use openraft::raft::VoteResponse;
 use openraft::OptionalSend;
 use openraft_multi::GroupRouter;
 
-use crate::decode;
 use crate::encode;
 use crate::grpc::proto::raft_service_client::RaftServiceClient;
 use crate::grpc::proto::RaftRequest;
@@ -51,6 +50,8 @@ pub struct GrpcRouter {
     self_id: NodeId,
     channels: GrpcPeerChannelPool,
     throttle: StandbyThrottle,
+    snapshot_cap: usize,
+    snapshot_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl GrpcRouter {
@@ -69,13 +70,17 @@ impl GrpcRouter {
             self_id,
             channels: GrpcPeerChannelPool::new(peers),
             throttle,
+            snapshot_cap: 64 * 1024 * 1024,
+            snapshot_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
     /// Build from cluster config (seeds standby throttle).
     pub fn from_config(config: &ClusterConfig) -> Self {
         let throttle = StandbyThrottle::from_config(config);
-        Self::with_throttle(config.peers.clone(), config.node_id, throttle)
+        let mut router = Self::with_throttle(config.peers.clone(), config.node_id, throttle);
+        router.snapshot_cap = config.max_snapshot_bytes;
+        router
     }
 
     pub fn self_id(&self) -> NodeId {
@@ -111,6 +116,11 @@ impl GrpcRouter {
             .await
             .map_err(|error| Unreachable::new(&GrpcError(error.to_string())))?;
         let mut client = RaftServiceClient::new(channel);
+        if path == "/raft/snapshot" {
+            client = client
+                .max_encoding_message_size(self.snapshot_cap + 1024 * 1024)
+                .max_decoding_message_size(self.snapshot_cap + 1024 * 1024);
+        }
 
         let encoded_req = encode(&req);
         tracing::debug!(
@@ -139,7 +149,8 @@ impl GrpcRouter {
             "grpc resp"
         );
 
-        let res = decode::<Result<Resp, RaftError>>(&resp_bytes);
+        let res = bincode::deserialize::<Result<Resp, RaftError>>(&resp_bytes)
+            .map_err(|_| Unreachable::new(&GrpcError("invalid native RPC response".into())))?;
         res.map_err(|e| Unreachable::new(&GrpcError(e.to_string())))
     }
 }
@@ -178,16 +189,64 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
         vote: typ::Vote,
         snapshot: SnapshotOf<TypeConfig, typ::SnapshotData>,
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
+        let permit = self
+            .snapshot_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                StreamingError::Unreachable(Unreachable::new(&GrpcError(
+                    "native snapshot send busy".into(),
+                )))
+            })?;
+        if self.snapshot_cap == 0
+            || self.snapshot_cap > 64 * 1024 * 1024
+            || snapshot.snapshot.get_ref().len() > self.snapshot_cap
+        {
+            return Err(StreamingError::Unreachable(Unreachable::new(&GrpcError(
+                "native snapshot size limit".into(),
+            ))));
+        }
         let data: Vec<u8> = snapshot.snapshot.into_inner();
-        self.send(
-            target,
-            group_id,
-            "/raft/snapshot",
-            (vote, snapshot.meta, data),
-        )
+        let wire_size = bincode::serialized_size(&(vote, &snapshot.meta, &data)).map_err(|_| {
+            StreamingError::Unreachable(Unreachable::new(&GrpcError(
+                "invalid snapshot metadata".into(),
+            )))
+        })?;
+        if wire_size > (self.snapshot_cap + 1024 * 1024) as u64
+            || wire_size.saturating_sub(data.len() as u64 + 8) > 1024 * 1024 - 1024
+        {
+            return Err(StreamingError::Unreachable(Unreachable::new(&GrpcError(
+                "native snapshot wire limit".into(),
+            ))));
+        }
+        let router = self.clone();
+        let ttl = option.hard_ttl();
+        tokio::spawn(async move {
+            let _permit = permit;
+            tokio::time::timeout(
+                ttl,
+                router.send(
+                    target,
+                    group_id,
+                    "/raft/snapshot",
+                    (vote, snapshot.meta, data),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                Unreachable::new(&GrpcError(
+                    "native snapshot RPC timeout; outcome unconfirmed".into(),
+                ))
+            })?
+        })
         .await
+        .map_err(|_| {
+            StreamingError::Unreachable(Unreachable::new(&GrpcError(
+                "native snapshot send task stopped".into(),
+            )))
+        })?
         .map_err(StreamingError::Unreachable)
     }
 

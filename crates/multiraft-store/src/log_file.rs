@@ -175,6 +175,9 @@ where
     VoteOf<C>: Serialize + DeserializeOwned,
 {
     loop {
+        // Claim IO ordering before detaching a batch, so hard-state writers
+        // cannot overtake a batch that has left the pending buffer.
+        let _io = io_gate.lock().await;
         let batch = {
             let mut guard = inner.lock().await;
             guard.take_flush_batch()
@@ -183,7 +186,6 @@ where
             return Ok(());
         };
 
-        let _io = io_gate.lock().await;
         let res = {
             let mut guard = inner.lock().await;
             guard.ensure_log_writer()?;
@@ -398,6 +400,15 @@ where
     LogIdOf<C>: Serialize + DeserializeOwned,
     VoteOf<C>: Serialize + DeserializeOwned,
 {
+    /// Sample the file-log owner's current retained file bytes, without mutation.
+    pub fn measure_retained_log_bytes(dir: impl AsRef<Path>) -> io::Result<u64> {
+        match fs::metadata(dir.as_ref().join(LOG_BIN)) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Open (or create) a durable log directory (immediate flush, OS page-cache sync).
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         Self::open_with_options(dir, 0, FileLogSyncLevel::Os)
@@ -587,11 +598,14 @@ where
             }
             fs::write(&tmp, &buf)?;
             durability::sync_path(&tmp, self.sync_level)?;
+            tracing::debug!(target: "multiraft::native_file_log", phase = "rewrite_data_synced", "native log rewrite ordering");
         }
         fs::rename(&tmp, &path)?;
+        tracing::debug!(target: "multiraft::native_file_log", phase = "rewrite_renamed", "native log rewrite ordering");
         if !matches!(self.sync_level, FileLogSyncLevel::Os) {
             durability::sync_dir(self.dir.as_path())?;
             durability::sync_path(&path, self.sync_level)?;
+            tracing::debug!(target: "multiraft::native_file_log", phase = "rewrite_directory_synced", "native log rewrite ordering");
         }
         let _ = fs::remove_file(self.dir.join(LOG_FILE_LEGACY));
         let _ = fs::remove_file(self.dir.join(LOG_NDJSON));
@@ -619,10 +633,16 @@ where
     }
 
     async fn save_committed(&mut self, committed: Option<LogIdOf<C>>) -> Result<(), io::Error> {
-        // Debounce: persist with the next log flush / vote / rewrite (avoids a
-        // hard_state.json rewrite on every commit under propose load).
+        if self.committed == committed && !self.hard_state_dirty {
+            return Ok(());
+        }
         self.committed = committed;
         self.hard_state_dirty = true;
+        // Data/All recovery must not depend on a later append or a live peer
+        // rediscovering the final committed suffix. Os retains its weak grade.
+        if !matches!(self.sync_level, FileLogSyncLevel::Os) {
+            self.persist_hard_state()?;
+        }
         Ok(())
     }
 
@@ -684,6 +704,7 @@ where
             self.log.remove(&key);
         }
         self.persist_hard_state()?;
+        tracing::debug!(target: "multiraft::native_file_log", phase = "purge_marker_synced", "native purge ordering");
         self.rewrite_log()?;
         Ok(PurgeDiagnostic {
             directory: self.dir.clone(),
@@ -868,7 +889,16 @@ mod impl_log_store {
         }
 
         async fn save_committed(&mut self, committed: Option<LogIdOf<C>>) -> Result<(), io::Error> {
+            let durable = !matches!(self.control.sync_level, FileLogSyncLevel::Os);
+            let _io = if durable {
+                Some(self.io_gate.lock().await)
+            } else {
+                None
+            };
             let mut inner = self.inner.lock().await;
+            if durable {
+                inner.flush_pending()?;
+            }
             inner.save_committed(committed).await
         }
 
@@ -962,7 +992,7 @@ mod debug_tests {
     #[test]
     fn file_log_inner_debug_fmt() {
         let inner = FileLogInner::<TypeConfig> {
-            dir: PathBuf::from("/tmp/x"),
+            dir: std::env::temp_dir().join("file-log-debug-unused"),
             last_purged_log_id: None,
             log: BTreeMap::new(),
             committed: None,
@@ -1037,7 +1067,7 @@ mod debug_tests {
 
         let ctrl = Arc::new(disabled);
         let inner = Arc::new(Mutex::new(FileLogInner::<TypeConfig> {
-            dir: PathBuf::from("/tmp/x"),
+            dir: std::env::temp_dir().join("file-log-debug-unused"),
             last_purged_log_id: None,
             log: BTreeMap::new(),
             committed: None,
@@ -1066,7 +1096,7 @@ mod debug_tests {
         ));
         os.flusher_running.store(true, Ordering::Release);
         let inner = Arc::new(Mutex::new(FileLogInner::<TypeConfig> {
-            dir: PathBuf::from("/tmp/x"),
+            dir: std::env::temp_dir().join("file-log-debug-unused"),
             last_purged_log_id: None,
             log: BTreeMap::new(),
             committed: None,

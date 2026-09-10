@@ -1,23 +1,14 @@
-//! Positive native-snapshot recovery for a lagging voter across a purged
-//! log prefix — the "rolling victim recovery after purge" ledger case.
+//! Positive native snapshot recovery for a lagging voter across a purged prefix.
 //!
-//! Channel proof: the victim voter is stopped after the first `W1` entries;
-//! the survivors then commit `W2` more entries, crossing the legacy
-//! `SnapshotPolicy::LogsSinceLast(5000)` threshold so the leader builds a
-//! native snapshot (memory-only legacy sync dump) and — with
-//! `max_in_snapshot_log_to_keep = 0` — purges every log entry at or below
-//! the snapshot point. The asserted purge index lies far beyond the
-//! victim's retained prefix, so log replication cannot supply the missing
-//! entries and the only recovery channel for the restarted victim is the
-//! native OpenRaft install-snapshot RPC. Recovery diagnostics
-//! (`native_snapshot_build`, `file_log_purge`) are captured and asserted;
-//! the final oracle is the restarted victim's OWN local FSM value.
+//! The original W1/W2 load and direct victim oracle are retained. Both survivors
+//! explicitly build durable checkpoints and purge beyond the victim's prefix
+//! before it restarts. This is an in-process conformance test, not a G1 receipt.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use multiraft_core::ClusterConfig;
+use multiraft_core::{ClusterConfig, FileLogSyncLevel, SnapshotMode};
 use multiraft_fsm::CounterFsm;
 use multiraft_net::{wait_for_leader, MultiRaft, SharedFabric};
 use tracing::field::{Field, Visit};
@@ -28,7 +19,7 @@ use tracing_subscriber::Layer;
 
 /// Entries the victim observes before it is stopped.
 const W1: u64 = 100;
-/// Entries committed while the victim is down; crosses LogsSinceLast(5000).
+/// Original workload committed while the victim is down.
 const W2: u64 = 5_600;
 
 #[derive(Clone, Default)]
@@ -99,6 +90,9 @@ where
 fn cfg(id: u64, peers: &[u64], dir: std::path::PathBuf) -> ClusterConfig {
     let mut config = ClusterConfig::for_test(id, peers);
     config.data_dir = dir;
+    config.snapshot_mode = SnapshotMode::NativeDurable;
+    config.file_log_sync_level = FileLogSyncLevel::Data;
+    config.retain_log_entries = 0;
     config
 }
 
@@ -127,6 +121,28 @@ async fn propose_inc(nodes: &[&MultiRaft], group: u64, idem: u64) {
         if std::time::Instant::now() >= deadline {
             panic!("propose timed out at idem={idem}");
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Keep one Raft entry per original command, with bounded concurrent submission.
+async fn propose_batch_inc(nodes: &[&MultiRaft], group: u64, ids: &[u64]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        for node in nodes.iter().filter(|node| node.is_leader(group)) {
+            let data = ids
+                .iter()
+                .map(|&idem| CounterFsm::encode_add(1, idem))
+                .collect();
+            if let Ok(results) = node.propose_batch(group, data).await {
+                assert_eq!(results.len(), ids.len());
+                return;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bounded Counter batch timed out"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -216,10 +232,28 @@ async fn lagging_voter_recovers_via_native_snapshot_across_purge() {
         .map(|(_, n)| n)
         .collect();
 
-    // Phase 2: W2 entries on the survivors — crosses LogsSinceLast(5000),
-    // so the leader builds a native snapshot and purges the covered prefix.
-    for idem in (W1 + 1)..=(W1 + W2) {
-        propose_inc(&survivors, group, idem).await;
+    // Phase 2: preserve every original W2 command while batching disk sync work.
+    let ids: Vec<_> = ((W1 + 1)..=(W1 + W2)).collect();
+    for batch in ids.chunks(128) {
+        propose_batch_inc(&survivors, group, batch).await;
+    }
+    for node in &survivors {
+        node.request_compaction(group)
+            .await
+            .expect("explicit durable compaction");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let status = node.local_storage_status(group).await.unwrap();
+            if status.progress == multiraft_net::CompactionProgress::CompletedObserved {
+                assert!(status.purged.is_some_and(|id| id.index > W1 + 50));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "survivor compaction unfinished: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     // Await the snapshot-build and purge diagnostics.
@@ -239,8 +273,7 @@ async fn lagging_voter_recovers_via_native_snapshot_across_purge() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "native snapshot build + log purge must occur after crossing the \
-             LogsSinceLast threshold (builds={}, purges={})",
+            "native snapshot build + log purge must occur after manual durable compaction (builds={}, purges={})",
             builds.len(),
             purges.len()
         );
@@ -279,7 +312,17 @@ async fn lagging_voter_recovers_via_native_snapshot_across_purge() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Cluster health: a linearizable read agrees with the recovered value.
+    assert!(
+        restarted
+            .local_storage_status(group)
+            .await
+            .unwrap()
+            .durable_snapshot
+            .is_some(),
+        "victim must durably install its peer snapshot"
+    );
+
+    // A ReadIndex-backed read agrees with the recovered value.
     let survivors_after: Vec<&MultiRaft> = survivors.clone();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let read = loop {
