@@ -97,13 +97,11 @@ def main():
     (run / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     receipts = []
 
-    def execute(name, command, timeout=300, require_tests=True):
-        log = run / 'logs' / (name + '.log')
-        timing = run / 'logs' / (name + '.time.txt')
-        actual = ['/usr/bin/time', '-v', '-o', str(timing)] + command
+    def run_logged(command, log, timeout):
         begin = time.time()
         with log.open('wb') as output:
-            process = subprocess.Popen(actual, cwd=repo, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+            process = subprocess.Popen(command, cwd=repo, env=env, stdout=output,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
             timed_out = False
             try:
                 code = process.wait(timeout=timeout)
@@ -111,8 +109,48 @@ def main():
                 timed_out = True
                 os.killpg(process.pid, signal.SIGKILL)
                 code = process.wait()
+        return code, timed_out, begin, time.time()
+
+    def fingerprint(path):
+        path = Path(path).resolve(strict=True)
+        assert path.is_relative_to(root / 'target')
+        stat = path.stat()
+        return {'path': str(path), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
+                'inode': stat.st_ino, 'sha256': digest(path)}
+
+    def execute(name, command, timeout=300, require_tests=True):
+        log = run / 'logs' / (name + '.log')
+        timing = run / 'logs' / (name + '.time.txt')
+        build_command = None
+        binaries_before = []
+        if require_tests:
+            build_command = command[:command.index('--')] + ['--no-run', '--message-format=json']
+            build_log = run / 'logs' / (name + '.build.jsonl')
+            build_code, build_timeout, _, _ = run_logged(build_command, build_log, 1800)
+            assert build_code == 0 and not build_timeout, 'case prebuild failed: ' + str(build_log)
+            executables = set()
+            for line in build_log.read_text(errors='replace').splitlines():
+                try:
+                    artifact = json.loads(line)
+                except ValueError:
+                    continue
+                if artifact.get('reason') == 'compiler-artifact' and artifact.get('executable'):
+                    executables.add(artifact['executable'])
+            assert executables, 'case prebuild selected no executable'
+            binaries_before = [fingerprint(path) for path in sorted(executables)]
+        actual = ['/usr/bin/time', '-v', '-o', str(timing)] + command
+        code, timed_out, begin, end = run_logged(actual, log, timeout)
+        binaries_after = [fingerprint(item['path']) for item in binaries_before]
+        binaries_unchanged = all(a['sha256'] == b['sha256'] for a, b in zip(binaries_before, binaries_after))
         content = log.read_text(errors='replace')
         selected = not require_tests or bool(re.search(r'test result: ok\. [1-9][0-9]* passed', content))
+        node_logs = []
+        fixture_roots = re.findall(r'NATIVE_EVIDENCE case=\S+ root=(\S+)', content)
+        for fixture in fixture_roots:
+            fixture = Path(fixture).resolve(strict=True)
+            assert fixture.is_relative_to(run)
+            for node_log in sorted(fixture.glob('node-*-epoch-*.log')):
+                node_logs.append({'path': str(node_log), 'sha256': digest(node_log)})
         scope = {'topology': 'Exact test fixture; RF3 cases use three OS processes and one Group', 'sync_grade': 'Data/All per exact fixture; NativeDurable never uses Os', 'oracle': 'Direct owner assertions in the named test, with RF3 per-victim/every-voter NATIVE_ORACLE records; no readiness substitution', 'recovery_channel': 'Named RF3 case separates isolated local snapshot+suffix, peer native gRPC install, and receiver local restart; unit cases retain their narrower source scope', 'seed': 'not-exposed', 'test_threads': 1}
         if name.startswith('isolated_local_post_purge'):
             scope.update(topology='RF3 Group 7: three processes before stop, only node 2 after restart', oracle='Direct node 2 FSM value 17 with purged prefix and durable checkpoint', recovery_channel='Local durable native snapshot plus retained committed suffix; no live peers')
@@ -127,9 +165,13 @@ def main():
         elif name.startswith('native_post_purge_restart'):
             scope.update(topology='One Data-grade native Raft Group 7 plus process-crash children', oracle='Value 17 from actual removed prefix plus suffix; missing checkpoint/middle entry rejects; all declared install/purge cuts', recovery_channel='OpenRaft startup install and committed-suffix replay')
         receipt = {'case': name, 'scope': scope, 'command': command, 'timeout_seconds': timeout, 'exit_code': code,
-                   'timed_out': timed_out, 'nonzero_intended_tests': selected, 'elapsed_seconds': time.time() - begin,
+                   'timed_out': timed_out, 'nonzero_intended_tests': selected, 'elapsed_seconds': end - begin,
+                   'utc_start': datetime.datetime.fromtimestamp(begin, datetime.timezone.utc).isoformat(),
+                   'utc_end': datetime.datetime.fromtimestamp(end, datetime.timezone.utc).isoformat(),
+                   'prebuild_command': build_command, 'binaries_before': binaries_before, 'binaries_after': binaries_after,
+                   'binary_unchanged': binaries_unchanged, 'node_log_count': len(node_logs), 'node_logs': node_logs,
                    'log': str(log), 'log_sha256': digest(log), 'timing': str(timing),
-                   'pass': code == 0 and selected}
+                   'pass': code == 0 and selected and binaries_unchanged}
         receipts.append(receipt)
         (run / 'receipts.json').write_text(json.dumps(receipts, indent=2) + '\n')
         print(json.dumps(receipt), flush=True)
