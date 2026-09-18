@@ -23,6 +23,8 @@ mod standby_throttle;
 pub use conn_metrics::ConnMetrics;
 pub use fsm_factory::FsmFactoryContext;
 pub use fsm_factory::StateMachineFactory;
+pub use group_control::classify_group_control_layout;
+pub use group_control::read_group_control_sample;
 pub use group_control::GroupControlLayoutObservation;
 pub use group_control::GroupControlPrecheckError;
 pub use group_control::GroupControlPrecheckRejection;

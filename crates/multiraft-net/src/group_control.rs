@@ -441,7 +441,15 @@ struct StatePoint {
     local_committed: Option<ObservedLogId>,
 }
 
-pub(crate) async fn read_group_control_sample<S: StateMachine>(
+/// Reads one best-effort local leader/control sample without requesting a transfer.
+///
+/// The caller supplies the expected fixed voter set and both age budgets. The
+/// sample remains diagnostic input; it does not authorize a transfer by itself.
+/// The caller must bind `raft` to `group_id` using its owned Group registration;
+/// the Group label is not inferred from the handle. `local_node_id` must identify
+/// that local voter. Sampling uses ReadIndex and the existing native checks.
+/// `sample_age` measures collection duration, not the age of a later stored copy.
+pub async fn read_group_control_sample<S: StateMachine>(
     raft: &Raft<S>,
     group_id: GroupId,
     local_node_id: NodeId,
@@ -610,6 +618,11 @@ where
     }
 }
 
+/// Classifies a fresh sample relative to an earlier control request echo.
+///
+/// This is an observation only. It does not establish that this request caused
+/// the observed leader layout. The caller must supply a sample for the echo's
+/// Group; classification does not bind a handle or recheck transfer eligibility.
 pub fn classify_group_control_layout(
     echo: GroupControlRequestEcho,
     sample_result: Result<&GroupControlSample, &GroupControlSampleError>,
