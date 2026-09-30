@@ -38,6 +38,10 @@ pub use group_control::GroupControlSample;
 pub use group_control::GroupControlSampleError;
 pub use group_control::MembershipChangeKind;
 pub use group_control::TargetQualification;
+pub use group_control::{
+    ControlContext, ControlIdentityMismatch, ControlInvocationId, ControlStage,
+    ControlSubmissionError, ControlTransferOutcome,
+};
 pub use group_observation::GroupObservation;
 pub use group_observation::GroupObservationReceiver;
 pub use group_observation::GroupServerState;

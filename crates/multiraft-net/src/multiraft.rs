@@ -90,6 +90,7 @@ use openraft::ReadPolicy;
 use tokio::sync::Notify;
 
 mod application;
+mod control;
 mod group_start;
 mod lifecycle;
 mod maintenance;
@@ -197,6 +198,8 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     groups: GroupMap<S>,
     tasks: tasks::OwnedTasks,
     reads: read::ReadRuntime,
+    control_slot: tokio::sync::Semaphore,
+    leader_watch_groups: Mutex<BTreeSet<GroupId>>,
     fsm_releases: Mutex<Vec<multiraft_store::StateMachineRelease>>,
     ingress_tasks: Arc<tasks::OwnedTasks>,
     listener_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -487,87 +490,6 @@ impl<S: StateMachine> MultiRaft<S> {
         }
     }
 
-    /// Best-effort control sample for one existing local Group.
-    ///
-    /// This combines two public state point reads, one ReadIndex confirmation
-    /// and one public metrics read from the same existing Raft handle. It does
-    /// not read the application FSM and does not create missing groups.
-    pub async fn read_group_control_sample(
-        &self,
-        group: GroupId,
-        expected_voters: &[NodeId],
-        max_sample_age: Duration,
-        max_target_ack_age: Duration,
-    ) -> Result<GroupControlSample, GroupControlSampleError> {
-        let raft = self
-            .raft(group)
-            .ok_or(GroupControlSampleError::UnknownGroup { group_id: group })?;
-
-        crate::group_control::read_group_control_sample(
-            &raft,
-            group,
-            self.node_id,
-            expected_voters,
-            max_sample_age,
-            max_target_ack_age,
-        )
-        .await
-    }
-
-    /// Submit one best-effort leadership transfer request after rechecking the
-    /// observed control preconditions against a fresh public sample.
-    pub async fn try_transfer_group_leader(
-        &self,
-        preconditions: &GroupControlPreconditions,
-        expected_voters: &[NodeId],
-        max_sample_age: Duration,
-        max_target_ack_age: Duration,
-    ) -> GroupControlRequestResult {
-        let group = preconditions.group_id;
-        let raft = match self.raft(group) {
-            Some(raft) => raft,
-            None => {
-                return GroupControlRequestResult::PrecheckRejected {
-                    echo: preconditions.echo(),
-                    reason: crate::group_control::GroupControlPrecheckRejection::Sample(
-                        GroupControlSampleError::UnknownGroup { group_id: group },
-                    ),
-                };
-            }
-        };
-
-        crate::group_control::submit_group_control_transfer(
-            &raft,
-            group,
-            self.node_id,
-            preconditions,
-            expected_voters,
-            max_sample_age,
-            max_target_ack_age,
-        )
-        .await
-    }
-
-    /// Classify the current independently observed layout for a previous
-    /// wrapper request. This does not reinterpret the request result.
-    pub async fn observe_group_control_layout(
-        &self,
-        echo: GroupControlRequestEcho,
-        expected_voters: &[NodeId],
-        max_sample_age: Duration,
-        max_target_ack_age: Duration,
-    ) -> GroupControlLayoutObservation {
-        let sample_result = self
-            .read_group_control_sample(
-                echo.group_id,
-                expected_voters,
-                max_sample_age,
-                max_target_ack_age,
-            )
-            .await;
-        crate::group_control::classify_group_control_layout(echo, sample_result.as_ref())
-    }
-
     pub fn is_leader(&self, group: u64) -> bool {
         self.raft(group).map(|r| r.is_leader()).unwrap_or(false)
     }
@@ -586,7 +508,7 @@ impl<S: StateMachine> MultiRaft<S> {
         F: Fn(u64, Option<u64>) + Send + Sync + 'static,
     {
         let cb: LeaderCb = Arc::new(cb);
-        self.leader_cbs.lock().unwrap().push(cb);
+        self.leader_cbs.lock().unwrap().push(cb.clone());
 
         let groups: Vec<(GroupId, Raft<S>)> = self
             .groups
@@ -597,6 +519,9 @@ impl<S: StateMachine> MultiRaft<S> {
             .collect();
 
         for (gid, raft) in groups {
+            // Retain the legacy initial callback without creating a second watcher.
+            let current = raft.metrics().borrow_watched().current_leader;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(gid, current)));
             self.spawn_leader_watch(gid, raft, self.leader_cbs.clone());
         }
     }

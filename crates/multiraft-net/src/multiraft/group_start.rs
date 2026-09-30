@@ -421,21 +421,37 @@ impl<S: StateMachine> MultiRaft<S> {
         raft: Raft<S>,
         cbs: Arc<Mutex<Vec<LeaderCb>>>,
     ) {
+        // Exactly one owned metrics watcher per local Group; callback registration
+        // reuses it rather than creating duplicate observations/tasks.
+        if !self.leader_watch_groups.lock().unwrap().insert(group) {
+            return;
+        }
+        let local_node_id = self.node_id;
         self.tasks.spawn(async move {
             let mut rx = raft.metrics();
-            let mut last: Option<Option<NodeId>> = None;
+            let mut last: Option<(Option<NodeId>, crate::VoteObservation)> = None;
             loop {
-                let cur = rx.borrow_watched().current_leader;
-                if last.as_ref() != Some(&cur) {
-                    last = Some(cur);
+                let metrics = rx.borrow_watched().clone();
+                let cur = metrics.current_leader;
+                let vote = crate::VoteObservation::new(metrics.vote.leader_id().term,
+                    metrics.vote.leader_id().node_id, metrics.vote.committed);
+                if last.as_ref() != Some(&(cur, vote)) {
+                    tracing::info!(target: "multiraft::control", group_id = group, local_node_id,
+                        stage = "observation", result = if last.is_some() { "leader_vote_changed" } else { "initial_observation" },
+                        leader_node_id = ?cur, previous_leader_node_id = ?last.map(|old| old.0),
+                        previous_vote_term = ?last.map(|old|old.1.term), previous_vote_node_id = ?last.map(|old|old.1.node_id),
+                        previous_vote_committed = ?last.map(|old|old.1.committed), vote_term = vote.term, vote_node_id = vote.node_id,
+                        vote_committed = vote.committed, reason_code = "cause_unknown",
+                        "native leader/vote observation; request causality unknown");
+                }
+                if last.as_ref().map(|old| old.0) != Some(cur) {
                     let callbacks: Vec<LeaderCb> = cbs.lock().unwrap().clone();
                     for cb in callbacks {
-                        cb(group, cur);
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(group, cur)));
                     }
                 }
-                if rx.changed().await.is_err() {
-                    break;
-                }
+                last = Some((cur, vote));
+                if rx.changed().await.is_err() { break; }
             }
         });
     }

@@ -89,3 +89,16 @@ Unconfirmed, request deadlines/cancellation, the retained sampler, canceled stop
 and real lease/listener/data-root reuse. They access no native Raft, metrics or
 trigger handle. Bounded tracing events are used as deterministic scheduling seams;
 new status tracing records only operation/phase/Node/Group identity.
+
+## Single-transfer control and source observations
+
+The weak runtime's normative sampling/transfer/layout APIs accept one opaque
+invocation identity and inherited absolute deadline. Existing native qualification
+and precheck algorithms are retained; structured source causes and full expected/
+observed evidence cross the public API. One nonqueued Node control slot is shared
+by all Group control calls. A queued trigger remains distinct from completion,
+and independent target layout observation establishes no request causality.
+See [the control API and source-log field contract](control-api.md) for interfaces,
+cancellation stages, finite INFO/DEBUG output, and the downstream sink field list.
+`tests/control_consumer.rs` verifies the public weak API over actual RF3 gRPC;
+private control tests prove deterministic zero/one-trigger and stage facts.
