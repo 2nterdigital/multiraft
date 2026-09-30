@@ -106,6 +106,7 @@ pub use maintenance::{
     LocalStorageStatus, NATIVE_SNAPSHOT_COMPACTION_CONTRACT,
 };
 mod snapshot_runtime;
+mod standby;
 use snapshot_runtime::SnapshotRuntime;
 
 type LeaderCb = Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>;
