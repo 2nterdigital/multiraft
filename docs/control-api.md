@@ -42,8 +42,11 @@ refused. A sampled collection duration is not a self-updating freshness token.
 
 ## Source logs and downstream field integration
 
-Target `multiraft::control`: bounded INFO start/terminal facts and leader/vote
-change observations; DEBUG carries finite source detail (at most 16 targets,
+Target `multiraft::control`: transfer start/terminal summaries, all refusals and
+cancellation, and actual leader/vote changes remain INFO. Ordinary sampling and
+independent layout observation starts and successful results are DEBUG only, so a
+steady sweep emits no successful observation records at default INFO. DEBUG also
+carries finite source detail (at most 16 targets,
 two voter configurations with 16 members each and 16 learners per membership).
 Complete evidence remains in typed returns; `detail_truncated` explicitly marks
 bounded membership output. No command/query bytes, consumer error/panic text,
