@@ -141,3 +141,24 @@ impl<S: StateMachine> MultiRaft<S> {
         })
     }
 }
+
+/// Finite source log labels come from the typed recovery result, never its text.
+pub(super) fn diagnostic_fields(error: &MultiRaftError) -> (&'static str, &'static str) {
+    use multiraft_core::{NativeFailure, RecoveryFailure, RecoveryStage};
+    let MultiRaftError::Recovery(recovery) = error else {
+        return ("unknown", "unknown");
+    };
+    let phase = match recovery.stage {
+        RecoveryStage::Construct => "construct",
+        RecoveryStage::Await => "await",
+        _ => "unknown",
+    };
+    let failure = match recovery.failure {
+        RecoveryFailure::Deadline => "deadline",
+        RecoveryFailure::Closed => "closed",
+        RecoveryFailure::Backend(NativeFailure::Storage) => "native_storage",
+        RecoveryFailure::Backend(NativeFailure::Panicked) => "native_panicked",
+        _ => "unknown",
+    };
+    (phase, failure)
+}
