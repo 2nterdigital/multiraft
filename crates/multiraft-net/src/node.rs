@@ -94,27 +94,39 @@ impl<S: StateMachine> Node<S> {
     pub async fn run(mut self) -> Option<()> {
         let groups = self.groups.clone();
         let mut workers: Vec<mpsc::Sender<NodeMessage>> = Vec::with_capacity(RPC_WORKERS);
+        let mut worker_tasks = tokio::task::JoinSet::new();
         for _ in 0..RPC_WORKERS {
             let (tx, rx) = mpsc::channel(RPC_WORKER_QUEUE);
             let groups = groups.clone();
-            tokio::spawn(async move {
+            worker_tasks.spawn(async move {
                 handle_worker(rx, groups).await;
             });
             workers.push(tx);
         }
 
         loop {
-            let msg = self.rx.next().await?;
+            let Some(msg) = self.rx.next().await else {
+                break;
+            };
             let idx = msg.group_id as usize % RPC_WORKERS;
             let worker = &mut workers[idx];
             if let Err(e) = worker.try_send(msg) {
                 if e.is_full() {
-                    worker.send(e.into_inner()).await.ok()?;
+                    if worker.send(e.into_inner()).await.is_err() {
+                        break;
+                    }
                 } else {
-                    return None;
+                    break;
                 }
             }
         }
+        drop(workers);
+        while let Some(result) = worker_tasks.join_next().await {
+            if result.is_err() {
+                return None;
+            }
+        }
+        Some(())
     }
 }
 

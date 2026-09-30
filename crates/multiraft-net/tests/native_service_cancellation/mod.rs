@@ -79,6 +79,8 @@ async fn cancelled_service_waiter_does_not_admit_another_native_install() {
     )])));
     let service = Arc::new(RaftServiceImpl {
         groups,
+        tasks: Arc::new(crate::multiraft::tasks::OwnedTasks::default()),
+        accepting: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         snapshot_slots: Arc::new(tokio::sync::Semaphore::new(1)),
     });
     let id = LogIdOf::<TypeConfig>::new(LeaderIdOf::<TypeConfig>::new_committed(1, 1), 3);

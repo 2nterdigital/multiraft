@@ -31,8 +31,9 @@ impl FsmFactoryContext {
 /// machine must own its per-group resources and release them safely when
 /// dropped.
 ///
-/// Until group lifecycle serialization exists, callers must serialize
-/// same-key `create_group` calls; concurrent same-key creation is unsupported.
+/// The owned [`crate::RuntimeHandle`] serializes Group construction. Legacy
+/// [`crate::MultiRaft`] callers must serialize same-key `create_group` calls;
+/// concurrent same-key creation through that low-level facade is unsupported.
 pub trait StateMachineFactory<S>: Send + Sync + 'static
 where
     S: StateMachine,
