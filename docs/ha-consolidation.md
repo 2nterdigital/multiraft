@@ -190,7 +190,12 @@ mode support and native replication/recovery algorithms remain unchanged.
 FSM destructor observations remain in the runtime registry until actual release.
 Shutdown awaits cloned resource-neutral observations and only prunes completed
 ones. Canceling a wait or retrying cleanup therefore cannot discard outstanding
-consumer lease evidence or report success before real destruction. The public
+consumer lease evidence or report success before real destruction. Owned rollback
+also keeps its full stop/join future in place through repeated existing 30-second
+poll windows. Neither the first graceful expiration nor a later window publishes
+completion or drops resource evidence. The original caller deadline remains bounded
+and unconfirmed; actual cleanup may continue while synchronous application work is
+still blocked, without claiming to preempt that work. The public
 consumer verifies this with an admitted local read, a blocked application Drop,
 a canceled first shutdown, a repeated wait and actual lease/listener reuse.
 

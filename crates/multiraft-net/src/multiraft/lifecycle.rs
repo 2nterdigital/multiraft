@@ -22,7 +22,7 @@ impl<S: StateMachine> MultiRaft<S> {
         }
     }
 
-    pub(super) async fn shutdown_owned_groups(&self) -> Result<(), MultiRaftError> {
+    pub(crate) async fn shutdown_owned_groups(&self) -> Result<(), MultiRaftError> {
         self.snapshot_rt
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
