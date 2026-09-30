@@ -124,7 +124,23 @@ impl<S: StateMachine> MultiRaft<S> {
                         hint: fwd.leader_id,
                     });
                 }
-                Err(MultiRaftError::Other(anyhow::anyhow!("client_write: {e}")))
+                let failure = match e.fatal() {
+                    Some(openraft::error::Fatal::Stopped) => {
+                        multiraft_core::ProposalFailure::Closed
+                    }
+                    Some(openraft::error::Fatal::StorageError(_)) => {
+                        multiraft_core::ProposalFailure::Backend(
+                            multiraft_core::NativeFailure::Storage,
+                        )
+                    }
+                    Some(openraft::error::Fatal::Panicked) => {
+                        multiraft_core::ProposalFailure::Backend(
+                            multiraft_core::NativeFailure::Panicked,
+                        )
+                    }
+                    None => multiraft_core::ProposalFailure::MembershipRejected,
+                };
+                Err(multiraft_core::ProposalError::new(failure, e.into()).into())
             }
         }
     }

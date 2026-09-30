@@ -5,6 +5,8 @@ use thiserror::Error;
 use crate::GroupId;
 use crate::NodeId;
 
+mod proposal;
+pub use proposal::{ProposalError, ProposalFailure};
 mod recovery;
 pub use recovery::{RecoveryError, RecoveryFailure, RecoveryStage};
 
@@ -64,6 +66,9 @@ pub enum MultiRaftError {
 
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
+
+    #[error(transparent)]
+    Proposal(#[from] ProposalError),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
