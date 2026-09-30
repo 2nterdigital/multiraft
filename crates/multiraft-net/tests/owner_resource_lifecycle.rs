@@ -8,26 +8,84 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::Layer;
 
+// Observe the real operational transition, never a scheduling/yield count.
+struct ShutdownStarted(Arc<Notify>);
+#[derive(Default)]
+struct ReleaseBoundary {
+    shutdown: bool,
+    stopping: bool,
+    local_node: bool,
+}
+impl Visit for ReleaseBoundary {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "operation" => self.shutdown = value == "node_shutdown",
+            "phase" => self.stopping = value == "start",
+            _ => {}
+        }
+    }
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "node_id" {
+            self.local_node = value == 11;
+        }
+    }
+    fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+}
+impl<S: Subscriber> Layer<S> for ShutdownStarted {
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        if event.metadata().target() != "multiraft::recovery" {
+            return;
+        }
+        let mut boundary = ReleaseBoundary::default();
+        event.record(&mut boundary);
+        if boundary.shutdown && boundary.stopping && boundary.local_node {
+            self.0.notify_one();
+        }
+    }
+}
+
+#[derive(Default)]
+struct GateState {
+    entered: bool,
+    released: bool,
+}
 #[derive(Clone, Default)]
 struct Gate {
     entered: Arc<Notify>,
-    open: Arc<(Mutex<bool>, Condvar)>,
+    open: Arc<(Mutex<GateState>, Condvar)>,
 }
 impl Gate {
     fn block(&self) {
-        self.entered.notify_one();
         let (lock, changed) = &*self.open;
-        let (open, timeout) = changed
-            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |open| !*open)
+        let mut state = lock.lock().unwrap();
+        state.entered = true;
+        changed.notify_all();
+        self.entered.notify_one();
+        let (state, timeout) = changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.released)
             .unwrap();
         assert!(
-            *open && !timeout.timed_out(),
+            state.released && !timeout.timed_out(),
             "test must release the actual destructor"
         );
     }
+    fn wait_for_entrance(&self) -> bool {
+        let (lock, changed) = &*self.open;
+        let (state, _) = changed
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |state| {
+                !state.entered
+            })
+            .unwrap();
+        state.entered
+    }
     fn release(&self) {
-        *self.open.0.lock().unwrap() = true;
+        self.open.0.lock().unwrap().released = true;
         self.open.1.notify_all();
     }
 }
@@ -161,16 +219,25 @@ async fn cancelled_shutdown_retry_waits_for_actual_fsm_destructor_and_lease_rele
 }
 
 // Native workers are created on a separate runtime through the public handle.
-// Cleanup belongs to the original runtime, whose clock can advance while a real
-// application destructor blocks an independent worker. No private state is read.
+// Cleanup belongs to the original runtime, whose clock advances while native
+// apply still owns the FSM. Actual Drop is released by an independent consumer
+// thread, whichever executor drops the final Arc. No private state is read.
 #[tokio::test]
 async fn owned_cleanup_retains_actual_destructor_beyond_both_native_shutdown_windows() {
+    let native_stopping = Arc::new(Notify::new());
+    // One bounded public source observer for this test binary, filtered by its
+    // distinct Node identity. Other native/runtime threads keep the same source
+    // boundary observable; no thread-local dispatcher lifetime is assumed.
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(ShutdownStarted(native_stopping.clone())),
+    )
+    .unwrap();
     let root = tempfile::tempdir().unwrap();
     let lease = root.path().join("late-consumer.lease");
     let gate = Gate::default();
     let addr = address();
-    let mut cluster = ClusterConfig::for_test(1, &[1]);
-    cluster.peers = vec![(1, addr)];
+    let mut cluster = ClusterConfig::for_test(11, &[11]);
+    cluster.peers = vec![(11, addr)];
     cluster.data_dir = root.path().to_owned();
     let factory_lease = lease.clone();
     let factory_gate = gate.clone();
@@ -215,7 +282,7 @@ async fn owned_cleanup_retains_actual_destructor_beyond_both_native_shutdown_win
                 .create_group(
                     GroupConfig {
                         group_id: 9,
-                        voters: vec![1],
+                        voters: vec![11],
                     },
                     tokio::time::Instant::now() + Duration::from_secs(5),
                 )
@@ -237,31 +304,27 @@ async fn owned_cleanup_retains_actual_destructor_beyond_both_native_shutdown_win
     tokio::time::timeout(Duration::from_secs(2), apply_gate.entered.notified())
         .await
         .unwrap();
-    let stopping =
+    let mut stopping =
         tokio::spawn(owner.shutdown(tokio::time::Instant::now() + Duration::from_secs(180)));
     tokio::task::yield_now().await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
     // Interrupted admission never retracts the dispatched native apply. Its
-    // independent worker keeps the real FSM while cleanup clears Group owners.
+    // independent worker keeps the real FSM throughout native stopping.
     tokio::time::resume();
     assert!(matches!(
         write.await.unwrap(),
         Err(RuntimeError::Interrupted { .. })
     ));
-    apply_gate.release();
-    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+    // The existing operational source event proves fallback native stop began.
+    // Keep native apply blocked throughout its second complete30s window.
+    tokio::time::timeout(Duration::from_secs(2), native_stopping.notified())
         .await
         .unwrap();
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    let falsely_completed = stopping.is_finished();
+    let early = tokio::time::timeout(Duration::from_secs(1), &mut stopping).await;
+    let falsely_completed = early.is_ok();
     let lease_held = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -273,13 +336,34 @@ async fn owned_cleanup_retains_actual_destructor_beyond_both_native_shutdown_win
             .await,
         Err(RuntimeError::Closed)
     );
-    // Always unblock the real application resource, including on RED assertion.
-    gate.release();
+    // The final FSM Arc may drop on the native worker OR the original cleanup
+    // driver. An independent consumer thread observes the actual destructor and
+    // keeps the unchanged5s gate bounded without relying on executor affinity.
+    let drop_gate = gate.clone();
+    let drop_lease = lease.clone();
+    let public_completion = stopping.abort_handle();
+    let destructor = std::thread::spawn(move || {
+        let entered = drop_gate.wait_for_entrance();
+        let held = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&drop_lease)
+            .is_err();
+        let pending = !public_completion.is_finished();
+        drop_gate.release();
+        (entered, held, pending)
+    });
     tokio::time::resume();
-    let result = tokio::time::timeout(Duration::from_secs(2), stopping)
-        .await
-        .unwrap()
-        .unwrap();
+    apply_gate.release();
+    let result = match early {
+        Ok(result) => result.unwrap(),
+        Err(_) => tokio::time::timeout(Duration::from_secs(2), stopping)
+            .await
+            .unwrap()
+            .unwrap(),
+    };
+    let (actual_drop_entered, lease_held_during_drop, pending_during_drop) =
+        destructor.join().unwrap();
     let _ = stop_worker.send(());
     worker.join().unwrap();
     assert!(
@@ -289,6 +373,18 @@ async fn owned_cleanup_retains_actual_destructor_beyond_both_native_shutdown_win
     assert!(
         lease_held,
         "actual consumer lease remains exclusive beyond both windows"
+    );
+    assert!(
+        actual_drop_entered,
+        "the actual application destructor must run"
+    );
+    assert!(
+        lease_held_during_drop,
+        "actual Drop must still hold the consumer lease"
+    );
+    assert!(
+        pending_during_drop,
+        "public shutdown cannot finish during actual Drop"
     );
     assert!(
         weak_closed,
