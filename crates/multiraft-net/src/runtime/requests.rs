@@ -1,4 +1,5 @@
 //! Bounded admission and existing opaque byte/ReadIndex operations.
+use super::recovery::StartupTiming;
 use super::*;
 use futures::FutureExt;
 use multiraft_core::ProposeApplied;
@@ -71,6 +72,34 @@ impl<S: StateMachine> RuntimeHandle<S> {
     ) -> Result<(), RuntimeError> {
         let admitted = self.admit(deadline).await?;
         let deadline = deadline.min(Instant::now() + CLEANUP_TIMEOUT);
+        self.create_group_registered(group, admitted, StartupTiming::Absolute(deadline))
+            .await
+    }
+
+    /// Construct a Group, then bound only its native recovery wait.
+    ///
+    /// This stage-compatible contract preserves consumers whose native constructor
+    /// and application validation were outside their recovery-wait timeout. The
+    /// same local basis, validator and owned rollback are used. It does not bound
+    /// total startup: synchronous application callbacks must themselves be bounded.
+    /// Cancellation drops only this waiter; construction and cleanup remain owned.
+    /// The existing absolute-deadline [`Self::create_group`] contract is unchanged.
+    pub async fn create_group_with_recovery_timeout(
+        &self,
+        group: GroupConfig,
+        recovery_timeout: Duration,
+    ) -> Result<(), RuntimeError> {
+        let admitted = self.admit(Instant::now() + CLEANUP_TIMEOUT).await?;
+        self.create_group_registered(group, admitted, StartupTiming::NativeWait(recovery_timeout))
+            .await
+    }
+
+    async fn create_group_registered(
+        &self,
+        group: GroupConfig,
+        admitted: Admitted<S>,
+        timing: StartupTiming,
+    ) -> Result<(), RuntimeError> {
         let shared = admitted.shared.clone();
         let (reply, receiver) = oneshot::channel();
         let task_shared = shared.clone();
@@ -78,7 +107,7 @@ impl<S: StateMachine> RuntimeHandle<S> {
             let shared = task_shared;
             let _admitted = admitted;
             let _serialized = shared.group_creation.lock().await;
-            let result = std::panic::AssertUnwindSafe(shared.recover_group(group, deadline))
+            let result = std::panic::AssertUnwindSafe(shared.recover_group(group, timing))
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| {
@@ -97,16 +126,24 @@ impl<S: StateMachine> RuntimeHandle<S> {
         if !registered {
             return Err(RuntimeError::Closed);
         }
-        let result = match tokio::time::timeout_at(deadline, receiver).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(RuntimeError::Source(MultiRaftError::Other(
-                anyhow::anyhow!("owned Group startup task stopped without a reply"),
-            ))),
-            Err(_) => Err(RuntimeError::Deadline {
-                phase: RuntimePhase::GroupStart,
-                outcome_unknown: true,
-            }),
+        let reply = match timing {
+            StartupTiming::Absolute(deadline) => tokio::time::timeout_at(deadline, receiver)
+                .await
+                .map_err(|_| RuntimeError::Deadline {
+                    phase: RuntimePhase::GroupStart,
+                    outcome_unknown: true,
+                }),
+            StartupTiming::NativeWait(_) => Ok(receiver.await),
         };
+        let result = reply
+            .and_then(|reply| {
+                reply.map_err(|_| {
+                    RuntimeError::Source(MultiRaftError::Other(anyhow::anyhow!(
+                        "owned Group startup task stopped without a reply"
+                    )))
+                })
+            })
+            .and_then(|result| result);
         if result.is_err() {
             shared.begin_cleanup();
             // This rollback budget is independent of the expired request budget.
