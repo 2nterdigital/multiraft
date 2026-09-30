@@ -5,6 +5,7 @@
 //! No operation exposes native Raft handles. Commands and effects stay opaque.
 
 mod control;
+mod local;
 mod maintenance;
 mod observation;
 mod owner;
@@ -65,6 +66,8 @@ pub enum RuntimePhase {
     GroupStart,
     Propose,
     Read,
+    LocalRead,
+    LocalStatus,
     Compaction,
     StorageStatus,
     Shutdown,

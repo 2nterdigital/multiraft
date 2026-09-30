@@ -93,6 +93,8 @@ mod application;
 mod control;
 mod group_start;
 mod lifecycle;
+mod local;
+pub use local::LocalGroupStatus;
 mod maintenance;
 mod membership;
 mod read;

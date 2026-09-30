@@ -56,6 +56,7 @@ pub use grpc::GrpcPeerChannelPool;
 pub use grpc::GrpcRouter;
 pub use grpc::GrpcServer;
 pub use multiraft::wait_for_leader;
+pub use multiraft::LocalGroupStatus;
 pub use multiraft::MultiRaft;
 pub use multiraft::SharedFabric;
 pub use multiraft::{

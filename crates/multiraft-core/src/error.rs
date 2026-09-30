@@ -49,6 +49,13 @@ pub enum MultiRaftError {
         source: NativeFailure,
     },
 
+    #[error("group {group_id} local observation identity mismatch: expected {expected}, observed {observed}")]
+    ObservationIdentityMismatch {
+        group_id: GroupId,
+        expected: NodeId,
+        observed: NodeId,
+    },
+
     #[error(transparent)]
     ReadIndex(#[from] ReadIndexFailure),
 
