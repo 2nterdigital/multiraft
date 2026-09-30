@@ -187,21 +187,47 @@ impl<S: StateMachine> RuntimeShared<S> {
                 let native_result = shared.node.shutdown().await.map_err(RuntimeError::Source);
                 startup_result.and(native_result)
             };
-            let result = match tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await {
+            let graceful = match tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await {
                 Ok(result) => result,
-                Err(_) => {
+                Err(_) => Err(RuntimeError::Deadline {
+                    phase: RuntimePhase::Shutdown,
+                    outcome_unknown: true,
+                }),
+            };
+            let result = match graceful {
+                Ok(()) => Ok(()),
+                Err(original) => {
                     shared.abort_requests.send_replace(true);
                     shared.node.abort_background();
-                    // Never abort a construction task without a native owner. Its
-                    // deadline cancels only native pre-worker awaits; registered FSM
-                    // release witnesses remain part of this retained rollback.
+                    // Never abort construction without its native owner. A native
+                    // or graceful timeout leaves actual release unconfirmed.
                     let _drained = shared.admission.write().await;
-                    let _ = shared.startups.join().await;
-                    let _ = shared.node.shutdown().await;
-                    Err(RuntimeError::Deadline {
-                        phase: RuntimePhase::Shutdown,
-                        outcome_unknown: true,
-                    })
+                    let startup_result = shared
+                        .startups
+                        .join()
+                        .await
+                        .map_err(|error| RuntimeError::Source(MultiRaftError::Other(error)));
+                    // Keep this full stop/join future IN PLACE across every native
+                    // budget window. A timer expiration abandons only that poll,
+                    // never retained tasks, blocking children or FSM witnesses.
+                    let stop = shared.node.shutdown_owned_groups();
+                    tokio::pin!(stop);
+                    let native_result = loop {
+                        if let Ok(result) =
+                            tokio::time::timeout(CLEANUP_TIMEOUT, stop.as_mut()).await
+                        {
+                            break result.map_err(RuntimeError::Source);
+                        }
+                    };
+                    let retained = startup_result.and(native_result);
+                    // A real graceful source failure remains the original cause.
+                    // For an expired graceful wait, a subsequently observed source
+                    // failure is more specific; otherwise retain its uncertainty.
+                    if matches!(original, RuntimeError::Deadline { .. }) {
+                        retained.and(Err(original))
+                    } else {
+                        Err(original)
+                    }
                 }
             };
             shared
