@@ -197,7 +197,9 @@ impl<S: StateMachine> MultiRaft<S> {
                         .into()
                     }
                 };
+                let (recovery_phase, recovery_failure) = recovery::diagnostic_fields(&classified);
                 tracing::error!(target: "multiraft::recovery", operation = "recovery_wait", phase = "error",
+                    recovery_phase, recovery_failure,
                     node_id = self.node_id, group_id = group, timeout_ms,
                     error = %classified, "Raft state-machine recovery failed");
                 return Err(classified);

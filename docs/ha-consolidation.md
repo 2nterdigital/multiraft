@@ -148,6 +148,17 @@ its local data while an authoritative read correctly fails without live peers.
 `RecoveryError` retains Group/stage and typed Deadline/Closed/native
 Storage/Panicked facts. Display/tracing contain only bounded facts; the original
 source chain is available separately through std::error::Error::source.
+The source target `multiraft::recovery` records `recovery_phase` (`construct`,
+`await`, or `unknown`) and `recovery_failure` (`deadline`, `closed`,
+`native_storage`, `native_panicked`, or `unknown`) on native group-start and
+recovery-wait errors. These finite labels are projected directly from the typed
+`RecoveryError`; downstream sinks may explicitly preserve them for this exact
+target. The native error chain is not formatted into logs. Missing required
+log/snapshot basis remains a native recovery refusal: callers can inspect the
+original `Error::source` chain separately, while the logged error stays a
+bounded summary. These diagnostics add no recovery decision or application
+watermark and never authorize retry or readiness.
+
 Native cancel signals end snapshot stream waiters with Closed, while already
 owned sends retain their slot/deadline. Receiver slots wait for the real native
 transition even when the native API waiter has observed fatal shutdown.

@@ -356,7 +356,9 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         .map_err(|error| {
             let classified = recovery::native_recovery_error(group, multiraft_core::RecoveryStage::Construct, error);
+            let (recovery_phase, recovery_failure) = recovery::diagnostic_fields(&classified);
             tracing::error!(target: "multiraft::recovery", operation = "group_start", phase = "error",
+                recovery_phase, recovery_failure,
                 node_id = self.node_id, group_id = group, transport, storage,
                 directory = %group_directory.display(), error = %classified,
                 "failed to recover or start local Raft group");

@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use multiraft_core::typ::{Entry, LogId};
-use multiraft_core::{ClusterConfig, FileLogSyncLevel, TypeConfig};
+use multiraft_core::{
+    ClusterConfig, FileLogSyncLevel, MultiRaftError, NativeFailure, RecoveryFailure, RecoveryStage,
+    TypeConfig,
+};
 use multiraft_fsm::CounterFsm;
 use multiraft_net::MultiRaft;
 use multiraft_store::FileLogStoreOf;
@@ -296,6 +300,37 @@ async fn file_group_open_failure_reports_node_group_path_and_error() {
     );
 }
 
+// Source-chain inspection belongs at the caller/test boundary, never in source logs.
+fn assert_missing_log_recovery_source(error: &MultiRaftError, expected_cause: &str) {
+    let MultiRaftError::Recovery(recovery) = error else {
+        panic!("native recovery must keep its typed public facts: {error:?}")
+    };
+    assert_eq!(recovery.group_id, 9);
+    assert_eq!(recovery.stage, RecoveryStage::Construct);
+    assert_eq!(
+        recovery.failure,
+        RecoveryFailure::Backend(NativeFailure::Storage)
+    );
+    let original = recovery
+        .source()
+        .expect("original native error remains available");
+    let native = original
+        .downcast_ref::<multiraft_core::typ::Fatal>()
+        .expect("source preserves the actual native Fatal");
+    assert!(
+        matches!(native, openraft::error::Fatal::StorageError(_)),
+        "missing logs are a native storage refusal: {native:?}"
+    );
+    let mut root = original;
+    while let Some(source) = root.source() {
+        root = source;
+    }
+    assert!(
+        root.to_string().contains(expected_cause),
+        "original missing-log root cause was lost: {root}"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn purged_log_without_persisted_fsm_reports_recovery_failure() {
     let _diagnostic_test_guard = DIAGNOSTIC_TEST_LOCK.lock().await;
@@ -319,10 +354,30 @@ async fn purged_log_without_persisted_fsm_reports_recovery_failure() {
 
     let expected_directory = group_path.display().to_string();
     let expected_cause = "Cannot re-apply logs: need logs from index 0, but purged up to";
-    assert_group_start_failure(&capture, &expected_directory, expected_cause);
+    assert_missing_log_recovery_source(&error, expected_cause);
+    let safe_summary = "group 9 recovery failed during Construct: native storage failed";
+    assert_eq!(error.to_string(), safe_summary);
+    assert!(!error.to_string().contains(expected_cause));
+    assert_group_start_failure(&capture, &expected_directory, safe_summary);
+    let failures = capture.matching("group_start");
+    let failure = failures
+        .iter()
+        .find(|event| event.get("phase").map(String::as_str) == Some("error"))
+        .expect("one terminal recovery failure");
+    assert_eq!(
+        failure.get("recovery_phase").map(String::as_str),
+        Some("construct")
+    );
+    assert_eq!(
+        failure.get("recovery_failure").map(String::as_str),
+        Some("native_storage")
+    );
+    assert_eq!(failure.get("error").map(String::as_str), Some(safe_summary));
     assert!(
-        error.to_string().contains(expected_cause),
-        "returned recovery error omitted storage root cause: {error:?}"
+        failure
+            .values()
+            .all(|value| !value.contains(expected_cause)),
+        "native source chain must not enter recovery logs: {failure:?}"
     );
 
     let open_events = capture.matching("file_log_open");
