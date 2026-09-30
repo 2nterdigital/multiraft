@@ -131,8 +131,10 @@ impl<S: StateMachine> MultiRaft<S> {
 }
 
 impl<S: StateMachine> MultiRaft<S> {
-    /// Wait until the state machine has recovered at least the persisted commit
-    /// point after a restart (no-op when the log was empty).
+    /// Native strong recovery wait: cluster commit must cover the local log tail,
+    /// then the FSM must apply that cluster commit. This can require live peers.
+    /// Owned Data/All startup uses a distinct constructor-proven durable local
+    /// basis; this legacy method keeps its stronger cluster-tail guarantee.
     pub async fn wait_for_recovery(
         &self,
         group: GroupId,
@@ -154,22 +156,35 @@ impl<S: StateMachine> MultiRaft<S> {
         let metrics = match raft.wait_for_recovery(Some(timeout)).await {
             Ok(metrics) => metrics,
             Err(error) => {
-                tracing::error!(
-                    target: "multiraft::recovery",
-                    operation = "recovery_wait",
-                    phase = "error",
-                    node_id = self.node_id,
-                    group_id = group,
-                    timeout_ms,
-                    error = %error,
-                    error_debug = ?error,
-                    "Raft state-machine recovery failed"
-                );
-                return Err(MultiRaftError::Other(anyhow::anyhow!(
-                    "wait_for_recovery node {}, group {}: {error}",
-                    self.node_id,
-                    group
-                )));
+                let native_failure = raft.metrics().borrow_watched().running_state.clone().err();
+                let classified = match native_failure {
+                    Some(native) => recovery::native_recovery_error(
+                        group,
+                        multiraft_core::RecoveryStage::Await,
+                        native,
+                    ),
+                    None => {
+                        let failure = match &error {
+                            openraft::metrics::WaitError::Timeout(..) => {
+                                multiraft_core::RecoveryFailure::Deadline
+                            }
+                            openraft::metrics::WaitError::ShuttingDown => {
+                                multiraft_core::RecoveryFailure::Closed
+                            }
+                        };
+                        multiraft_core::RecoveryError::new(
+                            group,
+                            multiraft_core::RecoveryStage::Await,
+                            failure,
+                            Some(error.into()),
+                        )
+                        .into()
+                    }
+                };
+                tracing::error!(target: "multiraft::recovery", operation = "recovery_wait", phase = "error",
+                    node_id = self.node_id, group_id = group, timeout_ms,
+                    error = %classified, "Raft state-machine recovery failed");
+                return Err(classified);
             }
         };
         let applied_index = metrics.last_applied.as_ref().map(|log_id| log_id.index());

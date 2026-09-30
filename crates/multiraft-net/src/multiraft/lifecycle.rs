@@ -89,6 +89,7 @@ impl<S: StateMachine> MultiRaft<S> {
             .await
             .map_err(|error| MultiRaftError::Other(error.into()))?;
         self.groups.lock().unwrap().clear();
+        self.construction_recovery.lock().unwrap().clear();
         drop(rafts);
         // Core shutdown does not join the SM worker. Successful stop promises that
         // its application destructor has completed before callers reopen resources.

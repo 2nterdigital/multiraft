@@ -13,7 +13,7 @@ async fn durable_mode_rejects_memory_weak_sync_and_invalid_limits() {
         match case {
             0 => config.data_dir = Default::default(),
             1 => config.file_log_sync_level = FileLogSyncLevel::Os,
-            2 => config.retain_log_entries = 65537,
+            2 => config.install_snapshot_timeout_ms = 0,
             3 => config.max_snapshot_bytes = 0,
             4 => config.max_snapshot_bytes = 67108865,
             _ => unreachable!(),

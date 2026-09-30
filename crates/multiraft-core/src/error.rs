@@ -5,6 +5,9 @@ use thiserror::Error;
 use crate::GroupId;
 use crate::NodeId;
 
+mod recovery;
+pub use recovery::{RecoveryError, RecoveryFailure, RecoveryStage};
+
 /// Terminal outcome for a local group observation stream.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -58,6 +61,9 @@ pub enum MultiRaftError {
 
     #[error(transparent)]
     ReadIndex(#[from] ReadIndexFailure),
+
+    #[error(transparent)]
+    Recovery(#[from] RecoveryError),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),

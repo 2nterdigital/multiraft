@@ -65,13 +65,17 @@ impl GroupRouter<TypeConfig, GroupId> for Router {
         group_id: GroupId,
         vote: typ::Vote,
         snapshot: SnapshotOf<TypeConfig, typ::SnapshotData>,
-        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
         let data: Vec<u8> = snapshot.snapshot.into_inner();
-        self.send_snapshot(target, group_id, vote, snapshot.meta, data)
-            .await
-            .map_err(StreamingError::Unreachable)
+        let sending = self.send_snapshot(target, group_id, vote, snapshot.meta, data);
+        tokio::pin!(sending, cancel);
+        tokio::select! {
+            biased;
+            reason = &mut cancel => Err(StreamingError::Closed(reason)),
+            result = &mut sending => result.map_err(StreamingError::Unreachable),
+        }
     }
 
     async fn transfer_leader(

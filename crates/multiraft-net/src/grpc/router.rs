@@ -278,19 +278,25 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
         group_id: GroupId,
         vote: typ::Vote,
         snapshot: SnapshotOf<TypeConfig, typ::SnapshotData>,
-        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
-        self.snapshot_sender
-            .send(
-                self.transport.clone(),
-                target,
-                group_id,
-                vote,
-                snapshot,
-                option,
-            )
-            .await
+        let sending = self.snapshot_sender.send(
+            self.transport.clone(),
+            target,
+            group_id,
+            vote,
+            snapshot,
+            option,
+        );
+        // Native stream cancellation closes only its waiter. The node-owned send
+        // retains the permit and its original deadline until actual work ends.
+        tokio::pin!(sending, cancel);
+        tokio::select! {
+            biased;
+            reason = &mut cancel => Err(StreamingError::Closed(reason)),
+            result = &mut sending => result,
+        }
     }
     async fn transfer_leader(
         &self,

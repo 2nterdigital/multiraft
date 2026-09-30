@@ -32,4 +32,4 @@ pub use type_config::Response;
 pub use type_config::SnapshotData;
 pub use type_config::TypeConfig;
 
-pub use error::{NativeFailure, ReadIndexFailure};
+pub use error::{NativeFailure, ReadIndexFailure, RecoveryError, RecoveryFailure, RecoveryStage};
