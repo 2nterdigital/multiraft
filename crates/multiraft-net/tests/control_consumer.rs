@@ -222,6 +222,13 @@ async fn normative_transfer_retains_evidence_and_source_logs_without_business_pa
             .unwrap()
     }
     let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        text.lines()
+            .any(|line| line.trim_start().starts_with("INFO")
+                && line.contains("leader_vote_changed")
+                && line.contains("cause_unknown")),
+        "actual changed native observation stays INFO with unknown causality"
+    );
     for field in [
         "invocation_id=",
         "group_id=7",

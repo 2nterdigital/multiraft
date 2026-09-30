@@ -44,7 +44,7 @@ impl<S: StateMachine> MultiRaft<S> {
             source: self.node_id,
             target: self.node_id,
         };
-        let mut guard = ControlGuard::new(context, echo, self.node_id);
+        let mut guard = ControlGuard::observation(context, echo, self.node_id);
         let result = async {
             let _permit = self.control_admit(group, context)?;
             self.sample_control(group, expected_voters, &mut guard, abort)
@@ -54,7 +54,7 @@ impl<S: StateMachine> MultiRaft<S> {
         match &result {
             Ok(sample) => {
                 guard.sample(sample);
-                guard.finish("sampled", "none");
+                guard.finish_observation("sampled", "none");
             }
             Err(error) => guard.finish("sample_unavailable", sample_reason(error)),
         }
@@ -219,7 +219,7 @@ impl<S: StateMachine> MultiRaft<S> {
         context: ControlContext,
         abort: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> GroupControlLayoutObservation {
-        let mut guard = ControlGuard::new(context, echo, self.node_id);
+        let mut guard = ControlGuard::observation(context, echo, self.node_id);
         guard.stage(ControlStage::Layout);
         let sample = async {
             let _permit = self.control_admit(echo.group_id, context)?;
@@ -234,13 +234,13 @@ impl<S: StateMachine> MultiRaft<S> {
                 guard.finish("layout_unavailable", sample_reason(reason))
             }
             GroupControlLayoutObservation::TargetObserved { .. } => {
-                guard.finish("target_observed", "causality_unknown")
+                guard.finish_observation("target_observed", "causality_unknown")
             }
             GroupControlLayoutObservation::SourceObserved { .. } => {
-                guard.finish("source_observed", "causality_unknown")
+                guard.finish_observation("source_observed", "causality_unknown")
             }
             GroupControlLayoutObservation::DifferentLeaderObserved { .. } => {
-                guard.finish("different_leader_observed", "causality_unknown")
+                guard.finish_observation("different_leader_observed", "causality_unknown")
             }
         }
         result

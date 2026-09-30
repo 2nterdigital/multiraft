@@ -1,7 +1,13 @@
 //! Finite source summaries and cancellation evidence. No arbitrary error/debug payloads.
 use super::*;
 
+#[derive(Clone, Copy)]
+enum EventMode {
+    Transfer,
+    Observation,
+}
 pub(crate) struct ControlGuard {
+    mode: EventMode,
     pub(crate) context: ControlContext,
     echo: GroupControlRequestEcho,
     local: NodeId,
@@ -16,8 +22,21 @@ impl ControlGuard {
         local: NodeId,
     ) -> Self {
         let guard = Self::admission(context, echo, local);
-        guard.log("started", "none");
+        guard.start_log();
         guard
+    }
+    pub(crate) fn observation(
+        context: ControlContext,
+        echo: GroupControlRequestEcho,
+        local: NodeId,
+    ) -> Self {
+        let mut guard = Self::admission(context, echo, local);
+        guard.mode = EventMode::Observation;
+        guard.start_log();
+        guard
+    }
+    fn start_log(&self) {
+        self.log("started", "none", self.mode);
     }
     /// The weak boundary logs refusals/cancellation; successful work uses the facade start.
     pub(crate) fn admission(
@@ -26,6 +45,7 @@ impl ControlGuard {
         local: NodeId,
     ) -> Self {
         Self {
+            mode: EventMode::Transfer,
             context,
             echo,
             local,
@@ -40,17 +60,27 @@ impl ControlGuard {
     pub(crate) fn stage(&mut self, stage: ControlStage) {
         self.stage = stage;
     }
-    fn log(&self, result: &'static str, reason_code: &'static str) {
-        tracing::info!(target: "multiraft::control", invocation_id = %self.context.invocation_id,
-            group_id = self.echo.group_id, local_node_id = self.local,
-            source_node_id = self.echo.source, target_node_id = self.echo.target,
-            stage = ?self.stage, result, reason_code,
-            duration_ms = self.started.elapsed().as_millis() as u64,
-            "control invocation source fact");
+    fn log(&self, result: &'static str, reason_code: &'static str, mode: EventMode) {
+        macro_rules! emit {($level:expr)=>{{
+            tracing::event!(target: "multiraft::control", $level, invocation_id = %self.context.invocation_id,
+                group_id = self.echo.group_id, local_node_id = self.local,
+                source_node_id = self.echo.source, target_node_id = self.echo.target,
+                stage = ?self.stage, result, reason_code,
+                duration_ms = self.started.elapsed().as_millis() as u64,
+                "control invocation source fact");
+        }}}
+        match mode {
+            EventMode::Transfer => emit!(tracing::Level::INFO),
+            EventMode::Observation => emit!(tracing::Level::DEBUG),
+        }
     }
     pub(crate) fn finish(&mut self, result: &'static str, reason: &'static str) {
         self.done = true;
-        self.log(result, reason);
+        self.log(result, reason, EventMode::Transfer);
+    }
+    pub(crate) fn finish_observation(&mut self, result: &'static str, reason: &'static str) {
+        self.done = true;
+        self.log(result, reason, EventMode::Observation);
     }
     pub(crate) fn sample(&self, sample: &GroupControlSample) {
         tracing::debug!(target: "multiraft::control", invocation_id = %self.context.invocation_id,
@@ -98,6 +128,7 @@ impl Drop for ControlGuard {
                     "not_submitted"
                 },
                 "cancelled",
+                EventMode::Transfer,
             );
         }
     }
