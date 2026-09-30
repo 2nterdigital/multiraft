@@ -50,6 +50,10 @@ impl OwnedTasks {
         state.tasks.spawn(future);
         true
     }
+    pub(crate) fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+    }
+
     pub(crate) fn abort(&self) {
         let mut state = self.state.lock().unwrap();
         state.closed = true;

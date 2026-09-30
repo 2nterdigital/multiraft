@@ -47,7 +47,10 @@ struct TestNodeRpcServer {
 
 impl TestNodeRpcServer {
     async fn start(marker: Vec<u8>) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        Self::start_at("127.0.0.1:0".parse().unwrap(), marker).await
+    }
+    async fn start_at(address: SocketAddr, marker: Vec<u8>) -> Self {
+        let listener = tokio::net::TcpListener::bind(address)
             .await
             .expect("bind Node RPC marker server");
         let addr = listener.local_addr().expect("Node RPC marker address");
@@ -193,5 +196,81 @@ async fn business_and_control_services_share_cached_peer_channel() {
 
     assert_eq!(pool.unique_peer_links(), 1);
     assert_eq!(server.accepted_connections(), 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_group_style_lookups_construct_one_peer_generation() {
+    let server = TestNodeRpcServer::start(vec![8]).await;
+    let pool = GrpcPeerChannelPool::new(vec![(1, server.addr())]);
+    let leases = futures::future::join_all((0..32).map(|_| pool.lease(1))).await;
+    for result in leases {
+        let lease = result.unwrap();
+        assert_eq!(lease.generation(), 1);
+        assert_eq!(call_marker(lease.channel()).await, vec![8]);
+    }
+    assert_eq!(server.accepted_connections(), 1);
+    pool.shutdown().await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn peer_restart_and_late_failure_preserve_the_new_successful_generation() {
+    let old_server = TestNodeRpcServer::start(vec![8]).await;
+    let address = old_server.addr();
+    let pool = GrpcPeerChannelPool::new(vec![(1, address)]);
+    let old = pool.lease(1).await.unwrap();
+    assert_eq!(call_marker(old.channel()).await, vec![8]);
+    old_server.shutdown().await;
+    let error = NodeRpcServiceClient::new(old.channel())
+        .call(NodeRpcRequest {
+            service_id: 1,
+            method_id: 1,
+            payload: vec![],
+        })
+        .await
+        .expect_err("old peer is stopped");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert!(pool.invalidate(&old));
+    let new_server = TestNodeRpcServer::start_at(address, vec![9]).await;
+    let fresh = pool.lease(1).await.unwrap();
+    assert!(fresh.generation() > old.generation());
+    assert_eq!(call_marker(fresh.channel()).await, vec![9]);
+    // The old request's delayed error cannot clear the now-successful generation.
+    assert!(!pool.invalidate(&old));
+    assert_eq!(
+        pool.lease(1).await.unwrap().generation(),
+        fresh.generation()
+    );
+    assert_eq!(
+        call_marker(pool.lease(1).await.unwrap().channel()).await,
+        vec![9]
+    );
+    assert_eq!(new_server.accepted_connections(), 1);
+    let unrelated = GrpcPeerChannelPool::new(vec![(1, address)]);
+    let foreign = unrelated.lease(1).await.unwrap();
+    assert!(!pool.invalidate(&foreign));
+    assert_eq!(
+        pool.lease(1).await.unwrap().generation(),
+        fresh.generation()
+    );
+    pool.shutdown().await;
+    unrelated.shutdown().await;
+    drop((old, fresh, foreign));
+    new_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn closed_pool_fences_lease_publication_and_retains_typed_identity() {
+    let server = TestNodeRpcServer::start(vec![8]).await;
+    let pool = GrpcPeerChannelPool::new(vec![(1, server.addr())]);
+    let lease = pool.lease(1).await.unwrap();
+    assert_eq!(call_marker(lease.channel()).await, vec![8]);
+    pool.shutdown().await;
+    assert!(matches!(
+        pool.lease(1).await,
+        Err(GrpcPeerChannelError::Closed { peer: 1 })
+    ));
+    drop(lease);
     server.shutdown().await;
 }

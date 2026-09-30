@@ -1,66 +1,199 @@
-//! Outbound gRPC [`GroupRouter`](openraft_multi::GroupRouter) with per-peer channel cache.
-
-use std::fmt;
-use std::future::Future;
-use std::net::SocketAddr;
-
+//! Native RPC adapter over shared generation-aware channels; Raft owns retries.
+use crate::encode;
+use crate::grpc::proto::{raft_service_client::RaftServiceClient, RaftRequest};
+use crate::grpc::{GrpcPeerChannelError, GrpcPeerChannelPool};
+use crate::standby_throttle::StandbyThrottle;
+use multiraft_core::{typ, ClusterConfig, GroupId, NodeId, TypeConfig};
 use openraft::alias::SnapshotOf;
-use openraft::error::RPCError;
-use openraft::error::ReplicationClosed;
-use openraft::error::StreamingError;
-use openraft::error::Unreachable;
-use openraft::network::Backoff;
-use openraft::network::RPCOption;
-use openraft::raft::AppendEntriesRequest;
-use openraft::raft::AppendEntriesResponse;
-use openraft::raft::SnapshotResponse;
-use openraft::raft::TransferLeaderRequest;
-use openraft::raft::TransferLeaderResponse;
-use openraft::raft::VoteRequest;
-use openraft::raft::VoteResponse;
+use openraft::error::{RPCError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::network::{Backoff, RPCOption};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderRequest,
+    TransferLeaderResponse, VoteRequest, VoteResponse,
+};
 use openraft::OptionalSend;
 use openraft_multi::GroupRouter;
+use std::{fmt, future::Future, net::SocketAddr, sync::Arc};
 
-use crate::encode;
-use crate::grpc::proto::raft_service_client::RaftServiceClient;
-use crate::grpc::proto::RaftRequest;
-use crate::grpc::GrpcPeerChannelPool;
-use crate::standby_throttle::StandbyThrottle;
-use multiraft_core::typ;
-use multiraft_core::typ::RaftError;
-use multiraft_core::ClusterConfig;
-use multiraft_core::GroupId;
-use multiraft_core::NodeId;
-use multiraft_core::TypeConfig;
+mod snapshot_send;
+use snapshot_send::SnapshotSender;
 
 #[derive(Debug)]
-struct GrpcError(String);
-
-impl fmt::Display for GrpcError {
+enum SendCause {
+    Channel(GrpcPeerChannelError),
+    Rpc(Box<tonic::Status>),
+    Native(typ::RaftError),
+    InvalidResponse(bincode::Error),
+    Closed,
+    Deadline { dispatched: bool },
+}
+#[derive(Debug)]
+struct SendFailure {
+    peer: NodeId,
+    group: GroupId,
+    method: &'static str,
+    cause: SendCause,
+}
+impl fmt::Display for SendFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        write!(
+            f,
+            "native RPC peer {} Group {} {} failed ({})",
+            self.peer,
+            self.group,
+            self.method,
+            self.category()
+        )
+    }
+}
+impl std::error::Error for SendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.cause {
+            SendCause::Channel(error) => Some(error),
+            SendCause::Rpc(error) => Some(error.as_ref()),
+            SendCause::Native(error) => Some(error),
+            SendCause::InvalidResponse(error) => Some(error.as_ref()),
+            SendCause::Closed | SendCause::Deadline { .. } => None,
+        }
+    }
+}
+impl SendFailure {
+    fn category(&self) -> &'static str {
+        match self.cause {
+            SendCause::Channel(_) => "connect",
+            SendCause::Rpc(_) => "rpc",
+            SendCause::Native(_) => "native",
+            SendCause::InvalidResponse(_) => "invalid_response",
+            SendCause::Closed => "closed",
+            SendCause::Deadline { dispatched: false } => "deadline_before_dispatch",
+            SendCause::Deadline { dispatched: true } => "deadline_unconfirmed",
+        }
     }
 }
 
-impl std::error::Error for GrpcError {}
-
-/// Shared outbound gRPC router: one tonic [`Channel`] per peer node.
+/// Context captured by sends. It deliberately owns no snapshot task registry,
+/// avoiding a registry -> task -> router -> registry cycle.
 #[derive(Clone)]
-pub struct GrpcRouter {
-    self_id: NodeId,
+struct RpcTransport {
     channels: GrpcPeerChannelPool,
     throttle: StandbyThrottle,
     snapshot_cap: usize,
-    snapshot_slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+impl RpcTransport {
+    async fn send<Req, Resp>(
+        &self,
+        peer: NodeId,
+        group: GroupId,
+        method: &'static str,
+        req: Req,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Resp, Unreachable<TypeConfig>>
+    where
+        Req: serde::Serialize,
+        Result<Resp, typ::RaftError>: serde::de::DeserializeOwned,
+    {
+        let failure = |cause| {
+            Unreachable::new(&SendFailure {
+                peer,
+                group,
+                method,
+                cause,
+            })
+        };
+        let mut stopping = self.channels.stopping();
+        if *stopping.borrow_and_update() {
+            return Err(failure(SendCause::Closed));
+        }
+        let send = async {
+            let _standby_permit = with_deadline(deadline, false, async {
+                Ok(self.throttle.before_send(peer).await)
+            })
+            .await
+            .map_err(failure)?;
+            let lease = with_deadline(deadline, false, async {
+                self.channels.lease(peer).await.map_err(SendCause::Channel)
+            })
+            .await
+            .map_err(failure)?;
+            if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                return Err(failure(SendCause::Deadline { dispatched: false }));
+            }
+            let mut client = RaftServiceClient::new(lease.channel());
+            if method == "/raft/snapshot" {
+                client = client
+                    .max_encoding_message_size(self.snapshot_cap + 1024 * 1024)
+                    .max_decoding_message_size(self.snapshot_cap + 1024 * 1024);
+            }
+            let result = with_deadline(deadline, true, async {
+                let payload = encode(&req);
+                if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                    return Err(SendCause::Deadline { dispatched: false });
+                }
+                let response = client
+                    .call(RaftRequest {
+                        group_id: group,
+                        path: method.to_owned(),
+                        payload,
+                    })
+                    .await
+                    .map_err(|error| SendCause::Rpc(Box::new(error)))?;
+                let result = bincode::deserialize::<Result<Resp, typ::RaftError>>(
+                    &response.into_inner().payload,
+                )
+                .map_err(SendCause::InvalidResponse)?;
+                result.map_err(SendCause::Native)
+            })
+            .await;
+            result.map_err(|cause| {
+                // Native Stopped responses can come from still-open accepted old
+                // connections. The next native attempt must get a fresh generation.
+                let generation = lease.generation();
+                let discarded = self.channels.invalidate(&lease);
+                let source = SendFailure {
+                    peer,
+                    group,
+                    method,
+                    cause,
+                };
+                tracing::debug!(target: "multiraft::transport", peer, group, method,
+                    generation, discarded, cause = source.category(), "native peer request failed");
+                Unreachable::new(&source)
+            })
+        };
+        tokio::select! {
+            biased;
+            _ = stopping.changed() => Err(failure(SendCause::Closed)),
+            result = send => result,
+        }
+    }
 }
 
+/// Every stage shares the one caller/native deadline; no phase obtains a new TTL.
+async fn with_deadline<T>(
+    deadline: Option<tokio::time::Instant>,
+    dispatched: bool,
+    future: impl Future<Output = Result<T, SendCause>>,
+) -> Result<T, SendCause> {
+    match deadline {
+        Some(at) => tokio::time::timeout_at(at, future)
+            .await
+            .map_err(|_| SendCause::Deadline { dispatched })?,
+        None => future.await,
+    }
+}
+
+/// Shared node transport: all Groups reuse one channel generation per peer and
+/// one owned, bounded outbound snapshot slot. Native backoff remains 500 ms.
+#[derive(Clone)]
+pub struct GrpcRouter {
+    self_id: NodeId,
+    transport: RpcTransport,
+    snapshot_sender: Arc<SnapshotSender>,
+}
 impl GrpcRouter {
-    /// Build a router for `self_id` using `peers` (including self; self is skipped outbound).
     pub fn new(peers: Vec<(NodeId, SocketAddr)>, self_id: NodeId) -> Self {
         Self::with_throttle(peers, self_id, StandbyThrottle::default())
     }
-
-    /// Build with a preconfigured standby throttle (from [`ClusterConfig`]).
     pub fn with_throttle(
         peers: Vec<(NodeId, SocketAddr)>,
         self_id: NodeId,
@@ -68,96 +201,53 @@ impl GrpcRouter {
     ) -> Self {
         Self {
             self_id,
-            channels: GrpcPeerChannelPool::new(peers),
-            throttle,
-            snapshot_cap: 64 * 1024 * 1024,
-            snapshot_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            transport: RpcTransport {
+                channels: GrpcPeerChannelPool::new(peers),
+                throttle,
+                snapshot_cap: 64 * 1024 * 1024,
+            },
+            snapshot_sender: Arc::new(SnapshotSender::default()),
         }
     }
-
-    /// Build from cluster config (seeds standby throttle).
     pub fn from_config(config: &ClusterConfig) -> Self {
-        let throttle = StandbyThrottle::from_config(config);
-        let mut router = Self::with_throttle(config.peers.clone(), config.node_id, throttle);
-        router.snapshot_cap = config.max_snapshot_bytes;
+        let mut router = Self::with_throttle(
+            config.peers.clone(),
+            config.node_id,
+            StandbyThrottle::from_config(config),
+        );
+        router.transport.snapshot_cap = config.max_snapshot_bytes;
         router
     }
-
     pub fn self_id(&self) -> NodeId {
         self.self_id
     }
-
-    /// Standby replication throttle for outbound RPCs.
     pub fn throttle(&self) -> &StandbyThrottle {
-        &self.throttle
+        &self.transport.throttle
     }
-
-    /// Distinct peer channels created (O(nodes), not O(groups)).
     pub fn unique_peer_links(&self) -> usize {
-        self.channels.unique_peer_links()
+        self.transport.channels.unique_peer_links()
     }
 
-    async fn send<Req, Resp>(
-        &self,
-        to_node: NodeId,
-        to_group: GroupId,
-        path: &str,
-        req: Req,
-    ) -> Result<Resp, Unreachable<TypeConfig>>
-    where
-        Req: serde::Serialize,
-        Result<Resp, RaftError>: serde::de::DeserializeOwned,
-    {
-        let _standby_permit = self.throttle.before_send(to_node).await;
-
-        let channel = self
-            .channels
-            .channel(to_node)
-            .await
-            .map_err(|error| Unreachable::new(&GrpcError(error.to_string())))?;
-        let mut client = RaftServiceClient::new(channel);
-        if path == "/raft/snapshot" {
-            client = client
-                .max_encoding_message_size(self.snapshot_cap + 1024 * 1024)
-                .max_decoding_message_size(self.snapshot_cap + 1024 * 1024);
-        }
-
-        let encoded_req = encode(&req);
-        tracing::debug!(
-            to_node,
-            to_group,
-            path,
-            req_bytes = encoded_req.len(),
-            "grpc send"
-        );
-
-        let response = client
-            .call(RaftRequest {
-                group_id: to_group,
-                path: path.to_string(),
-                payload: encoded_req,
-            })
-            .await
-            .map_err(|e| Unreachable::new(&GrpcError(format!("rpc to {to_node}: {e}"))))?;
-
-        let resp_bytes = response.into_inner().payload;
-        tracing::debug!(
-            to_node,
-            to_group,
-            path,
-            resp_bytes = resp_bytes.len(),
-            "grpc resp"
-        );
-
-        let res = bincode::deserialize::<Result<Resp, RaftError>>(&resp_bytes)
-            .map_err(|_| Unreachable::new(&GrpcError("invalid native RPC response".into())))?;
-        res.map_err(|e| Unreachable::new(&GrpcError(e.to_string())))
+    /// Fence transport intake and pending connects. An already-dispatched send
+    /// interrupted by closing remains unconfirmed; closing does not retract it.
+    pub fn close(&self) {
+        self.snapshot_sender.close();
+        self.transport.channels.close();
+    }
+    pub fn abort(&self) {
+        self.close();
+        self.snapshot_sender.abort();
+    }
+    /// Join owned sends after fencing. Group owners stop native work separately.
+    pub async fn join(&self) -> anyhow::Result<()> {
+        self.close();
+        let result = self.snapshot_sender.join().await;
+        self.transport.channels.shutdown().await;
+        result
     }
 }
-
 impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
     type SnapshotData = typ::SnapshotData;
-
     async fn append_entries(
         &self,
         target: NodeId,
@@ -165,11 +255,11 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
-        self.send(target, group_id, "/raft/append", rpc)
+        self.transport
+            .send(target, group_id, "/raft/append", rpc, None)
             .await
             .map_err(RPCError::Unreachable)
     }
-
     async fn vote(
         &self,
         target: NodeId,
@@ -177,11 +267,11 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
         rpc: VoteRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
-        self.send(target, group_id, "/raft/vote", rpc)
+        self.transport
+            .send(target, group_id, "/raft/vote", rpc, None)
             .await
             .map_err(RPCError::Unreachable)
     }
-
     async fn full_snapshot(
         &self,
         target: NodeId,
@@ -191,80 +281,36 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
-        let permit = self
-            .snapshot_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                StreamingError::Unreachable(Unreachable::new(&GrpcError(
-                    "native snapshot send busy".into(),
-                )))
-            })?;
-        if self.snapshot_cap == 0
-            || self.snapshot_cap > 64 * 1024 * 1024
-            || snapshot.snapshot.get_ref().len() > self.snapshot_cap
-        {
-            return Err(StreamingError::Unreachable(Unreachable::new(&GrpcError(
-                "native snapshot size limit".into(),
-            ))));
-        }
-        let data: Vec<u8> = snapshot.snapshot.into_inner();
-        let wire_size = bincode::serialized_size(&(vote, &snapshot.meta, &data)).map_err(|_| {
-            StreamingError::Unreachable(Unreachable::new(&GrpcError(
-                "invalid snapshot metadata".into(),
-            )))
-        })?;
-        if wire_size > (self.snapshot_cap + 1024 * 1024) as u64
-            || wire_size.saturating_sub(data.len() as u64 + 8) > 1024 * 1024 - 1024
-        {
-            return Err(StreamingError::Unreachable(Unreachable::new(&GrpcError(
-                "native snapshot wire limit".into(),
-            ))));
-        }
-        let router = self.clone();
-        let ttl = option.hard_ttl();
-        tokio::spawn(async move {
-            let _permit = permit;
-            tokio::time::timeout(
-                ttl,
-                router.send(
-                    target,
-                    group_id,
-                    "/raft/snapshot",
-                    (vote, snapshot.meta, data),
-                ),
+        self.snapshot_sender
+            .send(
+                self.transport.clone(),
+                target,
+                group_id,
+                vote,
+                snapshot,
+                option,
             )
             .await
-            .map_err(|_| {
-                Unreachable::new(&GrpcError(
-                    "native snapshot RPC timeout; outcome unconfirmed".into(),
-                ))
-            })?
-        })
-        .await
-        .map_err(|_| {
-            StreamingError::Unreachable(Unreachable::new(&GrpcError(
-                "native snapshot send task stopped".into(),
-            )))
-        })?
-        .map_err(StreamingError::Unreachable)
     }
-
     async fn transfer_leader(
         &self,
         target: NodeId,
         group_id: GroupId,
-        req: TransferLeaderRequest<TypeConfig>,
+        rpc: TransferLeaderRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<TransferLeaderResponse<TypeConfig>, RPCError<TypeConfig>> {
-        self.send(target, group_id, "/raft/transfer_leader", req)
+        self.transport
+            .send(target, group_id, "/raft/transfer_leader", rpc, None)
             .await
             .map_err(RPCError::Unreachable)
     }
-
     fn backoff(&self) -> Option<Backoff> {
         Some(Backoff::new(std::iter::repeat(
             std::time::Duration::from_millis(500),
         )))
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/native_transport_owner/mod.rs"]
+mod ownership_tests;

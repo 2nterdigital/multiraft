@@ -9,6 +9,9 @@ impl<S: StateMachine> MultiRaft<S> {
             let _ = stop.send(());
         }
         self.reads.stop();
+        if let NetBackend::Grpc { router } = &self.net {
+            router.abort();
+        }
         self.tasks.abort();
         self.ingress_tasks.abort();
         if let NetBackend::InProcess { router, .. } = &self.net {
@@ -27,6 +30,9 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         if let NetBackend::InProcess { router, .. } = &self.net {
             let _ = router.unregister_node(self.node_id);
+        }
+        if let NetBackend::Grpc { router } = &self.net {
+            router.close();
         }
         self.reads.stop();
         self.reads.join().await;
@@ -48,6 +54,11 @@ impl<S: StateMachine> MultiRaft<S> {
                 first_error.get_or_insert_with(|| {
                     MultiRaftError::Other(anyhow::anyhow!("shutdown group {group_id}: {error}"))
                 });
+            }
+        }
+        if let NetBackend::Grpc { router } = &self.net {
+            if let Err(error) = router.join().await {
+                first_error.get_or_insert(MultiRaftError::Other(error));
             }
         }
         // Stop/join listener, watchers and in-process ingress INCLUDING their children.
