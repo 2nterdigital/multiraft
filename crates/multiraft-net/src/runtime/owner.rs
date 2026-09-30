@@ -101,10 +101,27 @@ impl<S: StateMachine> NodeOwner<S> {
     }
 
     /// Fence new requests, drain admitted calls and join native/listener/FSM owners.
+    /// Success includes the actual application FSM destructor completing, so
+    /// consumers can reuse their leases/data directories and the listener port.
     /// Cancellation abandons only this wait: the one cleanup task continues.
     pub async fn shutdown(self, deadline: Instant) -> Result<(), RuntimeError> {
         self.shared.begin_cleanup();
-        let mut completion = self.shared.completed.subscribe();
+        self.shared.wait_cleanup(deadline).await
+    }
+}
+
+impl<S: StateMachine> Drop for NodeOwner<S> {
+    fn drop(&mut self) {
+        if self.shared.completed.borrow().is_none() {
+            self.shared.abort_requests.send_replace(true);
+        }
+        self.shared.begin_cleanup();
+    }
+}
+
+impl<S: StateMachine> RuntimeShared<S> {
+    pub(super) async fn wait_cleanup(&self, deadline: Instant) -> Result<(), RuntimeError> {
+        let mut completion = self.completed.subscribe();
         let wait = async {
             loop {
                 if let Some(result) = completion.borrow_and_update().clone() {
@@ -123,26 +140,15 @@ impl<S: StateMachine> NodeOwner<S> {
                     phase: RuntimePhase::Shutdown,
                     outcome_unknown: true,
                 })?;
-        let task = self.shared.cleanup_task.lock().unwrap().take();
+        let task = self.cleanup_task.lock().unwrap().take();
         if let Some(task) = task {
             task.await
                 .map_err(|error| RuntimeError::Source(MultiRaftError::Other(error.into())))?;
         }
         result
     }
-}
 
-impl<S: StateMachine> Drop for NodeOwner<S> {
-    fn drop(&mut self) {
-        if self.shared.completed.borrow().is_none() {
-            self.shared.abort_requests.send_replace(true);
-        }
-        self.shared.begin_cleanup();
-    }
-}
-
-impl<S: StateMachine> RuntimeShared<S> {
-    fn begin_cleanup(self: &Arc<Self>) {
+    pub(super) fn begin_cleanup(self: &Arc<Self>) {
         self.accepting.store(false, Ordering::Release);
         self.slots.close();
         if self.cleanup_started.swap(true, Ordering::AcqRel) {

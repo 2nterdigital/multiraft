@@ -1,5 +1,6 @@
 //! Bounded admission and existing opaque byte/ReadIndex operations.
 use super::*;
+use futures::FutureExt;
 use multiraft_core::ProposeApplied;
 use tokio::sync::{oneshot, OwnedRwLockReadGuard, OwnedSemaphorePermit};
 
@@ -59,7 +60,10 @@ impl<S: StateMachine> RuntimeHandle<S> {
     /// Construct/recover a Group using the retained factory. A canceled caller
     /// never interrupts native construction: the owner drains it before stopping.
     /// Construction shares the absolute caller deadline and a maximum 30-second
-    /// runtime budget. Application callbacks must be bounded.
+    /// runtime budget. Application callbacks must be bounded. Startup failure,
+    /// including recovery validation rejection, fences the whole owned node.
+    /// Successful rollback waits for actual FSM destruction before returning the
+    /// startup error; cancellation of this wait retains cleanup.
     pub async fn create_group(
         &self,
         group: GroupConfig,
@@ -74,58 +78,44 @@ impl<S: StateMachine> RuntimeHandle<S> {
             let shared = task_shared;
             let _admitted = admitted;
             let _serialized = shared.group_creation.lock().await;
-            let result = async {
-                if *shared.abort_requests.borrow() {
-                    return Err(RuntimeError::Closed);
-                }
-                if Instant::now() >= deadline {
-                    return Err(RuntimeError::Deadline {
-                        phase: RuntimePhase::GroupStart,
-                        outcome_unknown: false,
-                    });
-                }
-                // The native constructor's only suspension points precede worker/core
-                // spawn; cancellation drops its RAII tick. The facade registered an
-                // FSM release witness before entering it, even without a Group handle.
-                tokio::time::timeout_at(
-                    deadline,
-                    shared.node.create_group(group.group_id, &group.voters),
-                )
+            let result = std::panic::AssertUnwindSafe(shared.recover_group(group, deadline))
+                .catch_unwind()
                 .await
-                .map_err(|_| RuntimeError::Deadline {
-                    phase: RuntimePhase::GroupStart,
-                    outcome_unknown: true,
-                })??;
-                let remaining = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(CLEANUP_TIMEOUT);
-                shared
-                    .node
-                    .wait_for_recovery(group.group_id, remaining)
-                    .await?;
-                if !shared.accepting.load(Ordering::Acquire) {
-                    return Err(RuntimeError::Closed);
-                }
-                shared.ready.lock().unwrap().insert(group.group_id);
-                Ok(())
+                .unwrap_or_else(|_| {
+                    Err(RuntimeError::Source(MultiRaftError::Other(
+                        anyhow::anyhow!("owned Group startup callback panicked"),
+                    )))
+                });
+            if result.is_err() {
+                // No partially recovered Group survives a failed public startup.
+                // Cleanup runs outside this admission guard/startup task, then the
+                // caller observes actual resource release before retrying.
+                shared.begin_cleanup();
             }
-            .await;
             let _ = reply.send(result);
         });
         if !registered {
             return Err(RuntimeError::Closed);
         }
-        tokio::time::timeout_at(deadline, receiver)
-            .await
-            .map_err(|_| RuntimeError::Deadline {
+        let result = match tokio::time::timeout_at(deadline, receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(RuntimeError::Source(MultiRaftError::Other(
+                anyhow::anyhow!("owned Group startup task stopped without a reply"),
+            ))),
+            Err(_) => Err(RuntimeError::Deadline {
                 phase: RuntimePhase::GroupStart,
                 outcome_unknown: true,
-            })?
-            .map_err(|_| {
-                RuntimeError::Source(MultiRaftError::Other(anyhow::anyhow!(
-                    "owned Group startup task stopped without a reply"
-                )))
-            })?
+            }),
+        };
+        if result.is_err() {
+            shared.begin_cleanup();
+            // This rollback budget is independent of the expired request budget.
+            // A canceled waiter abandons only the wait; cleanup remains owned.
+            shared
+                .wait_cleanup(Instant::now() + CLEANUP_TIMEOUT)
+                .await?;
+        }
+        result
     }
 
     /// Propose unchanged bytes. Effects correspond to the exact committed and applied entry.

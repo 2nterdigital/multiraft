@@ -94,6 +94,7 @@ mod group_start;
 mod lifecycle;
 mod maintenance;
 mod membership;
+mod recovery;
 pub(crate) mod tasks;
 mod transport_start;
 pub use maintenance::{
