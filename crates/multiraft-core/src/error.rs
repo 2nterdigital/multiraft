@@ -94,10 +94,6 @@ pub enum ReadIndexFailure {
     },
     #[error(transparent)]
     Backend(NativeFailure),
-    #[error("ReadIndex confirmation round timed out")]
-    RoundTimeout,
-    #[error("ReadIndex confirmation round abandoned")]
-    Abandoned,
     #[error("read owner is closed")]
     Closed,
     #[error("local FSM is unavailable")]

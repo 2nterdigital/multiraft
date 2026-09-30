@@ -116,7 +116,6 @@ pub(crate) fn sample_reason(error: &GroupControlSampleError) -> &'static str {
             ReadIndexFailure::Backend(NativeFailure::Storage) => "native_storage",
             ReadIndexFailure::Backend(NativeFailure::Panicked) => "native_panicked",
             ReadIndexFailure::Closed => "closed",
-            ReadIndexFailure::RoundTimeout => "read_index_timeout",
             ReadIndexFailure::Deadline => "deadline",
             _ => "read_index_failed",
         },

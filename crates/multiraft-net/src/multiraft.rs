@@ -199,7 +199,6 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     net: NetBackend,
     groups: GroupMap<S>,
     tasks: tasks::OwnedTasks,
-    reads: read::ReadRuntime,
     control_slot: tokio::sync::Semaphore,
     leader_watch_groups: Mutex<BTreeSet<GroupId>>,
     fsm_releases: Mutex<Vec<multiraft_store::StateMachineRelease>>,

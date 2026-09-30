@@ -12,7 +12,6 @@ impl<S: StateMachine> MultiRaft<S> {
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
             let _ = stop.send(());
         }
-        self.reads.stop();
         if let NetBackend::Grpc { router } = &self.net {
             router.abort();
         }
@@ -39,8 +38,6 @@ impl<S: StateMachine> MultiRaft<S> {
         if let NetBackend::Grpc { router } = &self.net {
             router.close();
         }
-        self.reads.stop();
-        self.reads.join().await;
         let rafts: Vec<(GroupId, Raft<S>, StateMachineStore<S>)> = self
             .groups
             .lock()
