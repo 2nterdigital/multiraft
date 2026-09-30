@@ -71,7 +71,7 @@ async fn local_status_and_fallible_query_preserve_bytes_error_and_weak_lifetime(
     config.peers = vec![(1, address)];
     let owner = start(config, vec![1]).await;
     let handle = owner.handle();
-    leader(&[handle.clone()]).await;
+    leader(std::slice::from_ref(&handle)).await;
     let receipt = handle
         .propose(7, b"local value".to_vec(), deadline())
         .await
