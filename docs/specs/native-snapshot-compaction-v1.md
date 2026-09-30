@@ -25,7 +25,7 @@ sample of native metrics, the existing snapshot catalog and file-log owner,
 not a second authoritative registry or a health/recoverability promise.
 
 NativeDurable requires Data-or-stronger file logs, manual policy, retain count
-0..65536 (default 1024), and application bytes 1..67108864 (default ceiling).
+the full native u64 range (default 1024), and application bytes 1..67108864 (default ceiling).
 Application limits may be smaller. Native metadata/framing allowance is at
 most 1048576 bytes. Disabled never uses the legacy 5000-log snapshot policy.
 Standby HTTP/catalog/daisy recovery remains contained.
@@ -66,3 +66,9 @@ identity and checksums remain under the run root. All failures are retained.
 The ENOSPC case injects one failed staged-data write into its own child process;
 it never fills the shared laboratory disk. G1-only Rust tests are ignored by
 default and require explicit exact-case invocation on the dedicated host.
+
+
+2026-09-30 #164/#170 amendment: the user explicitly chose to preserve Ech0's
+arbitrary u64 retained-log inputs. The former 65,536 guard is expanded; native
+checked/saturating subtraction and the one canonical completion predicate remain.
+Application bytes (64 MiB maximum), metadata and concurrency bounds are unchanged.

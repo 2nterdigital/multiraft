@@ -143,10 +143,10 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
         response_tx,
     } = msg;
 
-    let (raft, snapshot_cap) = {
+    let (raft, state_machine) = {
         let g = groups.lock().unwrap();
         match g.get(&group_id) {
-            Some(app) => (app.raft.clone(), app.state_machine.snapshot_byte_limit()),
+            Some(app) => (app.raft.clone(), app.state_machine.clone()),
             None => {
                 let _ = response_tx.send(RaftReply::MissingGroup);
                 return;
@@ -158,6 +158,7 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
         RaftCall::Vote(req) => RaftReply::Vote(raft.vote(req).await),
         RaftCall::Append(req) => RaftReply::Append(raft.append_entries(req).await),
         RaftCall::Snapshot { vote, meta, data } => {
+            let snapshot_cap = state_machine.snapshot_byte_limit();
             if data.len() > snapshot_cap
                 || bincode::serialized_size(&(vote, &meta, &data))
                     .map_or(true, |size| size > (snapshot_cap + 1024 * 1024) as u64)
@@ -175,6 +176,7 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
                 .install_full_snapshot(vote, snapshot)
                 .await
                 .map_err(RaftError::<Infallible>::Fatal);
+            state_machine.wait_native_quiescent().await;
             RaftReply::Snapshot(res)
         }
         RaftCall::Transfer(req) => {

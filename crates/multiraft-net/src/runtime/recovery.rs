@@ -27,12 +27,13 @@ impl<S: StateMachine> RuntimeShared<S> {
                 .create_group(group.group_id, &group.voters)
                 .await?;
             self.node
-                .wait_for_recovery(
+                .wait_for_owned_recovery(
                     group.group_id,
                     deadline.saturating_duration_since(Instant::now()),
                 )
                 .await?;
             self.node.validate_recovered(group.group_id).await?;
+            self.node.ensure_recovery_running(group.group_id)?;
             Ok::<_, MultiRaftError>(())
         })
         .await

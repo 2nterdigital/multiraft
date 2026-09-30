@@ -287,3 +287,80 @@ async fn dispatched_snapshot_timeout_invalidates_its_generation_and_keeps_outcom
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn native_cancel_signal_returns_closed_without_releasing_actual_send_slot() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Semaphore::new(0));
+    let service = PeerService {
+        stopped: Arc::new(AtomicBool::new(false)),
+        entered: entered.clone(),
+        release: release.clone(),
+        gated_group: Some(7),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopping) = oneshot::channel();
+    let server = tokio::spawn(
+        Server::builder()
+            .add_service(RaftServiceServer::new(service))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopping.await;
+            }),
+    );
+    let router = GrpcRouter::new(vec![(2, address)], 1);
+    let sending = router.clone();
+    let (cancel, canceled) = oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        sending
+            .full_snapshot(
+                2,
+                7,
+                typ::Vote::new_committed(3, 1),
+                snapshot(),
+                async { canceled.await.unwrap() },
+                RPCOption::new(Duration::from_secs(2)),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    cancel
+        .send(ReplicationClosed::new("native replication stopped"))
+        .unwrap();
+    assert!(matches!(
+        waiter.await.unwrap(),
+        Err(StreamingError::Closed(_))
+    ));
+    let busy = router
+        .full_snapshot(
+            2,
+            8,
+            typ::Vote::new_committed(3, 1),
+            snapshot(),
+            std::future::pending(),
+            RPCOption::new(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap_err();
+    assert!(busy.to_string().contains("native snapshot send busy"));
+    release.add_permits(1);
+    // Join fences all further intake and waits for the originally accepted send,
+    // even though its native stream waiter has already observed Closed.
+    router.join().await.unwrap();
+    let closed = router
+        .full_snapshot(
+            2,
+            8,
+            typ::Vote::new_committed(3, 1),
+            snapshot(),
+            std::future::pending(),
+            RPCOption::new(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap_err();
+    assert!(closed.to_string().contains("native snapshot owner closed"));
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}

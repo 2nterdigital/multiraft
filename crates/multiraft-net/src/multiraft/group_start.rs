@@ -34,18 +34,16 @@ impl<S: StateMachine> MultiRaft<S> {
             snapshot_mode = ?self.config.snapshot_mode,
             snapshot_policy = snapshot_policy_name,
             file_log_sync_level = ?self.config.file_log_sync_level,
+            install_snapshot_timeout_ms = self.config.install_snapshot_timeout_ms,
+            snapshot_log_retention = self.config.snapshot_log_retention(),
             "starting local Raft group"
         );
         let config = Config {
             heartbeat_interval: self.config.heartbeat_interval_ms,
             election_timeout_min: self.config.election_timeout_min_ms,
             election_timeout_max: self.config.election_timeout_max_ms,
-            max_in_snapshot_log_to_keep: if self.config.snapshot_mode == SnapshotMode::NativeDurable
-            {
-                self.config.retain_log_entries
-            } else {
-                0
-            },
+            install_snapshot_timeout: self.config.install_snapshot_timeout_ms,
+            max_in_snapshot_log_to_keep: self.config.snapshot_log_retention(),
             snapshot_policy,
             // Wipe/restart chaos and follower catch-up can present a shorter log
             // than the leader last matched; without this openraft panics.
@@ -237,6 +235,7 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         let _ = sm_holder.set(state_machine_store.downgrade());
 
+        let mut durable_basis = None;
         let raft = match &self.net {
             NetBackend::InProcess { router, .. } => {
                 let network = NetworkFactory::new(router.clone(), group);
@@ -252,7 +251,7 @@ impl<S: StateMachine> MultiRaft<S> {
                     .await
                 } else {
                     let dir = self.config.data_dir.join(format!("group-{group}"));
-                    let log_store = FileLogStoreOf::open_with_full_options(
+                    let mut log_store = FileLogStoreOf::open_with_full_options(
                         &dir,
                         self.config.file_log_coalesce_us,
                         self.config.file_log_sync_level,
@@ -283,6 +282,9 @@ impl<S: StateMachine> MultiRaft<S> {
                             dir.display()
                         ))
                     })?;
+                    if recovery::durable_local_mode(&self.config) {
+                        durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
+                    }
                     openraft::Raft::new(
                         self.node_id,
                         config,
@@ -307,7 +309,7 @@ impl<S: StateMachine> MultiRaft<S> {
                     .await
                 } else {
                     let dir = self.config.data_dir.join(format!("group-{group}"));
-                    let log_store = FileLogStoreOf::open_with_full_options(
+                    let mut log_store = FileLogStoreOf::open_with_full_options(
                         &dir,
                         self.config.file_log_coalesce_us,
                         self.config.file_log_sync_level,
@@ -338,6 +340,9 @@ impl<S: StateMachine> MultiRaft<S> {
                             dir.display()
                         ))
                     })?;
+                    if recovery::durable_local_mode(&self.config) {
+                        durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
+                    }
                     openraft::Raft::new(
                         self.node_id,
                         config,
@@ -350,27 +355,22 @@ impl<S: StateMachine> MultiRaft<S> {
             }
         }
         .map_err(|error| {
-            tracing::error!(
-                target: "multiraft::recovery",
-                operation = "group_start",
-                phase = "error",
-                node_id = self.node_id,
-                group_id = group,
-                transport,
-                storage,
-                directory = %group_directory.display(),
-                error = %error,
-                error_debug = ?error,
-                "failed to recover or start local Raft group"
-            );
-            MultiRaftError::Other(anyhow::anyhow!(
-                "start Raft for node {}, group {} at {}: {error}",
-                self.node_id,
-                group,
-                group_directory.display()
-            ))
+            let classified = recovery::native_recovery_error(group, multiraft_core::RecoveryStage::Construct, error);
+            tracing::error!(target: "multiraft::recovery", operation = "group_start", phase = "error",
+                node_id = self.node_id, group_id = group, transport, storage,
+                directory = %group_directory.display(), error = %classified,
+                "failed to recover or start local Raft group");
+            classified
         })?;
 
+        // Do not add an await between native worker spawn and registry insertion.
+        // Only successful native construction validates this captured storage basis.
+        if let Some(target) = durable_basis {
+            self.construction_recovery
+                .lock()
+                .unwrap()
+                .insert(group, target);
+        }
         {
             let mut g = self.groups.lock().unwrap();
             g.insert(

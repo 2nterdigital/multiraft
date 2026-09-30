@@ -198,6 +198,8 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     tasks: tasks::OwnedTasks,
     reads: read::ReadRuntime,
     fsm_releases: Mutex<Vec<multiraft_store::StateMachineRelease>>,
+    // Immutable native storage basis captured before successful Group construction.
+    construction_recovery: Mutex<BTreeMap<GroupId, Option<openraft::alias::LogIdOf<TypeConfig>>>>,
     ingress_tasks: Arc<tasks::OwnedTasks>,
     listener_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     ingress_accepting: Arc<std::sync::atomic::AtomicBool>,

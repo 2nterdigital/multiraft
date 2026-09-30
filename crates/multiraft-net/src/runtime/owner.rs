@@ -4,6 +4,10 @@ use crate::StateMachineFactory;
 
 impl<S: StateMachine> NodeOwner<S> {
     /// Start the listener and recover every declared Group before returning handles.
+    /// Data/All file roots confirm the native constructor's validated checkpoint
+    /// and forced committed-log basis before consumer validation. This is local
+    /// recovery, not quorum/leader readiness; all business truth reads still use
+    /// ReadIndex. Memory/Os retain the native cluster-tail recovery wait.
     /// Failure and cancellation fence the partially built runtime and reclaim its resources.
     /// Application factories, apply/restore and query callbacks must be bounded: the
     /// runtime cannot preempt synchronous application code inside a Tokio worker.

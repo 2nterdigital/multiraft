@@ -127,10 +127,10 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
     groups: &GroupMap<S>,
     req: RaftRequest,
 ) -> Result<Response<RaftResponse>, Status> {
-    let (raft, snapshot_cap) = {
+    let (raft, state_machine) = {
         let groups = groups.lock().unwrap();
         match groups.get(&req.group_id) {
-            Some(g) => (g.raft.clone(), g.state_machine.snapshot_byte_limit()),
+            Some(g) => (g.raft.clone(), g.state_machine.clone()),
             None => {
                 let payload = encode::<Result<(), typ::RaftError>>(Err(typ::RaftError::Fatal(
                     openraft::error::Fatal::Stopped,
@@ -142,7 +142,14 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
 
     let res = match req.path.as_str() {
         "/raft/append" => api::append(&raft, &req.payload).await,
-        "/raft/snapshot" => api::snapshot(&raft, &req.payload, snapshot_cap).await?,
+        "/raft/snapshot" => {
+            let result =
+                api::snapshot(&raft, &req.payload, state_machine.snapshot_byte_limit()).await;
+            // Fatal/Stopped can close the native API waiter before the application
+            // worker returns. The owned receive slot follows the actual transition.
+            state_machine.wait_native_quiescent().await;
+            result?
+        }
         "/raft/vote" => api::vote(&raft, &req.payload).await,
         "/raft/transfer_leader" => api::transfer_leader(&raft, &req.payload).await,
         _ => {
