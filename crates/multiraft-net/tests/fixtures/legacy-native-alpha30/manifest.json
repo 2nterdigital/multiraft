@@ -1,0 +1,34 @@
+{
+  "source": "fe832257b0c744faf93f9c7a4ab1da63d37d6a46",
+  "producer": "old-fixture/src/main.rs",
+  "producer_lock_sha256": "f44f89f9ed88641461b262215d67b62552c7740d3e5b944abd3b8d92b5c46db8",
+  "native_versions": "openraft and macros/runtime alpha.30 from original library Cargo.lock",
+  "expected_value": 15,
+  "files": [
+    {
+      "path": "group-7/hard_state.json",
+      "sha256": "c187ecf2744f9ffd3206fd43d6036b96ca17ef45438a7192c538d6fe7f5dae13",
+      "bytes": 190
+    },
+    {
+      "path": "group-7/log.bin",
+      "sha256": "3a4fa64cceb24236632729d6b0e80a33bdea5f29ed4c9c93c93a8dab2df4fe1d",
+      "bytes": 168
+    },
+    {
+      "path": "snapshots/7/native-v1/active.json",
+      "sha256": "8983af5f696329072a7bb935157aa06aa2f0e85706e9b296b39a2db72ea3fb01",
+      "bytes": 188
+    },
+    {
+      "path": "snapshots/7/native-v1/b41598fce45bc20587624128c36c0d2556e59d3228ee9286cecfb170edc4d033/data.bin",
+      "sha256": "7a0f00b55a25758b866b418e1dec92e85707647bb35f8d7ac55aa0698bc89f06",
+      "bytes": 27
+    },
+    {
+      "path": "snapshots/7/native-v1/b41598fce45bc20587624128c36c0d2556e59d3228ee9286cecfb170edc4d033/native-meta.json",
+      "sha256": "b41598fce45bc20587624128c36c0d2556e59d3228ee9286cecfb170edc4d033",
+      "bytes": 369
+    }
+  ]
+}

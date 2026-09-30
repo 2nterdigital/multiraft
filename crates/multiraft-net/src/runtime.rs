@@ -5,6 +5,7 @@
 //! No operation exposes native Raft handles. Commands and effects stay opaque.
 
 mod owner;
+mod recovery;
 mod requests;
 
 use crate::multiraft::tasks::OwnedTasks;

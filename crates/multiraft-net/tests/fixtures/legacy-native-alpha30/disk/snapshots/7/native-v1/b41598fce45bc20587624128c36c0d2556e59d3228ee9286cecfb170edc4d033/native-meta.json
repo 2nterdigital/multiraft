@@ -1,0 +1,1 @@
+{"version":1,"group":7,"meta":{"last_log_id":{"leader_id":{"term":1,"node_id":1},"index":11},"last_membership":{"log_id":{"leader_id":{"term":0,"node_id":1},"index":0},"membership":{"configs":[[1]],"nodes":{"1":{"addr":"127.0.0.1:19001"}}}},"snapshot_id":"native-7-T1-N1-11-1"},"size":27,"data_sha256":"7a0f00b55a25758b866b418e1dec92e85707647bb35f8d7ac55aa0698bc89f06"}
