@@ -1,9 +1,9 @@
-//! Application reads use one caller budget and one observer, independent of shared rounds.
+//! Application reads use one caller budget and one observer, independent for each native confirmation.
 use super::*;
 use crate::read_observation::{ReadGuard, ReadObserver, ReadOutcome, ReadStage, TryReadError};
 
 impl<S: StateMachine> RuntimeHandle<S> {
-    /// Shared ReadIndex then this invocation's local FSM query. No hidden retry.
+    /// One native ReadIndex then this invocation's local FSM query. No hidden retry.
     /// The synchronous query must be bounded. For fallible queries use `try_read_linearizable`.
     pub async fn read_linearizable<R>(
         &self,

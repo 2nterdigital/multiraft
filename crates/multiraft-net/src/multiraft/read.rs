@@ -1,48 +1,10 @@
-//! Shared native confirmation is owned independently from every application's read waiter.
-mod barrier;
+//! One native ReadIndex per caller, using its single absolute budget through FSM query.
 use super::*;
 use crate::read_observation::{ReadGuard, ReadObserver, ReadOutcome, ReadStage};
-use barrier::ReadBarrier;
 use multiraft_core::{NativeFailure, ReadIndexFailure};
 use tokio::time::Instant;
 
-const ROUND_BOUND: Duration = Duration::from_secs(10);
-#[derive(Clone)]
-enum Confirmation {
-    Ready,
-    NotLeader(Option<NodeId>),
-    Failed(ReadIndexFailure),
-}
-#[derive(Default)]
-pub(super) struct ReadRuntime {
-    barriers: Mutex<BTreeMap<GroupId, Arc<ReadBarrier<Confirmation>>>>,
-    tasks: tasks::OwnedTasks,
-    closed: std::sync::atomic::AtomicBool,
-}
-impl ReadRuntime {
-    fn barrier(&self, group: GroupId) -> Result<Arc<ReadBarrier<Confirmation>>, MultiRaftError> {
-        let mut barriers = self.barriers.lock().unwrap();
-        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(ReadIndexFailure::Closed.into());
-        }
-        Ok(barriers
-            .entry(group)
-            .or_insert_with(|| ReadBarrier::new(4))
-            .clone())
-    }
-    pub(super) fn stop(&self) {
-        // Fence acquisition with the same lock that publishes new barriers.
-        let _barriers = self.barriers.lock().unwrap();
-        self.closed
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.tasks.abort();
-    }
-    pub(super) async fn join(&self) {
-        // A round panic is reported to its subscribers; it does not poison other Groups/shutdown.
-        let _ = self.tasks.join().await;
-        self.barriers.lock().unwrap().clear();
-    }
-}
+const READ_BOUND: Duration = Duration::from_secs(10);
 fn native_failure(error: openraft::error::Fatal<TypeConfig>) -> ReadIndexFailure {
     match error {
         openraft::error::Fatal::Stopped => ReadIndexFailure::Closed,
@@ -52,38 +14,42 @@ fn native_failure(error: openraft::error::Fatal<TypeConfig>) -> ReadIndexFailure
         }
     }
 }
-async fn confirm<S: StateMachine>(raft: Raft<S>) -> Confirmation {
-    match tokio::time::timeout(ROUND_BOUND, raft.ensure_linearizable(ReadPolicy::ReadIndex)).await {
-        Ok(Ok(_)) => Confirmation::Ready,
+async fn confirm<S: StateMachine>(raft: &Raft<S>, deadline: Instant) -> Result<(), MultiRaftError> {
+    match tokio::time::timeout_at(deadline, raft.ensure_linearizable(ReadPolicy::ReadIndex)).await {
+        Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => {
             if let Some(fwd) = error.forward_to_leader() {
-                return Confirmation::NotLeader(fwd.leader_id);
+                return Err(MultiRaftError::NotLeader {
+                    hint: fwd.leader_id,
+                });
             }
-            Confirmation::Failed(match error {
+            Err(match error {
                 RaftError::APIError(openraft::error::LinearizableReadError::QuorumNotEnough(
                     error,
                 )) => ReadIndexFailure::QuorumUnavailable {
                     responders: error.got,
-                },
-                RaftError::Fatal(error) => native_failure(error),
-                // The sole remaining API error is ForwardToLeader, handled above.
+                }
+                .into(),
+                RaftError::Fatal(error) => native_failure(error).into(),
                 RaftError::APIError(openraft::error::LinearizableReadError::ForwardToLeader(
                     error,
-                )) => return Confirmation::NotLeader(error.leader_id),
+                )) => MultiRaftError::NotLeader {
+                    hint: error.leader_id,
+                },
             })
         }
-        Err(_) => Confirmation::Failed(ReadIndexFailure::RoundTimeout),
+        Err(_) => Err(ReadIndexFailure::Deadline.into()),
     }
 }
 impl<S: StateMachine> MultiRaft<S> {
-    /// Shared ReadIndex confirmation, followed by this caller's own local FSM read.
-    /// Each call is bounded by ten seconds and never consumes a round started before arrival.
+    /// Independent native ReadIndex confirmation followed by this caller's FSM query.
+    /// One ten-second absolute budget covers both stages; no sharing, pool or queue.
     pub async fn read_linearizable<R>(
         &self,
         group: GroupId,
         query: impl FnOnce(&S) -> R,
     ) -> Result<R, MultiRaftError> {
-        self.read_linearizable_at(group, Instant::now() + ROUND_BOUND, query)
+        self.read_linearizable_at(group, Instant::now() + READ_BOUND, query)
             .await
     }
     /// Absolute-deadline ReadIndex + FSM read. The synchronous query must be bounded.
@@ -122,22 +88,7 @@ impl<S: StateMachine> MultiRaft<S> {
             let raft = self
                 .raft(group)
                 .ok_or(MultiRaftError::UnknownGroup(group))?;
-            let barrier = self.reads.barrier(group)?;
-            let outcome = tokio::time::timeout_at(
-                deadline,
-                barrier.confirm(&self.reads.tasks, move || confirm(raft.clone())),
-            )
-            .await
-            .map_err(|_| MultiRaftError::from(ReadIndexFailure::Deadline))?;
-            match outcome {
-                Ok(Confirmation::Ready) => Ok(()),
-                Ok(Confirmation::NotLeader(hint)) => Err(MultiRaftError::NotLeader { hint }),
-                Ok(Confirmation::Failed(error)) => Err(error.into()),
-                Err(_) if self.reads.closed.load(std::sync::atomic::Ordering::Acquire) => {
-                    Err(ReadIndexFailure::Closed.into())
-                }
-                Err(_) => Err(ReadIndexFailure::Abandoned.into()),
-            }
+            confirm(&raft, deadline).await
         }
         .await;
         stage.finish_source(&result);

@@ -1,4 +1,4 @@
-//! Per-caller source observations; the shared round contains no application context.
+//! Per-caller observations of independent native confirmation and FSM query.
 use multiraft_core::{GroupId, MultiRaftError, NodeId, ReadIndexFailure};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -17,8 +17,6 @@ pub enum ReadOutcome {
     NotLeader,
     QuorumUnavailable,
     Backend,
-    RoundTimeout,
-    Abandoned,
     ApplicationError,
     UnknownGroup,
     Closed,
@@ -115,8 +113,6 @@ impl<'a> ReadGuard<'a> {
                     ReadIndexFailure::Backend(_) | ReadIndexFailure::FsmUnavailable => {
                         ReadOutcome::Backend
                     }
-                    ReadIndexFailure::RoundTimeout => ReadOutcome::RoundTimeout,
-                    ReadIndexFailure::Abandoned => ReadOutcome::Abandoned,
                     ReadIndexFailure::Closed => ReadOutcome::Closed,
                     ReadIndexFailure::Deadline => ReadOutcome::Deadline,
                     _ => ReadOutcome::Backend,
