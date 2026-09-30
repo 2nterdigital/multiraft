@@ -4,6 +4,7 @@
 //! the runtime constructs and recovers native Groups before publishing handles.
 //! No operation exposes native Raft handles. Commands and effects stay opaque.
 
+mod control;
 mod observation;
 mod owner;
 mod read;
