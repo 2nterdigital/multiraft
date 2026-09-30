@@ -31,3 +31,5 @@ pub use type_config::Request;
 pub use type_config::Response;
 pub use type_config::SnapshotData;
 pub use type_config::TypeConfig;
+
+pub use error::{NativeFailure, ReadIndexFailure};

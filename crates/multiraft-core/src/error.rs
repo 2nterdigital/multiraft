@@ -43,8 +43,49 @@ pub enum MultiRaftError {
     #[error(transparent)]
     ObservationClosed(#[from] ObservationClosed),
 
+    #[error("group {group_id} observation failed: {source}")]
+    ObservationFailed {
+        group_id: GroupId,
+        source: NativeFailure,
+    },
+
+    #[error(transparent)]
+    ReadIndex(#[from] ReadIndexFailure),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// Business-neutral native backend failure classification; no raw error text is exported.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum NativeFailure {
+    #[error("native storage failed")]
+    Storage,
+    #[error("native task panicked")]
+    Panicked,
+}
+
+/// Source facts from a ReadIndex confirmation or its local FSM boundary.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ReadIndexFailure {
+    #[error("ReadIndex quorum unavailable; responders={responders:?}")]
+    QuorumUnavailable {
+        responders: std::collections::BTreeSet<NodeId>,
+    },
+    #[error(transparent)]
+    Backend(NativeFailure),
+    #[error("ReadIndex confirmation round timed out")]
+    RoundTimeout,
+    #[error("ReadIndex confirmation round abandoned")]
+    Abandoned,
+    #[error("read owner is closed")]
+    Closed,
+    #[error("local FSM is unavailable")]
+    FsmUnavailable,
+    #[error("read deadline expired")]
+    Deadline,
 }
 
 /// Successful propose: log index and term after quorum commit + apply

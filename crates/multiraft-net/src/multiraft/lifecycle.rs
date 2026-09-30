@@ -8,6 +8,7 @@ impl<S: StateMachine> MultiRaft<S> {
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
             let _ = stop.send(());
         }
+        self.reads.stop();
         self.tasks.abort();
         self.ingress_tasks.abort();
         if let NetBackend::InProcess { router, .. } = &self.net {
@@ -27,6 +28,8 @@ impl<S: StateMachine> MultiRaft<S> {
         if let NetBackend::InProcess { router, .. } = &self.net {
             let _ = router.unregister_node(self.node_id);
         }
+        self.reads.stop();
+        self.reads.join().await;
         let rafts: Vec<(GroupId, Raft<S>, StateMachineStore<S>)> = self
             .groups
             .lock()

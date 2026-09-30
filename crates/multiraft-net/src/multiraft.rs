@@ -94,6 +94,7 @@ mod group_start;
 mod lifecycle;
 mod maintenance;
 mod membership;
+mod read;
 mod recovery;
 pub(crate) mod tasks;
 mod transport_start;
@@ -195,6 +196,7 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     net: NetBackend,
     groups: GroupMap<S>,
     tasks: tasks::OwnedTasks,
+    reads: read::ReadRuntime,
     fsm_releases: Mutex<Vec<multiraft_store::StateMachineRelease>>,
     ingress_tasks: Arc<tasks::OwnedTasks>,
     listener_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,

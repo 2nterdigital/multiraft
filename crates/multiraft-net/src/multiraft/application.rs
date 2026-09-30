@@ -128,39 +128,6 @@ impl<S: StateMachine> MultiRaft<S> {
             }
         }
     }
-
-    /// Linearizable read: confirm leadership (ReadIndex), then read the local FSM.
-    ///
-    /// Non-leader → [`MultiRaftError::NotLeader`]. Use this for order-status / truth
-    /// reads. For Standby offload / debug local reads, use [`Self::read_stale`] or
-    /// [`Self::with_fsm`].
-    pub async fn read_linearizable<R>(
-        &self,
-        group: u64,
-        f: impl FnOnce(&S) -> R,
-    ) -> Result<R, MultiRaftError> {
-        let raft = self
-            .raft(group)
-            .ok_or(MultiRaftError::UnknownGroup(group))?;
-
-        match raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
-            Ok(_read_log_id) => self.with_fsm(group, f).await.ok_or_else(|| {
-                MultiRaftError::Other(anyhow::anyhow!(
-                    "read_linearizable: fsm missing for group {group}"
-                ))
-            }),
-            Err(e) => {
-                if let Some(fwd) = e.forward_to_leader() {
-                    return Err(MultiRaftError::NotLeader {
-                        hint: fwd.leader_id,
-                    });
-                }
-                Err(MultiRaftError::Other(anyhow::anyhow!(
-                    "ensure_linearizable: {e}"
-                )))
-            }
-        }
-    }
 }
 
 impl<S: StateMachine> MultiRaft<S> {
