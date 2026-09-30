@@ -3,6 +3,10 @@ use super::*;
 
 impl<S: StateMachine> MultiRaft<S> {
     pub(crate) fn abort_background(&self) {
+        self.snapshot_rt
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.snapshot_rt.maintenance_tasks.close();
         self.ingress_accepting
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
@@ -19,6 +23,7 @@ impl<S: StateMachine> MultiRaft<S> {
         self.snapshot_rt
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.snapshot_rt.maintenance_tasks.close();
         self.ingress_accepting
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
@@ -54,21 +59,10 @@ impl<S: StateMachine> MultiRaft<S> {
         if let Err(error) = self.ingress_tasks.join().await {
             first_error.get_or_insert(MultiRaftError::Other(error));
         }
-        let operations: Vec<_> = self
-            .snapshot_rt
-            .operations
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
-        for operation in operations {
-            let task = operation.task.lock().unwrap().take();
-            if let Some(task) = task {
-                if let Err(error) = task.await {
-                    first_error.get_or_insert(MultiRaftError::Other(error.into()));
-                }
-            }
+        // Retained operation and sampler jobs include their blocking provider/log
+        // children. A canceled join never drops their handles or releases permits.
+        if let Err(error) = self.snapshot_rt.maintenance_tasks.join().await {
+            first_error.get_or_insert(MultiRaftError::Other(error));
         }
         for (_, _, sm) in &rafts {
             sm.wait_native_quiescent().await;

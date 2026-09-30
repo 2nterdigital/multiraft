@@ -45,3 +45,47 @@ old-source file hashes, producer and original lock hash are retained under
 `tests/fixtures/legacy-native-alpha30`. This proves library compatibility with
 that fixture; Ech0 business schema and actual Store lease validation remain
 consumer integration evidence.
+
+## Owned native maintenance
+
+`RuntimeHandle::request_compaction(group, absolute_deadline)` submits one local
+native snapshot/compaction; `local_storage_status(group, absolute_deadline)`
+observes the library's canonical progress and native/provider/log facts. Typed
+`RuntimeError::MaintenanceRejected` preserves known native refusals. An expired
+admission budget dispatches nothing. Capture/submission share the original caller
+budget; `CompactionRejection::Deadline` means the budget expired before invoking
+the native trigger. Once invoked, trigger and accepted native work stay owned if
+the request waiter expires or is canceled. The caller then receives an unknown
+submission outcome and can inspect storage status separately.
+
+`CompletedObserved` requires actual builder return, a checksum-validated durable
+provider, native snapshot coverage and the configured purge/retention condition.
+The existing `completion_observed` predicate remains the sole classifier. A
+previous checkpoint at the same cut cannot complete a still-running repeated
+build. Observation has a bounded 30-second polling budget; unconfirmed shutdown,
+panic, provider failure or observation expiry never turns submission into
+completion. No automatic compaction, election timing or native protocol policy
+was added. Native alpha.30 already defaults purge batching to 1; retention rules
+are unchanged.
+
+The existing Store supplies one capture permit per Node and the bounded FSM
+capture hook. Known Unsupported/SizeLimit refusals never fall back to the legacy
+unbounded serializer. One retained public status sampler per Node reports Busy
+while actual provider/log work is unfinished, even when its original waiter was
+canceled or expired. Per-Group operations and the sampler share the generic owned
+task registry. Task futures capture independent state/permits rather than their
+registry owner, preventing a registry/handle/owner Arc cycle. Registration and
+close share a lock. Join polls handles retained in that registry, so canceling a
+join abandons only its waiter instead of aborting a parent and detaching a
+non-abortable filesystem child. Shutdown closes intake, stops native work and
+joins maintenance and blocking children before actual FSM release. Bounded
+synchronous FSM code and filesystem work cannot be forcibly preempted; the owned
+cleanup remains retained when a shutdown wait expires.
+
+Public consumer tests under `tests/owned_maintenance*.rs` recover the unchanged
+old-source fixture, compact, append a tail and restart. They cover canonical
+completion, repeated builds, node/group Busy, typed refusals, capture panic and
+Unconfirmed, request deadlines/cancellation, the retained sampler, canceled stop
+and real lease/listener/data-root reuse. They access no native Raft, metrics or
+trigger handle. Bounded tracing events are used as deterministic scheduling seams;
+new status tracing records only operation/phase/Node/Group identity.

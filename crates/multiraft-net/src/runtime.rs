@@ -4,6 +4,7 @@
 //! the runtime constructs and recovers native Groups before publishing handles.
 //! No operation exposes native Raft handles. Commands and effects stay opaque.
 
+mod maintenance;
 mod owner;
 mod recovery;
 mod requests;
@@ -61,6 +62,8 @@ pub enum RuntimePhase {
     GroupStart,
     Propose,
     Read,
+    Compaction,
+    StorageStatus,
     Shutdown,
 }
 
@@ -79,6 +82,7 @@ pub enum RuntimeError {
         outcome_unknown: bool,
     },
     Source(MultiRaftError),
+    MaintenanceRejected(crate::CompactionRejection),
     ShutdownFailed(Arc<RuntimeError>),
 }
 
@@ -103,6 +107,7 @@ impl std::fmt::Display for RuntimeError {
                 "runtime closed during {phase:?}; outcome_unknown={outcome_unknown}"
             ),
             Self::Source(source) => source.fmt(f),
+            Self::MaintenanceRejected(reason) => reason.fmt(f),
             Self::ShutdownFailed(source) => write!(f, "runtime shutdown failed: {source}"),
         }
     }
@@ -111,6 +116,7 @@ impl std::error::Error for RuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Source(source) => Some(source),
+            Self::MaintenanceRejected(reason) => Some(reason),
             Self::ShutdownFailed(source) => Some(source.as_ref()),
             _ => None,
         }
