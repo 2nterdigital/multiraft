@@ -175,3 +175,29 @@ corrupt image and missing committed tail before validation, then recovers15
 after repairing only the damaged file with the saved exact original bytes.
 Failed attempt logs and data roots stay under `.tmp/issue-170/`; no failed disk
 is regenerated or replaced to produce passing compatibility evidence.
+
+## Retained legacy Standby work and cancellation-safe release evidence
+
+Supported `StandbyOffload` capture uses the existing Node maintenance task
+registry. Registration and its close fence are atomic; late callbacks perform no
+catalog work. The registry joins the complete capture future, including the
+existing blocking catalog write. A canceled shutdown waiter leaves that job
+owned; owned-runtime Drop continues cleanup on its originating runtime. The FSM
+callback and job keep only weak snapshot-runtime references, so they do not form
+an own-registry/task/FSM cycle. Existing snapshot bytes, serialization behavior,
+mode support and native replication/recovery algorithms remain unchanged.
+
+FSM destructor observations remain in the runtime registry until actual release.
+Shutdown awaits cloned resource-neutral observations and only prunes completed
+ones. Canceling a wait or retrying cleanup therefore cannot discard outstanding
+consumer lease evidence or report success before real destruction. The public
+consumer verifies this with an admitted local read, a blocked application Drop,
+a canceled first shutdown, a repeated wait and actual lease/listener reuse.
+
+Application factory and Standby snapshot failures emit finite identity/boundary
+summaries (`application_factory_failed`, `capture_or_write_failed`), without
+application Display/Debug, payload or arbitrary native/source-chain text. Factory
+returns and retained snapshot-task failures keep the original opaque error chain
+for caller inspection. Logging never changes the source failure or grants retry
+or readiness. Source privacy tests use synthetic secret and oversized callback
+errors and inspect the actual subscriber separately from the returned chain.

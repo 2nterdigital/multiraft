@@ -90,9 +90,20 @@ impl<S: StateMachine> MultiRaft<S> {
         drop(rafts);
         // Core shutdown does not join the SM worker. Successful stop promises that
         // its application destructor has completed before callers reopen resources.
-        let releases = std::mem::take(&mut *self.fsm_releases.lock().unwrap());
-        for release in releases {
-            release.wait().await;
+        // Observations remain owned in the registry across any canceled wait or
+        // cleanup-timeout retry. Clones retain no FSM; prune only actual release.
+        loop {
+            let pending = {
+                let mut releases = self.fsm_releases.lock().unwrap();
+                releases.retain(|release| !release.is_released());
+                releases.clone()
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for release in pending {
+                release.wait().await;
+            }
         }
         tracing::info!(target: "multiraft::recovery", operation = "node_shutdown", phase = "complete",
             node_id = self.node_id, remaining_groups = 0_u64, "shut down Multi-Raft node");

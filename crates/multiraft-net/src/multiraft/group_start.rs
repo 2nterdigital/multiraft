@@ -97,8 +97,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 transport,
                 storage,
                 directory = %group_directory.display(),
-                error = %source,
-                error_debug = ?source,
+                reason_code = "application_factory_failed",
                 "failed to construct application FSM"
             );
             MultiRaftError::Other(source.context(format!(
@@ -134,51 +133,12 @@ impl<S: StateMachine> MultiRaft<S> {
                 );
                 MultiRaftError::Other(error)
             })?;
-            let rt = self.snapshot_rt.clone();
-            let holder = sm_holder.clone();
-            let trigger: TriggerCb = Arc::new(move |gid, index, term| {
-                let catalog = catalog.clone();
-                let rt = rt.clone();
-                let holder = holder.clone();
-                TypeConfig::spawn(async move {
-                    let Some(sm) = holder.get().and_then(|weak| weak.upgrade()) else {
-                        tracing::warn!(group = gid, "standby trigger before SM ready");
-                        return;
-                    };
-                    let delay = *rt.serialize_delay.lock().unwrap();
-                    match sm
-                        .build_standby_snapshot_async(&catalog, gid, index, term, delay)
-                        .await
-                    {
-                        Ok(entry) => {
-                            let fetch_url = rt
-                                .admin_advertise_addr
-                                .map(|addr| format!("http://{addr}/snapshots/{gid}/latest"))
-                                .unwrap_or_default();
-                            let ad = SnapshotAdvertisement {
-                                group: gid,
-                                last_index: entry.last_index,
-                                last_term: entry.last_term,
-                                snapshot_id: entry.snapshot_id,
-                                size: entry.size,
-                                sha256_hex: entry.sha256_hex,
-                                fetch_url,
-                            };
-                            rt.record_ad(ad);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                group = gid,
-                                index,
-                                term,
-                                error = %e,
-                                "standby async snapshot failed"
-                            );
-                        }
-                    }
-                });
-            });
-            Some(trigger)
+            Some(standby::trigger(
+                &self.snapshot_rt,
+                sm_holder.clone(),
+                catalog,
+                self.node_id,
+            ))
         } else {
             None
         };

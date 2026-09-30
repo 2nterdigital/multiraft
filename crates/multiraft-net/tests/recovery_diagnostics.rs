@@ -107,11 +107,10 @@ async fn seed_purged_committed_log(group_path: &std::path::Path) {
         .expect("purge recovery fixture prefix");
 }
 
-fn assert_group_start_failure(
+fn group_start_failure_event(
     capture: &EventCapture,
     expected_directory: &str,
-    expected_cause: &str,
-) {
+) -> BTreeMap<String, String> {
     let events = capture.matching("group_start");
     let starts: Vec<_> = events
         .iter()
@@ -150,11 +149,20 @@ fn assert_group_start_failure(
             Some(expected_directory)
         );
     }
+    errors[0].clone()
+}
+
+fn assert_group_start_failure(
+    capture: &EventCapture,
+    expected_directory: &str,
+    expected_cause: &str,
+) {
+    let error = group_start_failure_event(capture, expected_directory);
     assert!(
-        errors[0]
+        error
             .get("error")
             .is_some_and(|error| error.contains(expected_cause)),
-        "group error omitted root cause {expected_cause:?}: {events:?}"
+        "group error omitted expected source summary {expected_cause:?}: {error:?}"
     );
 }
 
@@ -428,7 +436,11 @@ async fn failing_fsm_factory_closes_group_start_lifecycle() {
     let data_root = tempfile::tempdir().expect("temporary data root");
     let group_path = data_root.path().join("group-9");
     let expected_directory = group_path.display().to_string();
-    let expected_cause = "diagnostic factory sentinel";
+    let expected_cause = format!(
+        "factory SECRET_SENTINEL authorization Bearer diagnostic-token payload={} END_SENTINEL",
+        "private-callback-data".repeat(512)
+    );
+    let returned_cause = expected_cause.clone();
     let capture = EventCapture::default();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
@@ -436,7 +448,7 @@ async fn failing_fsm_factory_closes_group_start_lifecycle() {
     let mut config = ClusterConfig::for_test(1, &[1]);
     config.data_dir = data_root.path().to_path_buf();
     let node = MultiRaft::<CounterFsm>::start_with_factory(config, move |_| {
-        Err::<CounterFsm, anyhow::Error>(anyhow::anyhow!(expected_cause))
+        Err::<CounterFsm, anyhow::Error>(anyhow::anyhow!(returned_cause.clone()))
     })
     .await
     .expect("start node shell");
@@ -450,10 +462,28 @@ async fn failing_fsm_factory_closes_group_start_lifecycle() {
     let returned_debug = format!("{error:?}");
     assert!(
         returned_display.contains("create FSM for node 1, group 9")
-            && returned_debug.contains(expected_cause),
+            && returned_debug.contains(&expected_cause),
         "returned factory error omitted context or source chain: {returned_debug}"
     );
-    assert_group_start_failure(&capture, &expected_directory, expected_cause);
+    let failure = group_start_failure_event(&capture, &expected_directory);
+    assert_eq!(
+        failure.get("reason_code").map(String::as_str),
+        Some("application_factory_failed")
+    );
+    assert!(!failure.contains_key("error") && !failure.contains_key("error_debug"));
+    assert!(capture
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|event| event.values())
+        .all(|value| !value.contains("SECRET_SENTINEL")
+            && !value.contains("diagnostic-token")
+            && !value.contains("private-callback-data")));
+    let MultiRaftError::Other(source) = &error else {
+        panic!("original fallible factory source remains available")
+    };
+    assert_eq!(source.root_cause().to_string(), expected_cause);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
