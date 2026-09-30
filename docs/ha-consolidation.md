@@ -28,6 +28,18 @@ returns the startup error. This owned-runtime policy does not change the legacy
 standalone facade's Group-creation policy. Cancellation abandons only the
 caller's wait. Node-owner Drop retains cleanup on the originating Tokio runtime.
 
+`RuntimeHandle::create_group(group, absolute_deadline)` keeps its existing total
+startup deadline across construction, native recovery and consumer validation.
+`create_group_with_recovery_timeout(group, recovery_timeout)` provides the stage
+contract for consumers whose existing timeout bounded only the native recovery
+wait: construction precedes that wait, and validation follows it. Both use the
+same pipeline, native basis, ready publication and owned rollback. The latter
+parameter does not bound total startup; application callbacks must be bounded.
+Cancellation retains the registered construction and cleanup rather than detaching
+native work. `tests/startup_wait_budget.rs` proves the constructor/validation
+boundary, unchanged absolute expiration, exact native-wait refusal, canceled
+waiter/owner Drop and actual lease/listener release through public APIs.
+
 Successful `NodeOwner::shutdown` and successful startup rollback are resource
 reuse seams: the application FSM destructor has finished, rather than merely
 native Raft shutdown acknowledging. Factories must return independently owned
