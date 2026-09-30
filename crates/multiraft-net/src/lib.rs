@@ -17,6 +17,7 @@ mod multiraft;
 mod network;
 mod node;
 mod router;
+mod runtime;
 mod snapshot_fetch;
 mod standby_throttle;
 
@@ -80,3 +81,8 @@ pub fn encode<T: Serialize>(t: T) -> Vec<u8> {
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
     bincode::deserialize(bytes).expect("raft decode")
 }
+
+pub use runtime::{
+    GroupConfig, NodeOwner, RuntimeConfig, RuntimeError, RuntimeHandle, RuntimePhase,
+    RuntimeTransport,
+};

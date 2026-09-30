@@ -18,6 +18,7 @@ pub use sm_bridge::SmOptions;
 pub use sm_bridge::StateMachineStore;
 pub use sm_bridge::TriggerCb;
 pub use sm_bridge::{NativeBuildReservation, NativeCaptureError, NativeSmOptions};
+pub use sm_bridge::{StateMachineRelease, WeakStateMachineStore};
 pub use snapshot_catalog::CatalogEntry;
 pub use snapshot_catalog::SnapshotCatalog;
 pub use snapshot_catalog::{NativeSnapshot, NativeSnapshotInfo, NativeSnapshotStage};
