@@ -79,6 +79,7 @@ impl<S: StateMachine> NodeOwner<S> {
                 cleanup_started: AtomicBool::new(false),
                 completed,
                 abort_requests,
+                closed: watch::channel(false).0,
                 runtime: tokio::runtime::Handle::current(),
                 cleanup_task: Mutex::new(None),
             }),
@@ -144,6 +145,7 @@ impl<S: StateMachine> Drop for NodeOwner<S> {
 impl<S: StateMachine> RuntimeShared<S> {
     fn begin_cleanup(self: &Arc<Self>) {
         self.accepting.store(false, Ordering::Release);
+        self.closed.send_replace(true);
         self.slots.close();
         if self.cleanup_started.swap(true, Ordering::AcqRel) {
             return;

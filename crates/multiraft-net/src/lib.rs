@@ -13,9 +13,11 @@ mod fsm_factory;
 mod group_control;
 mod group_observation;
 mod grpc;
+mod leader_hint;
 mod multiraft;
 mod network;
 mod node;
+mod read_observation;
 mod router;
 mod runtime;
 mod snapshot_fetch;
@@ -86,3 +88,6 @@ pub use runtime::{
     GroupConfig, NodeOwner, RuntimeConfig, RuntimeError, RuntimeHandle, RuntimePhase,
     RuntimeTransport,
 };
+
+pub use leader_hint::{HintSource, LeaderHint, LeaderHintReceiver};
+pub use read_observation::{ReadEvent, ReadObserver, ReadOutcome, ReadStage, TryReadError};

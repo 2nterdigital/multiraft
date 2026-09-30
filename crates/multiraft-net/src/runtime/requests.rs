@@ -147,26 +147,6 @@ impl<S: StateMachine> RuntimeHandle<S> {
             )
             .await
     }
-
-    /// ReadIndex-confirm leadership and then query the local FSM under its lock.
-    /// The synchronous query must be bounded and must not block the runtime thread.
-    pub async fn read_linearizable<R>(
-        &self,
-        group: GroupId,
-        deadline: Instant,
-        query: impl FnOnce(&S) -> R,
-    ) -> Result<R, RuntimeError> {
-        let admitted = self.admit(deadline).await?;
-        admitted.ensure_group(group)?;
-        admitted
-            .run(
-                deadline,
-                RuntimePhase::Read,
-                false,
-                admitted.shared.node.read_linearizable(group, query),
-            )
-            .await
-    }
 }
 impl<S: StateMachine> Admitted<S> {
     pub(super) async fn run<R>(

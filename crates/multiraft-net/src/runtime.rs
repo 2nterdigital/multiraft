@@ -4,7 +4,9 @@
 //! the runtime constructs and recovers native Groups before publishing handles.
 //! No operation exposes native Raft handles. Commands and effects stay opaque.
 
+mod observation;
 mod owner;
+mod read;
 mod requests;
 
 use crate::multiraft::tasks::OwnedTasks;
@@ -151,6 +153,7 @@ pub(super) struct RuntimeShared<S: StateMachine> {
     cleanup_started: AtomicBool,
     completed: watch::Sender<Option<Result<(), Arc<RuntimeError>>>>,
     abort_requests: watch::Sender<bool>,
+    closed: watch::Sender<bool>,
     runtime: tokio::runtime::Handle,
     cleanup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
