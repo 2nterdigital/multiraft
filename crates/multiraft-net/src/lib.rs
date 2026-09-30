@@ -8,6 +8,7 @@
 //! Public orchestration facade: [`MultiRaft`] (`use multiraft_net::MultiRaft`).
 
 mod api;
+pub mod application_rpc;
 mod conn_metrics;
 mod fsm_factory;
 mod group_control;
