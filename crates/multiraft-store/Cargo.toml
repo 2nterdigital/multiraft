@@ -10,6 +10,7 @@ multiraft-fsm = { path = "../multiraft-fsm" }
 openraft = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_ignored = "0.1"
 bincode = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }

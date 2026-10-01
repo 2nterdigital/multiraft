@@ -167,6 +167,10 @@ async fn unknown_and_corrupt_native_namespaces_fail_closed_before_factory() {
         ("unknown-native", b"unknown".as_slice()),
         ("log.bin", b"broken".as_slice()),
         ("hard_state.json", b"not-json".as_slice()),
+        ("hard_state.json", br#"{"last_purged_log_id":null,"committed":null,"vote":null,"future_vote":{"term":4}}"#.as_slice()),
+        ("hard_state.json", br#"{"last_purged_log_id":null,"committed":null,"vote":{"leader_id":{"term":4,"node_id":1,"future":true},"committed":false}}"#.as_slice()),
+        ("hard_state.json", br#"{"last_purged_log_id":null,"committed":null,"vote":null,"vote":null}"#.as_slice()),
+        ("hard_state.json", b"[null,null,null]".as_slice()),
     ] {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("group-7")).unwrap();
@@ -187,6 +191,7 @@ async fn unknown_and_corrupt_native_namespaces_fail_closed_before_factory() {
             InitializeDisposition::NotDispatched
         );
         assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(root.path().join("group-7").join(name)).unwrap(), bytes);
         reusable(root.path(), &peers);
         owner.shutdown(deadline()).await.unwrap();
     }

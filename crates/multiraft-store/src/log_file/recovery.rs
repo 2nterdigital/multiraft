@@ -17,6 +17,34 @@ where
     serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Strict opt-in evidence parsing; legacy open/load remains compatible.
+fn provenance_hard_state<C>(path: &Path) -> io::Result<HardState<C>>
+where
+    C: RaftTypeConfig,
+    LogIdOf<C>: Serialize + DeserializeOwned,
+    VoteOf<C>: Serialize + DeserializeOwned,
+{
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "unsupported native hard state");
+    let bytes = fs::read(path)?;
+    // Serde structs also accept sequences. Only the native JSON object is
+    // recognized provenance; optional known fields keep their legacy defaults.
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if !value.is_object() {
+        return Err(invalid());
+    }
+    let mut ignored = false;
+    let mut decoder = serde_json::Deserializer::from_slice(&bytes);
+    // Deserialize the original bytes, never the Value: this retains duplicate
+    // field detection in HardState and in the native nested vote/log-id structs.
+    let hard =
+        serde_ignored::deserialize(&mut decoder, |_| ignored = true).map_err(|_| invalid())?;
+    decoder.end().map_err(|_| invalid())?;
+    if ignored {
+        return Err(invalid());
+    }
+    Ok(hard)
+}
+
 pub(super) fn load_log<C>(dir: &Path) -> io::Result<BTreeMap<u64, C::Entry>>
 where
     C: RaftTypeConfig,
@@ -156,7 +184,7 @@ where
             let name = entry.file_name();
             match name.to_str() {
                 Some(HARD_STATE_FILE) => {
-                    let hard = load_hard_state::<C>(dir)?;
+                    let hard = provenance_hard_state::<C>(&entry.path())?;
                     persisted |= hard.vote.is_some()
                         || hard.committed.is_some()
                         || hard.last_purged_log_id.is_some();

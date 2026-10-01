@@ -98,3 +98,40 @@ fn fully_validated_inactive_generation_is_inert_and_never_promoted_to_active() {
     std::fs::write(generation.join("data.bin"), b"corrupt").unwrap();
     assert!(catalog.startup_provenance(7, 1024).is_err());
 }
+
+#[test]
+fn unsupported_hard_state_fields_and_structures_are_refused_without_changing_bytes() {
+    for bytes in [
+        br#"{"last_purged_log_id":null,"committed":null,"vote":null,"future_vote":{"term":4}}"#.as_slice(),
+        br#"{"last_purged_log_id":null,"committed":null,"vote":{"leader_id":{"term":4,"node_id":1,"future":true},"committed":false}}"#.as_slice(),
+        br#"{"last_purged_log_id":null,"committed":null,"vote":{"leader_id":{"term":4,"node_id":1},"committed":false,"future":true}}"#.as_slice(),
+        br#"{"last_purged_log_id":null,"committed":{"leader_id":{"term":4,"node_id":1},"index":2,"future":true},"vote":null}"#.as_slice(),
+        br#"{"last_purged_log_id":null,"committed":null,"vote":null,"vote":null}"#.as_slice(),
+        br#"{"last_purged_log_id":null,"committed":null,"vote":{"leader_id":{"term":4,"term":5,"node_id":1},"committed":false}}"#.as_slice(),
+        b"[null,null,null]".as_slice(),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("hard_state.json");
+        std::fs::write(&file, bytes).unwrap();
+        let result = FileLogStoreOf::startup_provenance(root.path());
+        assert!(result.is_err(), "unsupported hard state accepted: {result:?}");
+        assert_eq!(std::fs::read(file).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn strict_provenance_preserves_optional_defaults_and_legacy_open_unknown_field_compatibility() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("hard_state.json");
+    std::fs::write(&file, b"{}").unwrap();
+    assert_eq!(
+        FileLogStoreOf::startup_provenance(root.path()).unwrap(),
+        StartupProvenance::Pristine
+    );
+    let bytes =
+        br#"{"last_purged_log_id":null,"committed":null,"vote":null,"future_vote":{"term":4}}"#;
+    std::fs::write(&file, bytes).unwrap();
+    let legacy = FileLogStoreOf::open(root.path()).unwrap();
+    drop(legacy);
+    assert_eq!(std::fs::read(file).unwrap(), bytes);
+}
