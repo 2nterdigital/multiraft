@@ -1,6 +1,13 @@
 //! Batch-native registration and initialization; no application policy.
 use super::*;
-use multiraft_core::{InitializeDisposition, StartupProvenance};
+use multiraft_core::{
+    InitializationLogId, InitializationVote, InitializeDisposition, StartupProvenance,
+};
+use openraft::vote::RaftLeaderId;
+
+pub(crate) fn digest_label(value: Option<[u8; 32]>) -> Option<String> {
+    value.map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
 
 impl<S: StateMachine> MultiRaft<S> {
     pub(crate) fn startup_owner_empty(&self) -> bool {
@@ -54,15 +61,38 @@ impl<S: StateMachine> MultiRaft<S> {
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
-        tracing::info!(target: "multiraft::startup", node_id=self.node_id, group_id=group, input_digest=?input_digest, phase="initialize_dispatch", outcome="unknown", "native initialize call begins; reply and campaign are separate");
+        let digest = digest_label(input_digest);
+        tracing::info!(target: "multiraft::startup", node_id=self.node_id, group_id=group, startup_digest=digest.as_deref(), digest_known=digest.is_some(), phase="initialize_dispatch", initialization="unknown", outcome_unknown=true, "native initialize call begins; reply and campaign are separate");
         let result = match raft.initialize(self.membership_nodes(members)).await {
             Ok(()) => Ok(InitializeDisposition::InitOk),
-            Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
-                Ok(InitializeDisposition::NotAllowed)
+            Err(RaftError::APIError(InitializeError::NotAllowed(refusal))) => {
+                let leader = refusal.vote.leader_id();
+                Ok(InitializeDisposition::NotAllowed {
+                    last_log_id: refusal.last_log_id.map(|log| {
+                        let id = log.committed_leader_id();
+                        InitializationLogId {
+                            term: id.term(),
+                            node_id: *id.node_id(),
+                            index: log.index(),
+                        }
+                    }),
+                    vote: InitializationVote {
+                        term: leader.term(),
+                        node_id: *leader.node_id(),
+                        committed: refusal.vote.committed,
+                    },
+                })
             }
             Err(e) => Err(MultiRaftError::Other(e.into())),
         };
-        tracing::info!(target: "multiraft::startup", node_id=self.node_id, group_id=group, input_digest=?input_digest, phase="initialize_reply", disposition=?result.as_ref().ok(), "native initialize reply; quorum and campaign causality unknown");
+        let disposition = result
+            .as_ref()
+            .copied()
+            .unwrap_or(InitializeDisposition::Unknown);
+        tracing::info!(target: "multiraft::startup", node_id=self.node_id, group_id=group, startup_digest=digest.as_deref(), digest_known=digest.is_some(), phase="initialize_reply", initialization=disposition.code(), outcome_unknown=result.is_err(), "native initialize reply; quorum and campaign causality unknown");
+        if let InitializeDisposition::NotAllowed { last_log_id, vote } = disposition {
+            tracing::info!(target: "multiraft::startup", node_id=self.node_id, group_id=group, startup_digest=digest.as_deref(), digest_known=digest.is_some(), phase="initialize_refusal", initialization="not_allowed", last_log_known=last_log_id.is_some(), last_log_term=last_log_id.map(|v|v.term), last_log_node_id=last_log_id.map(|v|v.node_id), last_log_index=last_log_id.map(|v|v.index), vote_term=vote.term, vote_node_id=vote.node_id, vote_committed=vote.committed, "raw native initialization refusal facts");
+        }
         result
     }
 }

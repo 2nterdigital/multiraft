@@ -33,6 +33,22 @@ pub enum StartupPhase {
     Validate,
     Ready,
 }
+impl StartupPhase {
+    /// Bounded operational source label.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::Construct => "construct",
+            Self::Registered => "registered",
+            Self::Grace => "grace",
+            Self::Eligibility => "eligibility",
+            Self::Initialize => "initialize",
+            Self::NativeWait => "native_wait",
+            Self::Validate => "validate",
+            Self::Ready => "ready",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupCleanup {
     NotRequired,

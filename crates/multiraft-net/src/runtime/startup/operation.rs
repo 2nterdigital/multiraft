@@ -9,7 +9,8 @@ impl<S: StateMachine> RuntimeShared<S> {
         batch: StartupBatch,
         progress: Progress,
     ) -> Result<StartupReport, StartupFailure> {
-        tracing::info!(target: "multiraft::startup", node_id=self.node.node_id(), input_digest=?batch.input_digest, configuration_verified=false, phase="batch_admitted", groups=batch.groups.len(), "owned startup batch; consumer digest is opaque");
+        let digest = crate::multiraft::digest_label(batch.input_digest);
+        tracing::info!(target: "multiraft::startup", node_id=self.node.node_id(), startup_digest=digest.as_deref(), digest_known=digest.is_some(), configuration_verified=false, phase="batch_admitted", groups=batch.groups.len(), "owned startup batch; consumer digest is opaque");
         // Native registry is the registration boundary. No initialize/native wait
         // is entered until every local Group (including persisted ones) is there.
         for (index, input) in batch.groups.iter().enumerate() {
@@ -28,7 +29,7 @@ impl<S: StateMachine> RuntimeShared<S> {
                 group.deadline = Some(registered + batch.recovery_timeout);
                 group.phase = StartupPhase::Registered;
             });
-            tracing::info!(target:"multiraft::startup",node_id=self.node.node_id(),group_id=input.group.group_id,phase="registered",provenance=?provenance,budget_ms=batch.recovery_timeout.as_millis() as u64,"Group registration anchors startup deadline");
+            tracing::info!(target:"multiraft::startup",node_id=self.node.node_id(),group_id=input.group.group_id,startup_digest=digest.as_deref(),digest_known=digest.is_some(),phase="registered",startup_provenance=provenance.code(),budget_ms=batch.recovery_timeout.as_millis() as u64,"Group registration anchors startup deadline");
             for earlier in 0..=index {
                 self.check_budget(&progress, earlier)?;
             }

@@ -96,6 +96,7 @@ mod lifecycle;
 mod local;
 mod startup;
 pub use local::LocalGroupStatus;
+pub(crate) use startup::digest_label;
 mod maintenance;
 mod membership;
 mod read;

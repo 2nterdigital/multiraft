@@ -112,10 +112,17 @@ async fn peer_state_after_eligibility_keeps_raw_native_not_allowed_disposition()
         report.groups[0].provenance,
         Some(StartupProvenance::Pristine)
     );
-    assert_eq!(
-        report.groups[0].initialization,
-        InitializeDisposition::NotAllowed
-    );
+    let InitializeDisposition::NotAllowed { last_log_id, vote } = report.groups[0].initialization
+    else {
+        panic!("native initialization must refuse the actual concurrent state");
+    };
+    assert!(vote.term > 0);
+    assert!([1, 2].contains(&vote.node_id));
+    // Vote-only native state can refuse initialization before the initial log
+    // arrives. Preserve that absence rather than manufacture a log identity.
+    if let Some(last) = last_log_id {
+        assert!([1, 2].contains(&last.node_id));
+    }
     let handles = [h1, h2];
     leader(&handles, 7)
         .await

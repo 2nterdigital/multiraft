@@ -403,7 +403,7 @@ async fn three_independent_grpc_nodes_initialization_race_keeps_raw_dispositions
     assert!(reports.iter().flat_map(|r| &r.groups).all(|g| matches!(
         g.initialization,
         InitializeDisposition::InitOk
-            | InitializeDisposition::NotAllowed
+            | InitializeDisposition::NotAllowed { .. }
             | InitializeDisposition::NotDispatched
     )));
     assert!(reports

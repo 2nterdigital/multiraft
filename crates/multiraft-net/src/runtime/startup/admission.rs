@@ -143,8 +143,15 @@ impl<S: StateMachine> RuntimeHandle<S> {
                         ))
                     });
             match &result {
-                Ok(report) => tracing::info!(target: "multiraft::startup", node_id=report.node_id, input_digest=?report.input_digest, phase="batch_complete", groups=report.groups.len(), "all local validators complete; startup does not prove quorum"),
-                Err(failure) => tracing::warn!(target: "multiraft::startup", node_id=failure.report.node_id, input_digest=?failure.report.input_digest, group_id=?failure.group_id, phase=?failure.phase, initialization=?failure.group_id.and_then(|id|failure.report.groups.iter().find(|g|g.group_id==id)).map(|g|g.initialization), outcome_unknown=failure.outcome_unknown, "owned startup failed; rollback retained"),
+                Ok(report) => {
+                    let digest = crate::multiraft::digest_label(report.input_digest);
+                    tracing::info!(target: "multiraft::startup", node_id=report.node_id, startup_digest=digest.as_deref(), digest_known=digest.is_some(), phase="batch_complete", groups=report.groups.len(), "all local validators complete; startup does not prove quorum");
+                }
+                Err(failure) => {
+                    let digest = crate::multiraft::digest_label(failure.report.input_digest);
+                    let initialization = failure.group_id.and_then(|id|failure.report.groups.iter().find(|g|g.group_id==id)).map(|g|g.initialization.code());
+                    tracing::warn!(target: "multiraft::startup", node_id=failure.report.node_id, startup_digest=digest.as_deref(), digest_known=digest.is_some(), group_id=failure.group_id, failed_group_known=failure.group_id.is_some(), phase=failure.phase.code(), initialization=initialization, initialization_known=initialization.is_some(), outcome_unknown=failure.outcome_unknown, "owned startup failed; rollback retained");
+                }
             }
             if result.is_err() {
                 task_shared.begin_cleanup();
