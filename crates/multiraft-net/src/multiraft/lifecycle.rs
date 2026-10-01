@@ -107,6 +107,9 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         tracing::info!(target: "multiraft::recovery", operation = "node_shutdown", phase = "complete",
             node_id = self.node_id, remaining_groups = 0_u64, "shut down Multi-Raft node");
+        if let Some(source) = &self.election_source {
+            source.close();
+        }
         first_error.map_or(Ok(()), Err)
     }
 }

@@ -10,6 +10,7 @@
 mod api;
 pub mod application_rpc;
 mod conn_metrics;
+mod election_source;
 mod fsm_factory;
 mod group_control;
 mod group_observation;
@@ -102,4 +103,17 @@ pub use read_observation::{ReadEvent, ReadObserver, ReadOutcome, ReadStage, TryR
 pub use runtime::{
     GroupStartupReport, InitializeDisposition, StartupBatch, StartupCleanup, StartupFailure,
     StartupGroup, StartupPhase, StartupRejection, StartupReport,
+};
+
+pub use election_source::{
+    ElectionSource, ElectionSourceCapabilities, ElectionSourceConfig, ElectionSourceEvent,
+    ElectionSourceRead, ElectionSourceReceiver, ElectionSourceRecord, ElectionSourceStatus,
+    ElectionStatePoint, SourceFact, SourceUnknown, TransferRpcRequest, TransferRpcResult,
+    VoteRpcRequest, VoteRpcResponse,
+};
+
+pub use election_source::{
+    AutomaticElectionDecision, CampaignOrigin, CampaignPhase, NativeElectionFact,
+    NativeElectionKind, NativeElectionTiming, SourceRpcFailure, VoteRequestDisposition,
+    VoteResponseDisposition,
 };

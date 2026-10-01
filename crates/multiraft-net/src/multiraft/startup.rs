@@ -63,6 +63,10 @@ impl<S: StateMachine> MultiRaft<S> {
             .ok_or(MultiRaftError::UnknownGroup(group))?;
         let digest = digest_label(input_digest);
         tracing::info!(target: "multiraft::startup", node_id=self.node_id, group_id=group, startup_digest=digest.as_deref(), digest_known=digest.is_some(), phase="initialize_dispatch", initialization="unknown", outcome_unknown=true, "native initialize call begins; reply and campaign are separate");
+        let attempt = self
+            .election_source
+            .as_ref()
+            .map(|source| source.begin(group, crate::ElectionSourceEvent::InitializeStarted));
         let result = match raft.initialize(self.membership_nodes(members)).await {
             Ok(()) => Ok(InitializeDisposition::InitOk),
             Err(RaftError::APIError(InitializeError::NotAllowed(refusal))) => {
@@ -92,6 +96,9 @@ impl<S: StateMachine> MultiRaft<S> {
         tracing::info!(target: "multiraft::startup", node_id=self.node_id, group_id=group, startup_digest=digest.as_deref(), digest_known=digest.is_some(), phase="initialize_reply", initialization=disposition.code(), outcome_unknown=result.is_err(), "native initialize reply; quorum and campaign causality unknown");
         if let InitializeDisposition::NotAllowed { last_log_id, vote } = disposition {
             tracing::info!(target: "multiraft::startup", node_id=self.node_id, group_id=group, startup_digest=digest.as_deref(), digest_known=digest.is_some(), phase="initialize_refusal", initialization="not_allowed", last_log_known=last_log_id.is_some(), last_log_term=last_log_id.map(|v|v.term), last_log_node_id=last_log_id.map(|v|v.node_id), last_log_index=last_log_id.map(|v|v.index), vote_term=vote.term, vote_node_id=vote.node_id, vote_committed=vote.committed, "raw native initialization refusal facts");
+        }
+        if let Some(attempt) = attempt {
+            attempt.finish(crate::ElectionSourceEvent::InitializeFinished { disposition });
         }
         result
     }

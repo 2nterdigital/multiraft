@@ -201,15 +201,16 @@ impl<S: StateMachine> MultiRaft<S> {
         let mut durable_basis = None;
         let raft = match &self.net {
             NetBackend::InProcess { router, .. } => {
-                let network = NetworkFactory::new(router.clone(), group);
+                let network = crate::election_source::ObservedFactory::new(NetworkFactory::new(router.clone(), group), group, self.election_source.clone());
                 if self.config.data_dir.as_os_str().is_empty() {
                     let log_store = MemLogStore::default();
-                    openraft::Raft::new(
+                    openraft::Raft::new_with_election_observer(
                         self.node_id,
                         config,
                         network,
                         log_store,
                         state_machine_store.clone(),
+                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
                     )
                     .await
                 } else {
@@ -247,26 +248,28 @@ impl<S: StateMachine> MultiRaft<S> {
                     if recovery::durable_local_mode(&self.config) {
                         durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
                     }
-                    openraft::Raft::new(
+                    openraft::Raft::new_with_election_observer(
                         self.node_id,
                         config,
                         network,
                         log_store,
                         state_machine_store.clone(),
+                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
                     )
                     .await
                 }
             }
             NetBackend::Grpc { router } => {
-                let network = GrpcNetworkFactory::new(router.clone(), group);
+                let network = crate::election_source::ObservedFactory::new(GrpcNetworkFactory::new(router.clone(), group), group, self.election_source.clone());
                 if self.config.data_dir.as_os_str().is_empty() {
                     let log_store = MemLogStore::default();
-                    openraft::Raft::new(
+                    openraft::Raft::new_with_election_observer(
                         self.node_id,
                         config,
                         network,
                         log_store,
                         state_machine_store.clone(),
+                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
                     )
                     .await
                 } else {
@@ -304,12 +307,13 @@ impl<S: StateMachine> MultiRaft<S> {
                     if recovery::durable_local_mode(&self.config) {
                         durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
                     }
-                    openraft::Raft::new(
+                    openraft::Raft::new_with_election_observer(
                         self.node_id,
                         config,
                         network,
                         log_store,
                         state_machine_store.clone(),
+                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
                     )
                     .await
                 }

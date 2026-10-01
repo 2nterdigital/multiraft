@@ -91,6 +91,7 @@ use tokio::sync::Notify;
 
 mod application;
 mod control;
+mod election_source;
 mod group_start;
 mod lifecycle;
 mod local;
@@ -211,6 +212,7 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     listener_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     ingress_accepting: Arc<std::sync::atomic::AtomicBool>,
     fsm_factory: Arc<dyn StateMachineFactory<S>>,
+    pub(crate) election_source: Option<Arc<crate::election_source::SourceHub>>,
     leader_cbs: Arc<Mutex<Vec<LeaderCb>>>,
     snapshot_rt: Arc<SnapshotRuntime>,
     /// Standby node ids for replication throttle (shared with Router / GrpcRouter).
@@ -483,15 +485,20 @@ impl<S: StateMachine> MultiRaft<S> {
         group: GroupId,
         members: &[NodeId],
     ) -> Result<(), MultiRaftError> {
+        if self.election_source.is_some() {
+            return self
+                .startup_initialize(group, members, None)
+                .await
+                .map(|_| ());
+        }
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
-        let nodes = self.membership_nodes(members);
-        match raft.initialize(nodes).await {
+        match raft.initialize(self.membership_nodes(members)).await {
             Ok(()) => Ok(()),
             Err(RaftError::APIError(InitializeError::NotAllowed(_))) => Ok(()),
-            Err(e) => Err(MultiRaftError::Other(anyhow::anyhow!(
-                "initialize group: {e}"
+            Err(error) => Err(MultiRaftError::Other(anyhow::anyhow!(
+                "initialize group: {error}"
             ))),
         }
     }
