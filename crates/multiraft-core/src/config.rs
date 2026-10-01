@@ -78,7 +78,16 @@ pub struct ClusterConfig {
     pub role: NodeRole,
     /// Snapshot policy; see [`SnapshotMode`].
     pub snapshot_mode: SnapshotMode,
-    /// Covered native logs to retain after a checkpoint (0..=65,536).
+    /// Native snapshot send/install timeout, in milliseconds (1..=30,000).
+    /// The 200 ms default preserves legacy callers; durable image consumers can
+    /// explicitly choose a bounded larger budget independently of election timing.
+    pub install_snapshot_timeout_ms: u64,
+    /// Optional covered-log retention for Disabled/StandbyOffload native installs.
+    /// None preserves the facade's previous zero retention; Some(1000) can retain
+    /// the underlying alpha.30 default profile. NativeDurable uses retain_log_entries
+    /// exclusively and requires this override to be None.
+    pub non_durable_snapshot_log_retention: Option<u64>,
+    /// Covered native logs to retain after a checkpoint (the native full u64 range).
     pub retain_log_entries: u64,
     /// Application snapshot byte cap (1..=64 MiB), subject to stricter FSM limits.
     pub max_snapshot_bytes: usize,
@@ -133,10 +142,15 @@ pub struct ClusterConfig {
 impl ClusterConfig {
     /// Reject unsupported durable-native configurations before runtime publication.
     pub fn validate_snapshot_storage(&self) -> Result<(), &'static str> {
-        if self.retain_log_entries > 65_536
-            || self.max_snapshot_bytes == 0
-            || self.max_snapshot_bytes > 64 * 1024 * 1024
+        if self.install_snapshot_timeout_ms == 0 || self.install_snapshot_timeout_ms > 30_000 {
+            return Err("snapshot install timeout outside supported bounds");
+        }
+        if self.snapshot_mode == SnapshotMode::NativeDurable
+            && self.non_durable_snapshot_log_retention.is_some()
         {
+            return Err("snapshot log retention override outside supported profile");
+        }
+        if self.max_snapshot_bytes == 0 || self.max_snapshot_bytes > 64 * 1024 * 1024 {
             return Err("snapshot limits outside supported bounds");
         }
         if self.snapshot_mode == SnapshotMode::NativeDurable {
@@ -152,6 +166,16 @@ impl ClusterConfig {
         Ok(())
     }
 
+    /// Effective covered-log retention supplied to native snapshot installation.
+    /// NativeDurable keeps its single canonical manual-compaction retention input.
+    pub fn snapshot_log_retention(&self) -> u64 {
+        if self.snapshot_mode == SnapshotMode::NativeDurable {
+            self.retain_log_entries
+        } else {
+            self.non_durable_snapshot_log_retention.unwrap_or(0)
+        }
+    }
+
     /// Sensible defaults for local / in-process tests (memory log).
     pub fn for_test(node_id: NodeId, peer_ids: &[NodeId]) -> Self {
         let peers = peer_ids
@@ -165,6 +189,12 @@ impl ClusterConfig {
                 )
             })
             .collect();
+        Self::new(node_id, peers)
+    }
+
+    /// Construct production inputs from actual peer addresses, without synthetic
+    /// test-port arithmetic. All generic defaults are shared with for_test.
+    pub fn new(node_id: NodeId, peers: Vec<(NodeId, SocketAddr)>) -> Self {
         Self {
             node_id,
             peers,
@@ -174,6 +204,8 @@ impl ClusterConfig {
             election_timeout_max_ms: 600,
             role: NodeRole::Voter,
             snapshot_mode: SnapshotMode::Disabled,
+            install_snapshot_timeout_ms: 200,
+            non_durable_snapshot_log_retention: None,
             retain_log_entries: 1024,
             max_snapshot_bytes: 64 * 1024 * 1024,
             snapshot_keep: 2,
@@ -196,7 +228,6 @@ impl ClusterConfig {
             max_payload_entries: 0,
         }
     }
-
     /// Enable local stale queries (typically called after setting [`Self::role`]
     /// to [`NodeRole::Standby`]).
     pub fn with_stale_queries(mut self, enabled: bool) -> Self {

@@ -10,7 +10,9 @@ use std::{
 
 /// Shared snapshot catalog / ads for one MultiRaft node.
 pub(super) struct SnapshotRuntime {
-    pub(super) stopping: std::sync::atomic::AtomicBool,
+    pub(super) stopping: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) maintenance_tasks: super::tasks::OwnedTasks,
+    pub(super) sampler_budget: Arc<tokio::sync::Semaphore>,
     pub(super) operations: Mutex<
         std::collections::HashMap<multiraft_core::GroupId, Arc<super::maintenance::Operation>>,
     >,
@@ -37,7 +39,9 @@ impl SnapshotRuntime {
             None
         };
         Arc::new(Self {
-            stopping: std::sync::atomic::AtomicBool::new(false),
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            maintenance_tasks: super::tasks::OwnedTasks::default(),
+            sampler_budget: Arc::new(tokio::sync::Semaphore::new(1)),
             operations: Mutex::new(Default::default()),
             build_budget: Arc::new(tokio::sync::Semaphore::new(1)),
             catalog,

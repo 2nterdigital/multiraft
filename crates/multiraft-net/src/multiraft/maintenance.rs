@@ -1,10 +1,11 @@
-//! Disposable per-Group submission/observation, over native execution owners.
+//! Owned local native maintenance admission and canonical observations.
 use super::*;
 use crate::ObservedLogId;
-use multiraft_fsm::CaptureRefusal;
-use multiraft_store::NativeCaptureError;
-use openraft::alias::LogIdOf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::time::Instant;
+
+mod operation;
+mod status;
 
 pub const NATIVE_SNAPSHOT_COMPACTION_CONTRACT: &str = "native-snapshot-compaction-v1";
 
@@ -18,6 +19,8 @@ pub enum CompactionRejection {
     StorageFailure,
     SubmissionFailed,
     ShuttingDown,
+    /// The local submission budget expired before a native trigger was invoked.
+    Deadline,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionProgress {
@@ -50,44 +53,50 @@ pub struct LocalStorageStatus {
     pub no_purge_needed: bool,
 }
 
+impl std::fmt::Display for CompactionRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "native maintenance rejected: {self:?}")
+    }
+}
+impl std::error::Error for CompactionRejection {}
+
 pub(super) struct Operation {
-    state: Mutex<(CompactionProgress, bool)>,
-    pub(super) task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    // Task futures retain only these independent facts, never the registry owner.
+    state: Arc<Mutex<(CompactionProgress, bool)>>,
+    active: Arc<AtomicBool>,
 }
 impl Default for Operation {
     fn default() -> Self {
         Self {
-            state: Mutex::new((CompactionProgress::Idle, false)),
-            task: Mutex::new(None),
+            state: Arc::new(Mutex::new((CompactionProgress::Idle, false))),
+            active: Arc::new(AtomicBool::new(false)),
         }
-    }
-}
-fn observed(id: LogIdOf<TypeConfig>) -> ObservedLogId {
-    ObservedLogId::new(
-        id.committed_leader_id().term,
-        id.committed_leader_id().node_id,
-        id.index,
-    )
-}
-fn refused(error: NativeCaptureError) -> CompactionRejection {
-    match error {
-        NativeCaptureError::Refused(CaptureRefusal::Busy) => CompactionRejection::Busy,
-        NativeCaptureError::Refused(CaptureRefusal::SizeLimit) => CompactionRejection::SizeLimit,
-        NativeCaptureError::Refused(CaptureRefusal::Unsupported) => {
-            CompactionRejection::UnsupportedCapture
-        }
-        NativeCaptureError::Io(_) => CompactionRejection::StorageFailure,
     }
 }
 
+const OPERATION_BUDGET: Duration = Duration::from_secs(30);
+
 impl<S: StateMachine> MultiRaft<S> {
-    /// Submit one local operation. Dropping this waiter never cancels native work.
+    /// Submit one local operation. Dropping this waiter never revokes native work.
+    /// Submission is distinct from builder/provider/native/purge completion.
     pub async fn request_compaction(
         &self,
         group: GroupId,
     ) -> Result<CompactionSubmission, CompactionRejection> {
-        if self.snapshot_rt.stopping.load(Ordering::SeqCst) {
+        self.request_compaction_until(group, Instant::now() + OPERATION_BUDGET)
+            .await
+    }
+
+    pub(crate) async fn request_compaction_until(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+    ) -> Result<CompactionSubmission, CompactionRejection> {
+        if self.snapshot_rt.stopping.load(Ordering::Acquire) {
             return Err(CompactionRejection::ShuttingDown);
+        }
+        if Instant::now() >= deadline {
+            return Err(CompactionRejection::Deadline);
         }
         let (raft, sm) = self
             .groups
@@ -107,97 +116,37 @@ impl<S: StateMachine> MultiRaft<S> {
             .entry(group)
             .or_default()
             .clone();
+        if operation
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
-            let mut state = operation.state.lock().unwrap();
-            if matches!(
-                state.0,
-                CompactionProgress::Preparing | CompactionProgress::Submitted
-            ) {
-                return Err(CompactionRejection::Busy);
-            }
-            *state = (CompactionProgress::Preparing, false);
+            return Err(CompactionRejection::Busy);
         }
+        *operation.state.lock().unwrap() = (CompactionProgress::Preparing, false);
+        let terminal = operation::TerminalObservation::new(&operation);
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let task_operation = operation.clone();
+        let stopping = self.snapshot_rt.stopping.clone();
         let retain = self.config.retain_log_entries;
-        let task = tokio::spawn(async move {
-            let reservation = match sm.reserve_native_compaction().await {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    task_operation.state.lock().unwrap().0 = CompactionProgress::Idle;
-                    let _ = sender.send(Err(refused(error)));
-                    return;
-                }
-            };
-            let target = reservation.target;
-            let mut completion = reservation.completion;
-            let previous_purged = raft.metrics().borrow_watched().purged;
-            if raft.trigger().snapshot().await.is_err() {
-                sm.release_native_reservation();
-                task_operation.state.lock().unwrap().0 = CompactionProgress::Unconfirmed;
-                let _ = sender.send(Err(CompactionRejection::SubmissionFailed));
-                return;
-            }
-            task_operation.state.lock().unwrap().0 = CompactionProgress::Submitted;
-            let _ = sender.send(Ok(CompactionSubmission {
-                target: target.map(observed),
-            }));
-            loop {
-                tokio::select! {
-                    result = &mut completion => {
-                        if result.is_err() { task_operation.state.lock().unwrap().0 = CompactionProgress::Unconfirmed; return; }
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        if raft.metrics().borrow_watched().running_state.is_err() {
-                            sm.release_native_reservation();
-                            task_operation.state.lock().unwrap().0 = CompactionProgress::Unconfirmed; return;
-                        }
-                    }
-                }
-            }
-            loop {
-                let metrics = raft.metrics().borrow_watched().clone();
-                if metrics.running_state.is_err() {
-                    sm.release_native_reservation();
-                    task_operation.state.lock().unwrap().0 = CompactionProgress::Unconfirmed;
-                    return;
-                }
-                // Native positions alone (especially None/None) are not proof
-                // that a durable checkpoint exists. Verify the provider as well.
-                let durable = match sm.native_snapshot_info().await {
-                    Ok(snapshot) => snapshot,
-                    Err(_) => {
-                        task_operation.state.lock().unwrap().0 = CompactionProgress::Unconfirmed;
-                        return;
-                    }
-                };
-                if let Some(no_purge_needed) = completion_observed(
-                    target,
-                    retain,
-                    metrics.snapshot,
-                    metrics.purged,
-                    previous_purged,
-                    durable.as_ref().map(|snapshot| &snapshot.meta),
-                ) {
-                    *task_operation.state.lock().unwrap() =
-                        (CompactionProgress::CompletedObserved, no_purge_needed);
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
-        *operation.task.lock().unwrap() = Some(task);
+        if !self.snapshot_rt.maintenance_tasks.spawn(operation::run(
+            raft, sm, terminal, stopping, retain, deadline, sender,
+        )) {
+            return Err(CompactionRejection::ShuttingDown);
+        }
         receiver
             .await
             .unwrap_or(Err(CompactionRejection::SubmissionFailed))
     }
 
-    /// Sample native/provider/log facts; this does not claim health or causality.
+    /// Sample native/provider/log facts with one retained sampler per Node.
+    /// A canceled waiter does not free its slot while provider/log IO is executing.
     pub async fn local_storage_status(
         &self,
         group: GroupId,
     ) -> Result<LocalStorageStatus, CompactionRejection> {
+        if self.snapshot_rt.stopping.load(Ordering::Acquire) {
+            return Err(CompactionRejection::ShuttingDown);
+        }
         let (raft, sm) = self
             .groups
             .lock()
@@ -205,89 +154,33 @@ impl<S: StateMachine> MultiRaft<S> {
             .get(&group)
             .map(|app| (app.raft.clone(), app.state_machine.clone()))
             .ok_or(CompactionRejection::UnknownGroup)?;
-        let durable_snapshot = if self.config.snapshot_mode == SnapshotMode::NativeDurable {
-            sm.native_snapshot_info()
-                .await
-                .map_err(|_| CompactionRejection::StorageFailure)?
-                .map(|snapshot| DurableSnapshotObservation {
-                    last_log_id: snapshot.meta.last_log_id.map(observed),
-                    snapshot_id: snapshot.meta.snapshot_id,
-                    bytes: snapshot.size,
-                })
-        } else {
-            None
-        };
-        let metrics = raft.metrics().borrow_watched().clone();
-        let retained_log_bytes = if self.config.data_dir.as_os_str().is_empty() {
-            None
-        } else {
-            let dir = self.config.data_dir.join(format!("group-{group}"));
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    FileLogStoreOf::measure_retained_log_bytes(dir)
-                })
-                .await
-                .map_err(|_| CompactionRejection::StorageFailure)?
-                .map_err(|_| CompactionRejection::StorageFailure)?,
-            )
-        };
+        let permit = self
+            .snapshot_rt
+            .sampler_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CompactionRejection::Busy)?;
         let state = self
             .snapshot_rt
             .operations
             .lock()
             .unwrap()
             .get(&group)
-            .map(|op| *op.state.lock().unwrap())
-            .unwrap_or((CompactionProgress::Idle, false));
-        Ok(LocalStorageStatus {
-            group_id: group,
-            local_node_id: self.node_id,
-            mode: self.config.snapshot_mode,
-            durable_snapshot,
-            native_snapshot: metrics.snapshot.map(observed),
-            purged: metrics.purged.map(observed),
-            retained_log_bytes,
-            progress: state.0,
-            no_purge_needed: state.1,
-        })
-    }
-}
-
-fn completion_observed(
-    target: Option<LogIdOf<TypeConfig>>,
-    retain: u64,
-    native_snapshot: Option<LogIdOf<TypeConfig>>,
-    purged: Option<LogIdOf<TypeConfig>>,
-    previous_purged: Option<LogIdOf<TypeConfig>>,
-    durable_snapshot: Option<&openraft::alias::SnapshotMetaOf<TypeConfig>>,
-) -> Option<bool> {
-    let durable = durable_snapshot?;
-    if durable.last_log_id < target || native_snapshot < target {
-        return None;
-    }
-    let purge_target = target.and_then(|id| id.index.checked_sub(retain));
-    let no_purge_needed =
-        purge_target.is_none() || previous_purged.is_some_and(|id| Some(id.index) >= purge_target);
-    if purge_target.is_none() || purged.is_some_and(|id| Some(id.index) >= purge_target) {
-        Some(no_purge_needed)
-    } else {
-        None
-    }
-}
-
-#[cfg(test)]
-mod completion_tests {
-    use super::*;
-    #[test]
-    fn absent_native_positions_do_not_prove_an_empty_checkpoint_was_published() {
-        assert_eq!(
-            completion_observed(None, 1024, None, None, None, None),
-            None
-        );
-        let durable = openraft::alias::SnapshotMetaOf::<TypeConfig>::default();
-        assert_eq!(
-            completion_observed(None, 1024, None, None, None, Some(&durable)),
-            Some(true)
-        );
+            .map(|operation| operation.state.clone());
+        let directory = (!self.config.data_dir.as_os_str().is_empty())
+            .then(|| self.config.data_dir.join(format!("group-{group}")));
+        let node_id = self.node_id;
+        let mode = self.config.snapshot_mode;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if !self.snapshot_rt.maintenance_tasks.spawn(async move {
+            let _permit = permit;
+            let result = status::collect(node_id, group, mode, raft, sm, directory, state).await;
+            let _ = sender.send(result);
+        }) {
+            return Err(CompactionRejection::ShuttingDown);
+        }
+        receiver
+            .await
+            .unwrap_or(Err(CompactionRejection::StorageFailure))
     }
 }

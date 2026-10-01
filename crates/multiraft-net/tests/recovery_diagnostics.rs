@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use multiraft_core::typ::{Entry, LogId};
-use multiraft_core::{ClusterConfig, FileLogSyncLevel, TypeConfig};
+use multiraft_core::{
+    ClusterConfig, FileLogSyncLevel, MultiRaftError, NativeFailure, RecoveryFailure, RecoveryStage,
+    TypeConfig,
+};
 use multiraft_fsm::CounterFsm;
 use multiraft_net::MultiRaft;
 use multiraft_store::FileLogStoreOf;
@@ -103,11 +107,10 @@ async fn seed_purged_committed_log(group_path: &std::path::Path) {
         .expect("purge recovery fixture prefix");
 }
 
-fn assert_group_start_failure(
+fn group_start_failure_event(
     capture: &EventCapture,
     expected_directory: &str,
-    expected_cause: &str,
-) {
+) -> BTreeMap<String, String> {
     let events = capture.matching("group_start");
     let starts: Vec<_> = events
         .iter()
@@ -146,11 +149,20 @@ fn assert_group_start_failure(
             Some(expected_directory)
         );
     }
+    errors[0].clone()
+}
+
+fn assert_group_start_failure(
+    capture: &EventCapture,
+    expected_directory: &str,
+    expected_cause: &str,
+) {
+    let error = group_start_failure_event(capture, expected_directory);
     assert!(
-        errors[0]
+        error
             .get("error")
             .is_some_and(|error| error.contains(expected_cause)),
-        "group error omitted root cause {expected_cause:?}: {events:?}"
+        "group error omitted expected source summary {expected_cause:?}: {error:?}"
     );
 }
 
@@ -296,6 +308,37 @@ async fn file_group_open_failure_reports_node_group_path_and_error() {
     );
 }
 
+// Source-chain inspection belongs at the caller/test boundary, never in source logs.
+fn assert_missing_log_recovery_source(error: &MultiRaftError, expected_cause: &str) {
+    let MultiRaftError::Recovery(recovery) = error else {
+        panic!("native recovery must keep its typed public facts: {error:?}")
+    };
+    assert_eq!(recovery.group_id, 9);
+    assert_eq!(recovery.stage, RecoveryStage::Construct);
+    assert_eq!(
+        recovery.failure,
+        RecoveryFailure::Backend(NativeFailure::Storage)
+    );
+    let original = recovery
+        .source()
+        .expect("original native error remains available");
+    let native = original
+        .downcast_ref::<multiraft_core::typ::Fatal>()
+        .expect("source preserves the actual native Fatal");
+    assert!(
+        matches!(native, openraft::error::Fatal::StorageError(_)),
+        "missing logs are a native storage refusal: {native:?}"
+    );
+    let mut root = original;
+    while let Some(source) = root.source() {
+        root = source;
+    }
+    assert!(
+        root.to_string().contains(expected_cause),
+        "original missing-log root cause was lost: {root}"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn purged_log_without_persisted_fsm_reports_recovery_failure() {
     let _diagnostic_test_guard = DIAGNOSTIC_TEST_LOCK.lock().await;
@@ -319,10 +362,30 @@ async fn purged_log_without_persisted_fsm_reports_recovery_failure() {
 
     let expected_directory = group_path.display().to_string();
     let expected_cause = "Cannot re-apply logs: need logs from index 0, but purged up to";
-    assert_group_start_failure(&capture, &expected_directory, expected_cause);
+    assert_missing_log_recovery_source(&error, expected_cause);
+    let safe_summary = "group 9 recovery failed during Construct: native storage failed";
+    assert_eq!(error.to_string(), safe_summary);
+    assert!(!error.to_string().contains(expected_cause));
+    assert_group_start_failure(&capture, &expected_directory, safe_summary);
+    let failures = capture.matching("group_start");
+    let failure = failures
+        .iter()
+        .find(|event| event.get("phase").map(String::as_str) == Some("error"))
+        .expect("one terminal recovery failure");
+    assert_eq!(
+        failure.get("recovery_phase").map(String::as_str),
+        Some("construct")
+    );
+    assert_eq!(
+        failure.get("recovery_failure").map(String::as_str),
+        Some("native_storage")
+    );
+    assert_eq!(failure.get("error").map(String::as_str), Some(safe_summary));
     assert!(
-        error.to_string().contains(expected_cause),
-        "returned recovery error omitted storage root cause: {error:?}"
+        failure
+            .values()
+            .all(|value| !value.contains(expected_cause)),
+        "native source chain must not enter recovery logs: {failure:?}"
     );
 
     let open_events = capture.matching("file_log_open");
@@ -373,7 +436,11 @@ async fn failing_fsm_factory_closes_group_start_lifecycle() {
     let data_root = tempfile::tempdir().expect("temporary data root");
     let group_path = data_root.path().join("group-9");
     let expected_directory = group_path.display().to_string();
-    let expected_cause = "diagnostic factory sentinel";
+    let expected_cause = format!(
+        "factory SECRET_SENTINEL authorization Bearer diagnostic-token payload={} END_SENTINEL",
+        "private-callback-data".repeat(512)
+    );
+    let returned_cause = expected_cause.clone();
     let capture = EventCapture::default();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
@@ -381,7 +448,7 @@ async fn failing_fsm_factory_closes_group_start_lifecycle() {
     let mut config = ClusterConfig::for_test(1, &[1]);
     config.data_dir = data_root.path().to_path_buf();
     let node = MultiRaft::<CounterFsm>::start_with_factory(config, move |_| {
-        Err::<CounterFsm, anyhow::Error>(anyhow::anyhow!(expected_cause))
+        Err::<CounterFsm, anyhow::Error>(anyhow::anyhow!(returned_cause.clone()))
     })
     .await
     .expect("start node shell");
@@ -395,10 +462,28 @@ async fn failing_fsm_factory_closes_group_start_lifecycle() {
     let returned_debug = format!("{error:?}");
     assert!(
         returned_display.contains("create FSM for node 1, group 9")
-            && returned_debug.contains(expected_cause),
+            && returned_debug.contains(&expected_cause),
         "returned factory error omitted context or source chain: {returned_debug}"
     );
-    assert_group_start_failure(&capture, &expected_directory, expected_cause);
+    let failure = group_start_failure_event(&capture, &expected_directory);
+    assert_eq!(
+        failure.get("reason_code").map(String::as_str),
+        Some("application_factory_failed")
+    );
+    assert!(!failure.contains_key("error") && !failure.contains_key("error_debug"));
+    assert!(capture
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|event| event.values())
+        .all(|value| !value.contains("SECRET_SENTINEL")
+            && !value.contains("diagnostic-token")
+            && !value.contains("private-callback-data")));
+    let MultiRaftError::Other(source) = &error else {
+        panic!("original fallible factory source remains available")
+    };
+    assert_eq!(source.root_cause().to_string(), expected_cause);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

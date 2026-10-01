@@ -8,15 +8,19 @@
 //! Public orchestration facade: [`MultiRaft`] (`use multiraft_net::MultiRaft`).
 
 mod api;
+pub mod application_rpc;
 mod conn_metrics;
 mod fsm_factory;
 mod group_control;
 mod group_observation;
 mod grpc;
+mod leader_hint;
 mod multiraft;
 mod network;
 mod node;
+mod read_observation;
 mod router;
+mod runtime;
 mod snapshot_fetch;
 mod standby_throttle;
 
@@ -35,6 +39,10 @@ pub use group_control::GroupControlSample;
 pub use group_control::GroupControlSampleError;
 pub use group_control::MembershipChangeKind;
 pub use group_control::TargetQualification;
+pub use group_control::{
+    ControlContext, ControlIdentityMismatch, ControlInvocationId, ControlStage,
+    ControlSubmissionError, ControlTransferOutcome,
+};
 pub use group_observation::GroupObservation;
 pub use group_observation::GroupObservationReceiver;
 pub use group_observation::GroupServerState;
@@ -44,10 +52,12 @@ pub use group_observation::ObservedLogId;
 pub use group_observation::VoteObservation;
 pub use grpc::node_rpc;
 pub use grpc::GrpcPeerChannelError;
+pub use grpc::GrpcPeerChannelLease;
 pub use grpc::GrpcPeerChannelPool;
 pub use grpc::GrpcRouter;
 pub use grpc::GrpcServer;
 pub use multiraft::wait_for_leader;
+pub use multiraft::LocalGroupStatus;
 pub use multiraft::MultiRaft;
 pub use multiraft::SharedFabric;
 pub use multiraft::{
@@ -80,3 +90,11 @@ pub fn encode<T: Serialize>(t: T) -> Vec<u8> {
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
     bincode::deserialize(bytes).expect("raft decode")
 }
+
+pub use runtime::{
+    GroupConfig, NodeOwner, RuntimeConfig, RuntimeError, RuntimeHandle, RuntimePhase,
+    RuntimeTransport,
+};
+
+pub use leader_hint::{HintSource, LeaderHint, LeaderHintReceiver};
+pub use read_observation::{ReadEvent, ReadObserver, ReadOutcome, ReadStage, TryReadError};

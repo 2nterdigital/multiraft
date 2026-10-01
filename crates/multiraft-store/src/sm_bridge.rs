@@ -3,7 +3,9 @@
 //! Adapted from openraft `examples/sm-mem` at tag `v0.10.0-alpha.30`.
 
 mod native;
+mod release;
 pub use native::{NativeBuildReservation, NativeCaptureError, NativeSmOptions, SnapshotBuilder};
+pub use release::{StateMachineRelease, WeakStateMachineStore};
 
 use std::io;
 use std::io::Cursor;
@@ -61,10 +63,12 @@ struct StateMachineStoreInner<S: StateMachine> {
     fsm: S,
     snapshot_idx: AtomicU64,
     current_snapshot: Option<StoredSnapshot>,
+    // Fields drop in declaration order: signal only AFTER application FSM Drop.
+    _release: release::ReleaseOnDrop,
 }
 
 impl<S: StateMachine> StateMachineStoreInner<S> {
-    fn new(group_id: GroupId, fsm: S) -> Self {
+    fn new(group_id: GroupId, fsm: S, release: Arc<release::ReleaseState>) -> Self {
         Self {
             group_id,
             last_applied_log: None,
@@ -72,6 +76,7 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
             fsm,
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: None,
+            _release: release::ReleaseOnDrop(release),
         }
     }
 
@@ -88,6 +93,7 @@ pub struct StateMachineStore<S: StateMachine> {
     allow_hot_build: bool,
     catalog: Option<Arc<SnapshotCatalog>>,
     on_standby_trigger: Option<TriggerCb>,
+    release: StateMachineRelease,
 }
 
 impl<S: StateMachine> std::fmt::Debug for StateMachineStore<S> {
@@ -110,6 +116,7 @@ impl<S: StateMachine> Clone for StateMachineStore<S> {
             allow_hot_build: self.allow_hot_build,
             catalog: self.catalog.clone(),
             on_standby_trigger: self.on_standby_trigger.clone(),
+            release: self.release.clone(),
         }
     }
 }
@@ -128,14 +135,25 @@ impl<S: StateMachine> StateMachineStore<S> {
     }
 
     pub fn with_options(group_id: GroupId, fsm: S, opts: SmOptions) -> Self {
+        let released = Arc::new(release::ReleaseState::default());
         Self {
             group_id,
-            inner: Arc::new(Mutex::new(StateMachineStoreInner::new(group_id, fsm))),
+            inner: Arc::new(Mutex::new(StateMachineStoreInner::new(
+                group_id,
+                fsm,
+                released.clone(),
+            ))),
             native: None,
             allow_hot_build: opts.allow_hot_build,
             catalog: opts.catalog,
             on_standby_trigger: opts.on_standby_trigger,
+            release: StateMachineRelease { state: released },
         }
+    }
+
+    /// Observe real FSM release without retaining its resource owner.
+    pub fn release_observer(&self) -> StateMachineRelease {
+        self.release.clone()
     }
 
     pub fn group_id(&self) -> GroupId {

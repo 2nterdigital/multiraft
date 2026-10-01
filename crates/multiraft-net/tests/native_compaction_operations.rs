@@ -74,7 +74,7 @@ async fn local_compaction_observes_durable_checkpoint_and_native_purge() {
 
 #[tokio::test]
 async fn retention_zero_default_and_maximum_have_explicit_no_purge_outcomes() {
-    for retain in [0, 1024, 65536] {
+    for retain in [0, 1024, 65536, 65537, u64::MAX] {
         let root = tempfile::tempdir().unwrap();
         let mut cfg = ClusterConfig::for_test(1, &[1]);
         cfg.data_dir = root.path().into();

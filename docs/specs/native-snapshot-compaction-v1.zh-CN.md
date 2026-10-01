@@ -11,7 +11,7 @@
 NativeDurable 要求 Data 或更强的文件日志，采用手动策略。Data/All 等级在
 保存 committed 时同步已有字段，并按日志 IO 顺序落盘，避免依赖下一次写入或
 在线 peer 才能找回最后的已提交后缀。保留日志数为
-0–65536，默认 1024；应用快照字节数为 1–67108864，默认上限 64 MiB。
+原生完整 u64 范围，默认 1024；应用快照字节数为 1–67108864，默认上限 64 MiB。
 Disabled 不再继承旧的 5000 条日志自动快照策略。Standby HTTP/catalog/daisy
 恢复仍被隔离。原生传输的元数据与封装预算至多 1 MiB，快照发送和接收有明确
 并发界限；超限字节在不必要的复制与安装之前拒绝。
@@ -33,3 +33,9 @@ Unconfirmed 分开：捕获准备不是提交，trigger 返回不是完成。完
 现有失败路径。G1 必须在指定实验室验证精确后端提交、依赖锁、崩溃切点和每种
 正向恢复形态的五次运行。后端 dev 发布需要单独授权；G2 对齐精确消费者源码后
 验证真实 Meta/Message。进程崩溃结果不构成主机断电或容量/SLO 认证。
+
+
+2026-09-30 #164/#170 amendment: the user explicitly chose to preserve Ech0's
+arbitrary u64 retained-log inputs. The former 65,536 guard is expanded; native
+checked/saturating subtraction and the one canonical completion predicate remain.
+Application bytes (64 MiB maximum), metadata and concurrency bounds are unchanged.

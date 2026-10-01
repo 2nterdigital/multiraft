@@ -94,27 +94,39 @@ impl<S: StateMachine> Node<S> {
     pub async fn run(mut self) -> Option<()> {
         let groups = self.groups.clone();
         let mut workers: Vec<mpsc::Sender<NodeMessage>> = Vec::with_capacity(RPC_WORKERS);
+        let mut worker_tasks = tokio::task::JoinSet::new();
         for _ in 0..RPC_WORKERS {
             let (tx, rx) = mpsc::channel(RPC_WORKER_QUEUE);
             let groups = groups.clone();
-            tokio::spawn(async move {
+            worker_tasks.spawn(async move {
                 handle_worker(rx, groups).await;
             });
             workers.push(tx);
         }
 
         loop {
-            let msg = self.rx.next().await?;
+            let Some(msg) = self.rx.next().await else {
+                break;
+            };
             let idx = msg.group_id as usize % RPC_WORKERS;
             let worker = &mut workers[idx];
             if let Err(e) = worker.try_send(msg) {
                 if e.is_full() {
-                    worker.send(e.into_inner()).await.ok()?;
+                    if worker.send(e.into_inner()).await.is_err() {
+                        break;
+                    }
                 } else {
-                    return None;
+                    break;
                 }
             }
         }
+        drop(workers);
+        while let Some(result) = worker_tasks.join_next().await {
+            if result.is_err() {
+                return None;
+            }
+        }
+        Some(())
     }
 }
 
@@ -131,10 +143,10 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
         response_tx,
     } = msg;
 
-    let (raft, snapshot_cap) = {
+    let (raft, state_machine) = {
         let g = groups.lock().unwrap();
         match g.get(&group_id) {
-            Some(app) => (app.raft.clone(), app.state_machine.snapshot_byte_limit()),
+            Some(app) => (app.raft.clone(), app.state_machine.clone()),
             None => {
                 let _ = response_tx.send(RaftReply::MissingGroup);
                 return;
@@ -146,6 +158,7 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
         RaftCall::Vote(req) => RaftReply::Vote(raft.vote(req).await),
         RaftCall::Append(req) => RaftReply::Append(raft.append_entries(req).await),
         RaftCall::Snapshot { vote, meta, data } => {
+            let snapshot_cap = state_machine.snapshot_byte_limit();
             if data.len() > snapshot_cap
                 || bincode::serialized_size(&(vote, &meta, &data))
                     .map_or(true, |size| size > (snapshot_cap + 1024 * 1024) as u64)
@@ -163,6 +176,7 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
                 .install_full_snapshot(vote, snapshot)
                 .await
                 .map_err(RaftError::<Infallible>::Fatal);
+            state_machine.wait_native_quiescent().await;
             RaftReply::Snapshot(res)
         }
         RaftCall::Transfer(req) => {

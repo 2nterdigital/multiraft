@@ -128,7 +128,7 @@ pub enum LocalMembershipRole {
     NotMember,
 }
 
-/// Normalized active local Raft server state.
+/// Normalized local Raft state. Active observation streams close on Shutdown.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupServerState {
@@ -140,6 +140,8 @@ pub enum GroupServerState {
     Candidate,
     /// Leader state.
     Leader,
+    /// Native shutdown state, available in point-in-time local diagnostics.
+    Shutdown,
 }
 
 /// Receiver for latest-value group observations.
@@ -211,12 +213,19 @@ pub(crate) fn normalize_server_state(
     group_id: GroupId,
     state: openraft::ServerState,
 ) -> Result<GroupServerState, ObservationClosed> {
+    match project_server_state(state) {
+        GroupServerState::Shutdown => Err(ObservationClosed::new(group_id)),
+        active => Ok(active),
+    }
+}
+
+pub(crate) fn project_server_state(state: openraft::ServerState) -> GroupServerState {
     match state {
-        openraft::ServerState::Learner => Ok(GroupServerState::Learner),
-        openraft::ServerState::Follower => Ok(GroupServerState::Follower),
-        openraft::ServerState::Candidate => Ok(GroupServerState::Candidate),
-        openraft::ServerState::Leader => Ok(GroupServerState::Leader),
-        openraft::ServerState::Shutdown => Err(ObservationClosed::new(group_id)),
+        openraft::ServerState::Learner => GroupServerState::Learner,
+        openraft::ServerState::Follower => GroupServerState::Follower,
+        openraft::ServerState::Candidate => GroupServerState::Candidate,
+        openraft::ServerState::Leader => GroupServerState::Leader,
+        openraft::ServerState::Shutdown => GroupServerState::Shutdown,
     }
 }
 

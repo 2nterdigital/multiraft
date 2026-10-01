@@ -31,8 +31,9 @@ impl FsmFactoryContext {
 /// machine must own its per-group resources and release them safely when
 /// dropped.
 ///
-/// Until group lifecycle serialization exists, callers must serialize
-/// same-key `create_group` calls; concurrent same-key creation is unsupported.
+/// The owned [`crate::RuntimeHandle`] serializes Group construction. Legacy
+/// [`crate::MultiRaft`] callers must serialize same-key `create_group` calls;
+/// concurrent same-key creation through that low-level facade is unsupported.
 pub trait StateMachineFactory<S>: Send + Sync + 'static
 where
     S: StateMachine,
@@ -43,6 +44,21 @@ where
     ///
     /// Returns an error when the state machine cannot be constructed.
     fn create(&self, context: FsmFactoryContext) -> anyhow::Result<S>;
+
+    /// Validate the local application image after native recovery reaches the
+    /// persisted commit point, before the owned runtime admits Group requests.
+    ///
+    /// The consumer owns all validation rules. This bounded synchronous callback
+    /// runs under the FSM lock and receives no native Raft capability. It is a
+    /// local recovery check, not leadership confirmation or a cluster-wide read.
+    /// New empty Groups are validated as well. Returning an error (or panicking)
+    /// fences the node; retained cleanup stops its Groups/listener and waits for
+    /// actual FSM destruction before successful rollback completes. A later node
+    /// start may retry the same key. Idempotently ensuring an already-ready Group
+    /// does not repeat validation. The default accepts the recovered image.
+    fn validate_recovered(&self, _context: FsmFactoryContext, _fsm: &S) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl<S, F> StateMachineFactory<S> for F

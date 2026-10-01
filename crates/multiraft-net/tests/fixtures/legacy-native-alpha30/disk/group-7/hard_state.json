@@ -1,0 +1,1 @@
+{"last_purged_log_id":{"leader_id":{"term":1,"node_id":1},"index":9},"committed":{"leader_id":{"term":1,"node_id":1},"index":12},"vote":{"leader_id":{"term":1,"node_id":1},"committed":true}}
