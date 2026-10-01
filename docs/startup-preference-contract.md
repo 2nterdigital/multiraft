@@ -6,7 +6,7 @@ The new capability is opt-in and business neutral. It atomically admits a startu
 
 Each Group deadline begins at its own registration completion. The Ech0 contract uses Cg+10s, charging subsequent constructors, preference grace, initialize and native wait; application validation remains afterward. Explicit 500ms grace is the first candidate. Existing single-Group native-wait and absolute-deadline APIs retain their contracts.
 
-Accepted work and cleanup belong to the existing owner through waiter cancellation, Drop and shutdown. Public outcomes preserve phase, raw initialization disposition, dispatch uncertainty and actual resource release; initialization replies do not prove quorum/commit or later leader causality. Independent public consumers validate failures and cancellation without production test probes.
+Accepted work and cleanup belong to the existing owner through waiter cancellation, Drop and shutdown. Public outcomes preserve phase, raw initialization disposition (including the exact optional native last-log identity and vote on `NotAllowed`), dispatch uncertainty and actual resource release; initialization replies do not prove quorum/commit or later leader causality. Independent public consumers validate failures and cancellation without production test probes.
 
 Formal comparative runs remain separately authorized. This implementation does not change Ech0's default balancing or write retry contracts.
 
