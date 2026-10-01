@@ -8,7 +8,7 @@ Admission reserves the empty owner atomically. Both a retained batch and an admi
 
 For each Group, `Cg` is captured at native registry insertion and `Dg=Cg+recovery_timeout`. Checks before/after subsequent constructors and every policy boundary preserve that anchor. `B` is the last native registration instant; nonpreferred grace ends at `min(B+grace,Dg)`. An expired deadline wins over fallback. Application validation remains after native waiting and outside this budget. A blocked synchronous consumer callback cannot be preempted; its lease stays owned until it actually returns. `Registered` is a truthful failure phase when a later constructor consumes an earlier Group's deadline, before preference dispatch.
 
-Provider provenance is inspected before the constructor or migration can write native namespaces. File-log inspection uses the existing hard-state/bin/NDJSON/legacy parsers and validates every present format, including a format the normal loader would not select. Recognized empty native records can prove `Pristine`; any historical vote/log/purge/commit proves `Persisted`. Snapshot inspection reuses provider metadata/data checksum parsers. An active snapshot proves persisted state even with no applied log basis. Fully validated inactive generations remain inert and can participate in empty provenance; they are never activated or deleted. Unknown names, symlinks, malformed or incomplete unsupported namespaces fail closed. This opt-in rejection surface is deliberately stricter than legacy loading, including unproven staging remnants.
+Provider provenance is inspected before the constructor or migration can write native namespaces. File-log inspection keeps the existing bin/NDJSON/legacy parsers and validates every present format, including a format the normal loader would not select. Hard-state provenance has a strict read-only wrapper around native deserialization: only a JSON object is supported, unknown fields (including nested native vote/log fields) and duplicate known fields are refused from the original bytes. Known optional defaults remain valid; legacy open/load decoding is unchanged. Recognized empty native records can prove `Pristine`; any historical vote/log/purge/commit proves `Persisted`. Snapshot inspection reuses provider metadata/data checksum parsers. An active snapshot proves persisted state even with no applied log basis. Fully validated inactive generations remain inert and can participate in empty provenance; they are never activated or deleted. Unknown names, symlinks, malformed or incomplete unsupported namespaces fail closed. This opt-in rejection surface is deliberately stricter than legacy loading, including unproven staging remnants.
 
 A pristine provider result alone does not grant initialization: the live native `is_initialized` check is required immediately before one initialize call. Received vote/log/membership/snapshot state exits grace or makes native initialize reject atomically. Persisted Groups skip preference and initialize entirely. `InitOk` is the native local IO-conditioned reply; it does not prove quorum, commitment, a campaign result or a desired leader layout. `NotAllowed { last_log_id, vote }`, `NotDispatched` and `Unknown` remain distinct. The refusal preserves the native optional full log identity (term/Node/index) and vote (term/Node/committed), including an absent last log; it never infers them from later metrics. There are no added election inputs, transfers, retries, all-peer barriers or quorum publication gates.
 
@@ -41,11 +41,17 @@ Commands run with `CARGO_TARGET_DIR` and `TMPDIR` under the active checkout's `.
 
 ## Source-qualified validation after review
 
-The original feature freeze is `78cb4f66f795e3c6f2d76acca3d52c9b3e8f781d`; its retained receipts contain 143 unique passing cases across core/net/store (overlapping suite reruns are counted once). The repaired source consumed by Ech0 is `435d371483c978afd091e682a5eee21b08621b7e`. It adds raw native refusal DTO fidelity and scalar source events, without changing startup policy, election inputs or disk formats.
+The original feature freeze is `78cb4f66f795e3c6f2d76acca3d52c9b3e8f781d`; its retained receipts contain 143 unique passing cases across core/net/store (overlapping suite reruns are counted once). The first reviewed source consumed by Ech0 was `435d371483c978afd091e682a5eee21b08621b7e`. It adds raw native refusal DTO fidelity and scalar source events, without changing startup policy, election inputs or disk formats.
 
 At the repaired source, `owned_startup_native_rejection` (1), `owned_startup_preference` (15) and `owned_startup_source_uncertainty` (2) pass: 18 cases, retained in `.tmp/issue-194/review-repair/tests-2.log`. Affected core/store/net all-target check and strict Clippy pass (`check-final.log`, `clippy.log`); format passes (`fmt-final.log`). The failed earlier `check-2.log` remains retained and is not a passing receipt. The earlier refusal assertion failure remains retained: a native refusal can truthfully have a vote and no last log, so the public oracle now preserves and accepts that native absence. These 18 rerun cases are not added to the original 143 as new unique tests.
 
 Ech0 separately exercises the real production JSONL collector, including canceled caller work, and actual old-binary rollback on candidate-written original roots. Those consumer receipts belong to [Ech0 #193](https://github.com/2nterdigital/ech0-delivery/pull/197), not a library cohort-compatibility or performance claim.
+
+## Subsequent public review repairs (2026-10-01)
+
+A public reviewer reproduced a false `Pristine` result when an otherwise empty hard-state record contained an unknown future field, followed by initialization overwriting that field. Source `0e4a6b1f8796dd268879a3bb24e3301634344f76` fixes opt-in qualification with strict original-byte deserialization; legacy open/load remains unchanged. Public provider tests reject unknown root/nested fields, duplicate known fields and a non-object record without changing bytes. The public batch consumer additionally confirms Construct refusal, `NotDispatched`, no factory invocation and real lease/listener reuse. Known optional defaults and recognized old vote/recovery remain supported.
+
+The new provider protection assertion first failed with `Ok(Pristine)` (`red-store.log`). At the repaired source, provider7/7 and public preference15/15 pass (`green-library.log`); these include two new provider cases and expanded inputs to an existing batch case, not 22 new unique cases. Store/net all-target check and strict Clippy pass (`check-library.log`, `clippy-library.log`), and workspace format passes. These logs are under `.tmp/issue-194/p2-repair/`. No native disk writer/format, election input or timing policy changed. Prior143/18-case receipts above retain their original source qualifications; actual old-binary evidence remains scoped to its earlier artifacts.
 
 ## Changed Rust line counts
 
@@ -70,11 +76,11 @@ The pre-existing 1114-line file-log module was split by behavior before new prov
 | crates/multiraft-net/src/runtime/startup/operation.rs | 237 |
 | crates/multiraft-net/tests/owned_startup_lifecycle.rs | 327 |
 | crates/multiraft-net/tests/owned_startup_native_rejection.rs | 137 |
-| crates/multiraft-net/tests/owned_startup_preference.rs | 705 |
+| crates/multiraft-net/tests/owned_startup_preference.rs | 710 |
 | crates/multiraft-net/tests/owned_startup_source_uncertainty.rs | 164 |
 | crates/multiraft-net/tests/startup_support/mod.rs | 247 |
 | crates/multiraft-store/src/log_file.rs | 850 |
-| crates/multiraft-store/src/log_file/recovery.rs | 180 |
+| crates/multiraft-store/src/log_file/recovery.rs | 208 |
 | crates/multiraft-store/src/log_file/storage.rs | 146 |
 | crates/multiraft-store/src/snapshot_catalog/native.rs | 484 |
-| crates/multiraft-store/tests/startup_provenance.rs | 100 |
+| crates/multiraft-store/tests/startup_provenance.rs | 137 |
