@@ -9,3 +9,5 @@ Each Group deadline begins at its own registration completion. The Ech0 contract
 Accepted work and cleanup belong to the existing owner through waiter cancellation, Drop and shutdown. Public outcomes preserve phase, raw initialization disposition, dispatch uncertainty and actual resource release; initialization replies do not prove quorum/commit or later leader causality. Independent public consumers validate failures and cancellation without production test probes.
 
 Formal comparative runs remain separately authorized. This implementation does not change Ech0's default balancing or write retry contracts.
+
+The implemented public API, provenance/rejection details and independent consumer evidence are recorded in [the implementation receipt](startup-preference-implementation.md). Grace is anchored at complete batch registration B; each budget remains anchored at its own Group registration Cg. Caller-supplied digest correlation is opaque and never a cohort verification claim.

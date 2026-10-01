@@ -98,3 +98,8 @@ pub use runtime::{
 
 pub use leader_hint::{HintSource, LeaderHint, LeaderHintReceiver};
 pub use read_observation::{ReadEvent, ReadObserver, ReadOutcome, ReadStage, TryReadError};
+
+pub use runtime::{
+    GroupStartupReport, InitializeDisposition, StartupBatch, StartupCleanup, StartupFailure,
+    StartupGroup, StartupPhase, StartupRejection, StartupReport,
+};

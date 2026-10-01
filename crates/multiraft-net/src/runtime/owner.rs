@@ -80,6 +80,7 @@ impl<S: StateMachine> NodeOwner<S> {
                 ready: Mutex::new(BTreeSet::new()),
                 group_creation: tokio::sync::Mutex::new(()),
                 startups: OwnedTasks::default(),
+                startup_admission: Mutex::new(startup::StartupAdmission::default()),
                 cleanup_started: AtomicBool::new(false),
                 completed,
                 abort_requests,

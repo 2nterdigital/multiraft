@@ -94,6 +94,7 @@ mod control;
 mod group_start;
 mod lifecycle;
 mod local;
+mod startup;
 pub use local::LocalGroupStatus;
 mod maintenance;
 mod membership;

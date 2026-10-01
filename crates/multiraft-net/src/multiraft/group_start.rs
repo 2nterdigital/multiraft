@@ -2,7 +2,10 @@
 use super::*;
 
 impl<S: StateMachine> MultiRaft<S> {
-    pub(super) async fn spawn_local_group(&self, group: GroupId) -> Result<(), MultiRaftError> {
+    pub(super) async fn spawn_local_group(
+        &self,
+        group: GroupId,
+    ) -> Result<tokio::time::Instant, MultiRaftError> {
         // Every admitted mode is manual-only. Native protocol snapshots still
         // use the configured provider; Disabled has no legacy 5000-log policy.
         let snapshot_policy = openraft::SnapshotPolicy::Never;
@@ -80,7 +83,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 error_debug = ?error,
                 "rejected invalid OpenRaft group configuration"
             );
-            MultiRaftError::Other(anyhow::anyhow!(error.to_string()))
+            MultiRaftError::Other(error.into())
         })?);
 
         let context = FsmFactoryContext {
@@ -235,12 +238,11 @@ impl<S: StateMachine> MultiRaft<S> {
                             error_debug = ?error,
                             "failed to open file-backed Raft log"
                         );
-                        MultiRaftError::Other(anyhow::anyhow!(
+                        let message = format!(
                             "open file log for node {}, group {} at {}: {error}",
-                            self.node_id,
-                            group,
-                            dir.display()
-                        ))
+                            self.node_id, group, dir.display()
+                        );
+                        MultiRaftError::Other(anyhow::Error::new(error).context(message))
                     })?;
                     if recovery::durable_local_mode(&self.config) {
                         durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
@@ -293,12 +295,11 @@ impl<S: StateMachine> MultiRaft<S> {
                             error_debug = ?error,
                             "failed to open file-backed Raft log"
                         );
-                        MultiRaftError::Other(anyhow::anyhow!(
+                        let message = format!(
                             "open file log for node {}, group {} at {}: {error}",
-                            self.node_id,
-                            group,
-                            dir.display()
-                        ))
+                            self.node_id, group, dir.display()
+                        );
+                        MultiRaftError::Other(anyhow::Error::new(error).context(message))
                     })?;
                     if recovery::durable_local_mode(&self.config) {
                         durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
@@ -333,6 +334,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 .unwrap()
                 .insert(group, target);
         }
+        let registered_at;
         {
             let mut g = self.groups.lock().unwrap();
             g.insert(
@@ -344,6 +346,7 @@ impl<S: StateMachine> MultiRaft<S> {
                     state_machine: state_machine_store,
                 },
             );
+            registered_at = tokio::time::Instant::now();
         }
 
         self.spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
@@ -359,7 +362,7 @@ impl<S: StateMachine> MultiRaft<S> {
             directory = %group_directory.display(),
             "published local Raft group"
         );
-        Ok(())
+        Ok(registered_at)
     }
 
     pub(super) fn membership_nodes(&self, members: &[NodeId]) -> BTreeMap<NodeId, BasicNode> {

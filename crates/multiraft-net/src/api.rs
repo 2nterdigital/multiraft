@@ -24,6 +24,8 @@ pub async fn append<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
     encode(res)
 }
 
+// tonic requires this concrete status type at the protocol boundary.
+#[allow(clippy::result_large_err)]
 pub async fn snapshot<S: StateMachine>(
     raft: &Raft<S>,
     req: &[u8],

@@ -7,10 +7,13 @@ mod channel_pool;
 pub mod router;
 pub mod server;
 
+// Generated tonic signatures return their required concrete Status.
+#[allow(clippy::result_large_err)]
 pub mod proto {
     tonic::include_proto!("multiraft");
 }
 
+#[allow(clippy::result_large_err)]
 pub mod node_rpc {
     tonic::include_proto!("multiraft.node_rpc");
 }

@@ -123,6 +123,8 @@ impl<S: StateMachine + 'static> RaftService for RaftServiceImpl<S> {
     }
 }
 
+// Preserve the tonic service signature instead of boxing its wire status.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn demux_raft_call<S: StateMachine>(
     groups: &GroupMap<S>,
     req: RaftRequest,

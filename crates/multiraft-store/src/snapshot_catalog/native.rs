@@ -103,6 +103,82 @@ fn validate_meta(meta: &SnapshotMetaOf<TypeConfig>) -> io::Result<()> {
 }
 
 impl SnapshotCatalog {
+    /// Validate the complete Group snapshot namespace before native construction.
+    /// Fully validated inactive generations remain inert; unknown/incomplete
+    /// namespaces fail closed and are never promoted to recovery authority.
+    pub fn startup_provenance(
+        &self,
+        group: GroupId,
+        max_bytes: usize,
+    ) -> io::Result<multiraft_core::StartupProvenance> {
+        use multiraft_core::StartupProvenance;
+        self.validate_native_paths(group)?;
+        let group_root = self.root.join(group.to_string());
+        let entries = match fs::read_dir(&group_root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok(StartupProvenance::Pristine)
+            }
+            Err(e) => return Err(e),
+        };
+        let mut persisted = false;
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name() != "native-v1" || !entry.file_type()?.is_dir() {
+                return Err(invalid("unrecognized native snapshot namespace"));
+            }
+            for native in fs::read_dir(entry.path())? {
+                let native = native?;
+                let name = native.file_name();
+                let name = name
+                    .to_str()
+                    .ok_or_else(|| invalid("unknown native snapshot name"))?;
+                if name == "active.json" && native.file_type()?.is_file() {
+                    continue;
+                }
+                if name == "active.pending" && native.file_type()?.is_file() {
+                    let pending: Active =
+                        serde_json::from_slice(&bounded_read(&native.path(), META_LIMIT)?)
+                            .map_err(io::Error::other)?;
+                    self.read_native_generation(group, max_bytes, &entry.path(), &pending)?;
+                    continue;
+                }
+                if !native.file_type()?.is_dir()
+                    || name.len() != 64
+                    || !name.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Err(invalid("unrecognized native snapshot namespace"));
+                }
+                for file in fs::read_dir(native.path())? {
+                    let file = file?;
+                    if !file.file_type()?.is_file()
+                        || !matches!(
+                            file.file_name().to_str(),
+                            Some("data.bin" | "native-meta.json")
+                        )
+                    {
+                        return Err(invalid("unrecognized native snapshot generation namespace"));
+                    }
+                }
+                let metadata = bounded_read(&native.path().join("native-meta.json"), META_LIMIT)?;
+                let candidate = Active {
+                    version: VERSION,
+                    group,
+                    generation: name.to_owned(),
+                    metadata_sha256: hex_sha256(&metadata),
+                };
+                self.read_native_generation(group, max_bytes, &entry.path(), &candidate)?;
+            }
+            let info = self.describe_native(group, max_bytes)?;
+            persisted |= info.is_some();
+        }
+        Ok(if persisted {
+            StartupProvenance::Persisted
+        } else {
+            StartupProvenance::Pristine
+        })
+    }
+
     fn native_root(&self, group: GroupId) -> PathBuf {
         self.root.join(group.to_string()).join("native-v1")
     }

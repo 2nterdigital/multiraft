@@ -12,6 +12,11 @@ mod owner;
 mod read;
 mod recovery;
 mod requests;
+pub(crate) mod startup;
+pub use startup::{
+    GroupStartupReport, InitializeDisposition, StartupBatch, StartupCleanup, StartupFailure,
+    StartupGroup, StartupPhase, StartupRejection, StartupReport,
+};
 
 use crate::multiraft::tasks::OwnedTasks;
 use crate::{MultiRaft, SharedFabric};
@@ -161,6 +166,7 @@ pub(super) struct RuntimeShared<S: StateMachine> {
     pub(super) ready: Mutex<BTreeSet<GroupId>>,
     pub(super) group_creation: tokio::sync::Mutex<()>,
     pub(super) startups: OwnedTasks,
+    startup_admission: Mutex<startup::StartupAdmission>,
     cleanup_started: AtomicBool,
     completed: watch::Sender<Option<Result<(), Arc<RuntimeError>>>>,
     abort_requests: watch::Sender<bool>,
