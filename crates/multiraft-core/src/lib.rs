@@ -8,6 +8,10 @@ mod config;
 mod error;
 mod multiraft;
 mod snapshot;
+mod startup;
+pub use startup::{
+    InitializationLogId, InitializationVote, InitializeDisposition, StartupProvenance,
+};
 mod type_config;
 
 pub use config::ClusterConfig;

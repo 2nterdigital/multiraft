@@ -101,11 +101,13 @@ impl<S: StateMachine> RuntimeHandle<S> {
         timing: StartupTiming,
     ) -> Result<(), RuntimeError> {
         let shared = admitted.shared.clone();
+        let reservation = shared.reserve_legacy()?;
         let (reply, receiver) = oneshot::channel();
         let task_shared = shared.clone();
         let registered = shared.startups.spawn(async move {
             let shared = task_shared;
             let _admitted = admitted;
+            let _reservation = reservation;
             let _serialized = shared.group_creation.lock().await;
             let result = std::panic::AssertUnwindSafe(shared.recover_group(group, timing))
                 .catch_unwind()
