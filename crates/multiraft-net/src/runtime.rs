@@ -5,6 +5,7 @@
 //! No operation exposes native Raft handles. Commands and effects stay opaque.
 
 mod control;
+mod election_source;
 mod local;
 mod maintenance;
 mod observation;
@@ -166,6 +167,7 @@ pub(super) struct RuntimeShared<S: StateMachine> {
     pub(super) ready: Mutex<BTreeSet<GroupId>>,
     pub(super) group_creation: tokio::sync::Mutex<()>,
     pub(super) startups: OwnedTasks,
+    source_jobs: OwnedTasks,
     startup_admission: Mutex<startup::StartupAdmission>,
     cleanup_started: AtomicBool,
     completed: watch::Sender<Option<Result<(), Arc<RuntimeError>>>>,
