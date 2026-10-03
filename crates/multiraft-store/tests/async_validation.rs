@@ -1,6 +1,7 @@
 //! Consumer-owned asynchronous proof, tested through the public native store seam.
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,18 +12,25 @@ use multiraft_fsm::{
     ApplyOut, CaptureError, CounterFsm, GroupId, StateMachine, ValidationContext, ValidationFuture,
     ValidationKind,
 };
-use multiraft_store::{NativeSmOptions, SnapshotCatalog, StateMachineStore, ValidationOptions};
+use multiraft_store::{
+    NativeSmOptions, SmOptions, SnapshotCatalog, StateMachineStore, ValidationOptions,
+};
 use openraft::alias::{LeaderIdOf, SnapshotOf};
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderIdExt;
 use openraft::{EntryPayload, RaftSnapshotBuilder};
 use tokio::sync::{Notify, Semaphore};
 
+type ReadyAction = Box<dyn FnOnce() + Send>;
+
 #[derive(Clone, Default)]
 struct Proof {
     entered: Arc<Notify>,
     release: Arc<Notify>,
     inputs: Arc<Mutex<Vec<(ValidationContext, i64)>>>,
+    before_ready: Arc<Mutex<Option<ReadyAction>>>,
+    reject_ready: Arc<AtomicBool>,
+    ready_calls: Arc<AtomicUsize>,
     reject: bool,
     panic: bool,
     lease_root: PathBuf,
@@ -77,13 +85,22 @@ impl StateMachine for CheckedCounter {
             Ok(())
         }))
     }
-    fn recovery_validated(&mut self, _: ValidationContext) -> Result<(), Self::Error> {
+    fn recovery_validated(&mut self, context: ValidationContext) -> Result<(), Self::Error> {
+        self.proof.ready_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(action) = self.proof.before_ready.lock().unwrap().take() {
+            action();
+        }
+        if self.proof.reject_ready.load(Ordering::SeqCst) {
+            // Produce the consumer's existing error through its public decoder.
+            self.counter.restore(context.group_id, &[])?;
+            unreachable!("empty image must reject");
+        }
         self.ready = true;
         Ok(())
     }
 }
 fn scratch() -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/issue-4/store-tests");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/issue-4-review/store-tests");
     std::fs::create_dir_all(&root).unwrap();
     tempfile::tempdir_in(root).unwrap()
 }
@@ -530,4 +547,250 @@ async fn default_consumer_does_not_wait_for_external_validator_admission() {
         .unwrap();
     assert_eq!(store.try_with_fsm(|fsm| fsm.value(7)).await.unwrap(), 9);
     assert_eq!(budget.available_permits(), 0);
+}
+
+#[tokio::test]
+async fn rejecting_readiness_preserves_native_and_legacy_authority_and_applied_state() {
+    for native in [true, false] {
+        let disk = scratch();
+        let leases = scratch();
+        let proof = Proof {
+            lease_root: leases.path().to_owned(),
+            ..Proof::default()
+        };
+        let catalog = Arc::new(SnapshotCatalog::new(disk.path(), 1));
+        let mut store = if native {
+            receiver(
+                disk.path(),
+                proof.clone(),
+                Arc::new(Semaphore::new(1)),
+                Duration::from_secs(3),
+            )
+        } else {
+            StateMachineStore::with_options(
+                7,
+                CheckedCounter {
+                    counter: CounterFsm::new(),
+                    proof: proof.clone(),
+                    ready: false,
+                },
+                SmOptions {
+                    allow_hot_build: true,
+                    catalog: Some(catalog.clone()),
+                    on_standby_trigger: None,
+                },
+            )
+        };
+        let old = image(scratch().path(), 5).await;
+        let old_meta = old.meta.clone();
+        let old_bytes = old.snapshot.get_ref().clone();
+        proof.release.notify_one();
+        store
+            .install_snapshot(&old.meta, old.snapshot)
+            .await
+            .unwrap();
+        let applied = store.applied_state().await.unwrap();
+        let authority = if native {
+            Some(std::fs::read(disk.path().join("7/native-v1/active.json")).unwrap())
+        } else {
+            None
+        };
+        proof.reject_ready.store(true, Ordering::SeqCst);
+        let mut candidate = source(scratch().path());
+        candidate
+            .apply(stream::iter([
+                Ok((entry(0, None), None)),
+                Ok((entry(1, Some(5)), None)),
+                Ok((entry(2, Some(4)), None)),
+            ]))
+            .await
+            .unwrap();
+        let candidate = candidate
+            .try_create_snapshot_builder(false)
+            .await
+            .unwrap()
+            .build_snapshot()
+            .await
+            .unwrap();
+        proof.release.notify_one();
+        assert!(store
+            .install_snapshot(&candidate.meta, candidate.snapshot)
+            .await
+            .is_err());
+        assert_eq!(
+            proof.ready_calls.load(Ordering::SeqCst),
+            2,
+            "proof passed before hook rejected"
+        );
+        assert_eq!(proof.inputs.lock().unwrap()[1].1, 9);
+        assert_eq!(store.applied_state().await.unwrap(), applied);
+        assert!(store.application_ready().is_err());
+        assert!(store.try_with_fsm(|fsm| fsm.ready).await.is_err());
+        if let Some(mut builder) = store.try_create_snapshot_builder(false).await {
+            assert!(builder.build_snapshot().await.is_err());
+        }
+        assert!(store
+            .apply(stream::iter([Ok((entry(2, Some(7)), None))]))
+            .await
+            .is_err());
+        if native {
+            store.wait_native_quiescent().await;
+            assert_eq!(
+                std::fs::read(disk.path().join("7/native-v1/active.json")).unwrap(),
+                authority.unwrap()
+            );
+            assert_eq!(
+                store.native_snapshot_info().await.unwrap().unwrap().meta,
+                old_meta
+            );
+            let restored = catalog.load_native(7, 1024).unwrap().unwrap();
+            assert_eq!(restored.meta, old_meta);
+            assert_eq!(restored.data, old_bytes);
+            assert_eq!(generation_dirs(disk.path()), 1);
+        } else {
+            assert_eq!(
+                catalog.latest(7).unwrap().unwrap().snapshot_id,
+                old_meta.snapshot_id
+            );
+            assert_eq!(
+                catalog.read(7, &old_meta.snapshot_id).unwrap().unwrap(),
+                old_bytes
+            );
+        }
+        assert_no_leases(leases.path());
+    }
+}
+
+#[tokio::test]
+async fn pending_startup_defers_new_peer_image_without_changing_recovery_generation() {
+    let disk = scratch();
+    let old = image(disk.path(), 5).await;
+    let leases = scratch();
+    let proof = Proof {
+        lease_root: leases.path().to_owned(),
+        ..Proof::default()
+    };
+    let mut store = receiver(
+        disk.path(),
+        proof.clone(),
+        Arc::new(Semaphore::new(1)),
+        Duration::from_secs(3),
+    );
+    store.begin_recovery_validation();
+    store
+        .install_snapshot(&old.meta, old.snapshot)
+        .await
+        .unwrap();
+    store
+        .apply(stream::iter([Ok((entry(2, Some(3)), None))]))
+        .await
+        .unwrap();
+    let applied = store.applied_state().await.unwrap();
+    let provider = store.native_snapshot_info().await.unwrap().unwrap();
+    let authority = std::fs::read(disk.path().join("7/native-v1/active.json")).unwrap();
+    let candidate = image(scratch().path(), 99).await;
+    assert_eq!(
+        store
+            .install_snapshot(&candidate.meta, candidate.snapshot)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(proof.inputs.lock().unwrap().is_empty());
+    assert_eq!(store.applied_state().await.unwrap(), applied);
+    assert_eq!(
+        store.native_snapshot_info().await.unwrap().unwrap().meta,
+        provider.meta
+    );
+    assert_eq!(
+        std::fs::read(disk.path().join("7/native-v1/active.json")).unwrap(),
+        authority
+    );
+    let validating = store.clone();
+    let validation = tokio::spawn(async move {
+        validating
+            .validate_recovery(|fsm| {
+                assert_eq!(fsm.counter.value(7), 8);
+                assert!(!fsm.ready);
+                Ok(())
+            })
+            .await
+    });
+    entered(&proof).await;
+    let inputs = proof.inputs.lock().unwrap().clone();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].0.kind, ValidationKind::Startup);
+    assert_eq!(
+        inputs[0].0.generation, 2,
+        "only existing load and suffix mutate generation"
+    );
+    assert_eq!(inputs[0].0.applied, Some((2, 1)));
+    assert_eq!(inputs[0].1, 8);
+    proof.release.notify_one();
+    validation.await.unwrap().unwrap();
+    assert_eq!(
+        store
+            .try_with_fsm(|fsm| (fsm.counter.value(7), fsm.ready))
+            .await
+            .unwrap(),
+        (8, true)
+    );
+    assert_no_leases(leases.path());
+}
+
+#[tokio::test]
+async fn readiness_hook_cannot_publish_after_it_closes_the_owner() {
+    for startup in [false, true] {
+        let disk = scratch();
+        let old = image(disk.path(), 5).await;
+        let authority = std::fs::read(disk.path().join("7/native-v1/active.json")).unwrap();
+        let leases = scratch();
+        let proof = Proof {
+            lease_root: leases.path().to_owned(),
+            ..Proof::default()
+        };
+        let mut store = receiver(
+            disk.path(),
+            proof.clone(),
+            Arc::new(Semaphore::new(1)),
+            Duration::from_secs(3),
+        );
+        store.begin_recovery_validation();
+        store
+            .install_snapshot(&old.meta, old.snapshot)
+            .await
+            .unwrap();
+        proof.release.notify_one();
+        store.validate_recovery(|_| Ok(())).await.unwrap();
+        let applied = store.applied_state().await.unwrap();
+        let closing = store.clone();
+        *proof.before_ready.lock().unwrap() = Some(Box::new(move || {
+            assert!(
+                closing.application_ready().is_err(),
+                "marker preparation stays gated"
+            );
+            closing.close_native_intake();
+        }));
+        proof.release.notify_one();
+        let result = if startup {
+            store.begin_recovery_validation();
+            store.validate_recovery(|_| Ok(())).await
+        } else {
+            let candidate = image(scratch().path(), 9).await;
+            store
+                .install_snapshot(&candidate.meta, candidate.snapshot)
+                .await
+        };
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        store.wait_native_quiescent().await;
+        assert_eq!(store.applied_state().await.unwrap(), applied);
+        assert_eq!(
+            std::fs::read(disk.path().join("7/native-v1/active.json")).unwrap(),
+            authority
+        );
+        assert!(store.try_with_fsm(|fsm| fsm.ready).await.is_err());
+        assert_eq!(generation_dirs(disk.path()), 1);
+        assert_no_leases(leases.path());
+    }
 }

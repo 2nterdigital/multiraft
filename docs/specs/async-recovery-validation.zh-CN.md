@@ -6,7 +6,7 @@ consumer 可以校验外部恢复证明，而不把网络等待放入确定性 `
 
 需要外部恢复证明的 FSM 实现 `StateMachine::requires_recovery_validation()`，返回 `true`。`recovery_validation(context)` 在短暂 FSM 锁内同步冻结有界、独立拥有的输入，返回可选 `ValidationFuture`；库释放锁后才轮询 future。冻结阶段不能执行网络 IO 或创建脱离 owner 的任务。future 拥有连接、请求和临时资源；丢弃 future 必须取消或释放这些工作。`None` 表示这个具体状态无需外部工作，会跳过外部 validator 准入，即使 consumer 提供的预算正被占用。
 
-`ValidationContext` 包含 Group、应用状态代次、applied `(index, term)` 和来源 `Startup` / `PeerInstall`。consumer 必须冻结当前状态的证明输入，不能在异步等待后再读取可变 FSM。`recovery_validated` 在证明成功后设置同步、本地 readiness 标记，不能等待外部 IO；consumer restore 必要时清除自己的标记。
+`ValidationContext` 包含 Group、应用状态代次、applied `(index, term)` 和来源 `Startup` / `PeerInstall`。consumer 必须冻结当前状态的证明输入，不能在异步等待后再读取可变 FSM。`recovery_validated` 是可拒绝的同步、本地 readiness 准备 hook，在证明成功并核对代次与 owner 后运行，不能等待外部 IO。hook 返回后再次核对代次与 owner；所有可拒绝的 marker 步骤必须先于新 provider 发布。consumer restore 必要时清除自己的标记。即使 consumer marker 已准备，durable 发布与 bridge 更新完成前，业务 read、apply 和 capture 仍受门控。
 
 例如归档 consumer 可以只冻结有界归档水位与证明摘要，在既有 `StateMachine` 实现中加入：
 
@@ -39,17 +39,19 @@ fn recovery_validated(
 
 ## 启动与同伴安装
 
-owned node 启动调用 `begin_recovery_validation`，加载已有 active provider，回放 committed suffix。加载完全匹配的既有合法 active 状态不是激活新同伴候选，不执行 peer proof。随后 `validate_recovery` 冻结实际恢复所得状态代次，异步校验证明，核对代次与关闭状态，执行既有本地 `StateMachineFactory::validate_recovered`，在该同步回调返回后再次核对代次与 owner 状态，最后发布 readiness hook，才准入 Group。
+owned node 启动调用 `begin_recovery_validation`，加载已有 active provider，回放 committed suffix。加载完全匹配的既有合法 active 状态不是激活新同伴候选，不执行 peer proof。随后 `validate_recovery` 冻结实际恢复所得状态代次，异步校验证明，核对代次与关闭状态，执行既有本地 `StateMachineFactory::validate_recovered`，在该同步回调返回后再次核对代次与 owner 状态，最后运行可拒绝的 readiness hook，再次核对代次与 owner，并开放应用门，才准入 Group。
 
 启用校验的底层 `MultiRaft` consumer 先等待 `wait_for_recovery`，再调用 `validate_recovered(group)`，之后才访问业务。proposal 方法在应用 ready 前门控业务派发，同时继续允许 native committed suffix 回放。
 
 直接使用 store 的 consumer 必须在加载/回放前调用 `begin_recovery_validation`，在 committed 回放后调用 `validate_recovery`。恢复阶段允许 native replay，业务读取与新捕获被门控。`try_with_fsm` 对未校验状态返回错误；旧便捷方法 `with_fsm` 要求调用者先保证 ready，否则 panic。
 
-运行中 native peer install 与 apply、另一 install 串行。它暂存 durable bytes，在业务 read/capture 被门控时恢复候选，冻结证明输入，释放 FSM 锁后等待证明，并在激活前核对代次与 owner 关闭状态。成功安装先 durable 激活 provider，再发布 readiness hook、更新 applied/membership，最后返回成功。等待中的应用输入不能改变候选或借用旧证明。
+运行中 native peer install 与 apply、另一 install 串行。它暂存 durable bytes，在业务 read/capture 被门控时恢复候选，冻结证明输入，释放 FSM 锁后等待证明，并在激活前核对代次与 owner 关闭状态。候选仍受门控时先运行可拒绝的 readiness hook，再次核对代次与关闭状态，然后 durable 激活 provider、更新 applied/membership、开放应用门，最后返回成功。legacy install 也在 catalog write 前完成该 hook。等待中的应用输入不能改变候选或借用旧证明。
+
+启用校验的 startup recovery 期间，新 peer 候选在 restore、代次变化或 catalog 发布前返回可重试的 `io::ErrorKind::WouldBlock`；启动校验成功后重试。原 `RECOVERING` 状态保持，既有 active snapshot＋committed suffix 能继续完成校验。完全匹配既有 native active 的加载仍获准，它不是新 provider 发布。默认 consumer 不进入这一 pending recovery 状态。
 
 ## 失败、取消与资源 owner
 
-拒绝、超时、panic、调用者取消、owner 关闭都不能发布未验证候选。失败 transition 使应用访问进入 fencing，直到销毁/重启。外部证明失败时，既有 active durable provider 与诊断事实保留。库不会通过第二次不可信 restore 尝试回滚已经改变的应用。重启从既有 active provider 与 committed log 恢复。
+拒绝、超时、panic、调用者取消、owner 关闭都不能发布未验证候选。失败 transition 使应用访问进入 fencing，直到销毁/重启。外部证明或 readiness hook 拒绝时，既有 active durable provider、applied/membership 与诊断事实保留。库不会通过第二次不可信 restore 尝试回滚已经改变的应用。重启从既有 active provider 与 committed log 恢复。
 
 一个 catalog ownership domain 的部分构造写入与拥有 owner 的 stage handle 合计最多 16 个，同一 generation 的重复 handle 也计入预算。同一 root 的 clone 与独立重新打开的 catalog 共享 ownership 和该上限。启动最多扫描一个 Group native namespace 中的 64 项。只有完整 namespace 与既有 active authority 全部验证成功，才能清理已完全验证、inactive 且没有 owner 的 generation。未知项、不完整 generation 与 `.stage-*` 目录保留，并使恢复失败隔离；不能把它们当成 abandoned work 静默删除。扫描失败时保留诊断字节，不进行 pruning。没有 active authority 时也保留全部代文件，供原生 coverage 检查和精确修复恢复依据；namespace 预算仍生效。
 
@@ -61,6 +63,6 @@ validation permit 随 future 完成/取消释放。native staging/activation 的
 
 ## 验证
 
-`multiraft-store/tests/async_validation.rs` 覆盖成功、read/capture/apply 隔离、不同代次并发安装、拒绝/deadline/调用者 abort/owner close、准入超时、既有 provider 保留与重复失败清理。validator 拥有真实临时文件 lease，从外部观察资源回收。
+`multiraft-store/tests/async_validation.rs` 覆盖成功、read/capture/apply 隔离、不同代次并发安装、拒绝/deadline/调用者 abort/owner close、准入超时、既有 provider 保留与重复失败清理。readiness hook 拒绝覆盖 native 与 legacy catalog、原 native authority/bytes、applied 不变及应用 fencing；启动新候选延后保持代次，随后原 snapshot＋committed suffix 成功通过校验。validator 拥有真实临时文件 lease，从外部观察资源回收。
 
-`multiraft-net/tests/async_recovery_validation.rs` 使用既有 `legacy-native-alpha30` fixture，校验 manifest hash 与来源提交，证明启动只对 snapshot＋committed suffix 实际状态执行一次校验，覆盖拒绝、超时、启动取消和 dynamic Group 校验期间 owned shutdown。通用库测试不证明特定数据库事务协议；consumer 仍须独立验证真实外部证明实现。
+`multiraft-net/tests/async_recovery_validation.rs` 使用既有 `legacy-native-alpha30` fixture，校验 manifest hash 与来源提交，证明启动只对 snapshot＋committed suffix 实际状态执行一次校验，覆盖外部证明拒绝、readiness hook 拒绝、超时、启动取消和 dynamic Group 校验期间 owned shutdown。通用库测试不证明特定数据库事务协议；consumer 仍须独立验证真实外部证明实现。

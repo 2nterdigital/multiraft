@@ -43,6 +43,14 @@ impl<S: StateMachine> StateMachineStore<S> {
             }
         }
         self.validation.applicable()?;
+        if recovering {
+            // Startup proof must bind the existing authority plus its committed
+            // suffix. A different peer candidate can retry after startup is ready.
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "peer snapshot deferred until startup recovery is validated",
+            ));
+        }
         {
             let inner = self.inner.lock().await;
             if inner.last_applied_log > meta.last_log_id {
@@ -104,12 +112,25 @@ impl<S: StateMachine> StateMachineStore<S> {
         tracing::debug!(target: "multiraft::native_install", phase = "application_restored",
             group_id = group, "native snapshot install; candidate remains gated");
         self.validation.validate(input).await?;
-        self.validation.verify(context)?;
+        {
+            let mut inner = self.inner.lock().await;
+            self.validation.verify(context)?;
+            // The consumer can reject its local readiness marker. Resolve that
+            // before replacing durable authority; the bridge remains gated.
+            inner
+                .fsm
+                .recovery_validated(context)
+                .map_err(io::Error::other)?;
+            self.validation.verify(context)?;
+        }
         // Provider owns bytes after durable activation. Permit lives inside the
         // blocking child, so a canceled waiter must still join that resource.
         let catalog = native.options.catalog.clone();
+        let validation = self.validation.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            // Blocking admission can be delayed after the marker was prepared.
+            validation.verify(context)?;
             catalog.activate_native(stage)
         })
         .await
@@ -118,16 +139,10 @@ impl<S: StateMachine> StateMachineStore<S> {
             group_id = group, "native snapshot install");
         let mut inner = self.inner.lock().await;
         self.validation.verify(context)?;
-        if !recovering {
-            inner
-                .fsm
-                .recovery_validated(context)
-                .map_err(io::Error::other)?;
-        }
         inner.last_applied_log = meta.last_log_id;
         inner.last_membership = meta.last_membership.clone();
         inner.current_snapshot = None;
-        self.validation.ready(recovering)?;
+        self.validation.ready(false)?;
         tracing::debug!(target: "multiraft::native_install", phase = "bridge_updated",
             group_id = group, "native snapshot install");
         tracing::debug!(target: "multiraft::native_install", phase = "validated_and_activated", group_id = group, generation = context.generation, "native snapshot install");

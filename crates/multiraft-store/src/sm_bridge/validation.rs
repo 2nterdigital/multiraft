@@ -186,6 +186,12 @@ impl<S: StateMachine> StateMachineStore<S> {
         let _transition = self.validation.transition.lock().await;
         self.validation.applicable()?;
         let recovering = self.validation.recovering();
+        if recovering {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "peer snapshot deferred until startup recovery is validated",
+            ));
+        }
         self.validation.begin()?;
         let (context, input) = {
             let mut inner = self.inner.lock().await;
@@ -213,15 +219,14 @@ impl<S: StateMachine> StateMachineStore<S> {
         self.validation.validate(input).await?;
         let mut inner = self.inner.lock().await;
         self.validation.verify(context)?;
+        inner
+            .fsm
+            .recovery_validated(context)
+            .map_err(io::Error::other)?;
+        self.validation.verify(context)?;
         if let Some(catalog) = &self.catalog {
             let (index, term) = context.applied.unwrap_or((0, 0));
             catalog.write(self.group_id, index, term, meta.snapshot_id.clone(), &data)?;
-        }
-        if !recovering {
-            inner
-                .fsm
-                .recovery_validated(context)
-                .map_err(io::Error::other)?;
         }
         inner.last_applied_log = meta.last_log_id;
         inner.last_membership = meta.last_membership.clone();
@@ -229,7 +234,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             meta: meta.clone(),
             data,
         });
-        self.validation.ready(recovering)?;
+        self.validation.ready(false)?;
         Ok(())
     }
 
@@ -298,6 +303,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             .fsm
             .recovery_validated(context)
             .map_err(io::Error::other)?;
+        self.validation.verify(context)?;
         self.validation.ready(false)?;
         Ok(())
     }

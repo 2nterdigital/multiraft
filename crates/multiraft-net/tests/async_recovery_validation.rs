@@ -27,6 +27,8 @@ struct Proof {
     drops: Arc<AtomicUsize>,
     validated: Arc<AtomicUsize>,
     local_checks: Arc<AtomicUsize>,
+    reject_ready: bool,
+    ready_calls: Arc<AtomicUsize>,
     reject: bool,
     leases: PathBuf,
 }
@@ -73,7 +75,12 @@ impl StateMachine for Consumer {
             }
         }))
     }
-    fn recovery_validated(&mut self, _: ValidationContext) -> Result<(), Self::Error> {
+    fn recovery_validated(&mut self, context: ValidationContext) -> Result<(), Self::Error> {
+        self.proof.ready_calls.fetch_add(1, Ordering::SeqCst);
+        if self.proof.reject_ready {
+            self.counter.restore(context.group_id, &[])?;
+            unreachable!("empty image must reject");
+        }
         self.ready = true;
         self.proof.validated.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -110,7 +117,7 @@ impl StateMachineFactory<Consumer> for Factory {
     }
 }
 fn scratch() -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/issue-4/net-tests");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/issue-4-review/net-tests");
     fs::create_dir_all(&root).unwrap();
     tempfile::tempdir_in(root).unwrap()
 }
@@ -222,12 +229,13 @@ async fn snapshot_plus_committed_suffix_is_the_single_startup_proof_input() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejected_timed_out_and_cancelled_startups_do_not_publish_or_retain_resources() {
-    for failure in ["reject", "timeout", "abort", "budget"] {
+    for failure in ["reject", "readiness", "timeout", "abort", "budget"] {
         let disk = fixture();
         let leases = scratch();
         let proof = Proof {
             leases: leases.path().to_owned(),
             reject: failure == "reject",
+            reject_ready: failure == "readiness",
             ..Proof::default()
         };
         let port = address();
@@ -252,7 +260,7 @@ async fn rejected_timed_out_and_cancelled_startups_do_not_publish_or_retain_reso
             entered(&proof).await;
         }
         match failure {
-            "reject" => {
+            "reject" | "readiness" => {
                 proof.release.notify_one();
                 assert!(start.await.unwrap().is_err());
             }
@@ -267,7 +275,17 @@ async fn rejected_timed_out_and_cancelled_startups_do_not_publish_or_retain_reso
         }
         reclaimed(&proof, port).await;
         assert_eq!(proof.validated.load(Ordering::SeqCst), 0, "{failure}");
-        assert_eq!(proof.local_checks.load(Ordering::SeqCst), 0, "{failure}");
+        let expected_checks = usize::from(failure == "readiness");
+        assert_eq!(
+            proof.local_checks.load(Ordering::SeqCst),
+            expected_checks,
+            "{failure}"
+        );
+        assert_eq!(
+            proof.ready_calls.load(Ordering::SeqCst),
+            expected_checks,
+            "{failure}"
+        );
         assert_eq!(fs::read(&active).unwrap(), authority, "{failure}");
         drop(occupied);
         assert_eq!(budget.available_permits(), 1, "{failure}");

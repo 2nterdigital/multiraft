@@ -66,8 +66,9 @@ pub trait StateMachine: Send + 'static {
         None
     }
 
-    /// Publish a consumer readiness marker only after external proof succeeds.
-    /// This synchronous local hook cannot perform external waits.
+    /// Prepare a consumer readiness marker after proof and local checks succeed.
+    /// Rejection precedes new provider publication. The bridge keeps business
+    /// access gated until publication completes. This hook cannot wait on IO.
     fn recovery_validated(&mut self, _context: ValidationContext) -> Result<(), Self::Error> {
         Ok(())
     }
