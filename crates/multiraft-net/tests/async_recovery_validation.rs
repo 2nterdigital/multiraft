@@ -13,7 +13,8 @@ use multiraft_fsm::{
     ValidationKind,
 };
 use multiraft_net::{
-    FsmFactoryContext, GroupConfig, NodeOwner, RuntimeConfig, StateMachineFactory,
+    FsmFactoryContext, GroupConfig, GrpcRouter, NodeOwner, Router, RuntimeConfig, RuntimeTransport,
+    SharedFabric, StateMachineFactory,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore};
@@ -51,6 +52,7 @@ impl StateMachine for Consumer {
         self.counter.snapshot(group)
     }
     fn restore(&mut self, group: GroupId, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.ready = false;
         self.counter.restore(group, bytes)
     }
     fn requires_recovery_validation(&self) -> bool {
@@ -413,4 +415,347 @@ fn abandoned_candidate_writer() {
     // A real separate process owns these bytes. Its exit loses RAM ownership,
     // without ever publishing installation or an acknowledged application write.
     std::mem::forget(stage);
+}
+
+// Both transports enter the owned library ingress rather than a raw native handle.
+enum Peer {
+    Grpc(GrpcRouter),
+    InProcess(Router),
+}
+impl Peer {
+    async fn snapshot(&self, snapshot: multiraft_core::typ::Snapshot) -> Result<(), String> {
+        use multiraft_core::typ::Vote;
+        use openraft::network::RPCOption;
+        use openraft_multi::GroupRouter;
+        match self {
+            Self::Grpc(router) => router
+                .full_snapshot(
+                    1,
+                    7,
+                    Vote::new_committed(9, 2),
+                    snapshot,
+                    std::future::pending(),
+                    RPCOption::new(Duration::from_secs(3)),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Self::InProcess(router) => router
+                .send_snapshot(
+                    1,
+                    7,
+                    Vote::new_committed(9, 2),
+                    snapshot.meta,
+                    snapshot.snapshot.into_inner(),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        }
+    }
+}
+fn peer_image(root: &Path) -> multiraft_core::typ::Snapshot {
+    use multiraft_core::{typ::LogId, TypeConfig};
+    use openraft::alias::LeaderIdOf;
+    use openraft::vote::RaftLeaderIdExt;
+    let catalog = multiraft_store::SnapshotCatalog::new(root.join("snapshots"), 1);
+    let mut meta = catalog.load_native(7, 1024).unwrap().unwrap().meta;
+    meta.last_log_id = Some(LogId::new(
+        LeaderIdOf::<TypeConfig>::new_committed(9, 2),
+        50,
+    ));
+    meta.snapshot_id = "owned-peer-after-startup-proof".into();
+    let mut counter = CounterFsm::new();
+    counter
+        .apply(7, 50, &CounterFsm::encode_add(99, 50))
+        .unwrap();
+    multiraft_core::typ::Snapshot {
+        meta,
+        snapshot: io::Cursor::new(counter.snapshot(7).unwrap()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_startup_peer_snapshot_is_nonfatal_at_grpc_and_inprocess_ingress() {
+    for grpc in [true, false] {
+        let disk = fixture();
+        let leases = scratch();
+        let proof = Proof {
+            leases: leases.path().to_owned(),
+            ..Proof::default()
+        };
+        let port = address();
+        let mut runtime = config(disk.path(), port, true);
+        let peer = if grpc {
+            Peer::Grpc(GrpcRouter::new(vec![(1, port)], 2))
+        } else {
+            let fabric = SharedFabric::new();
+            let router = fabric.router().clone();
+            runtime.transport = RuntimeTransport::InProcess(fabric);
+            Peer::InProcess(router)
+        };
+        let authority_path = disk.path().join("snapshots/7/native-v1/active.json");
+        let authority = fs::read(&authority_path).unwrap();
+        let candidate = peer_image(disk.path());
+        let starting = tokio::spawn(NodeOwner::start(
+            runtime,
+            Factory {
+                proof: proof.clone(),
+                timeout: Duration::from_secs(10),
+                budget: None,
+            },
+            Instant::now() + Duration::from_secs(15),
+        ));
+        entered(&proof).await;
+        let startup_input = proof.inputs.lock().unwrap()[0];
+        assert_eq!(startup_input.0.kind, ValidationKind::Startup);
+        assert_eq!(startup_input.1, 15);
+        // Repeated immediate refusals also prove send/receive admission is released;
+        // neither request can wait behind the held startup transition/FSM proof.
+        for _ in 0..2 {
+            let request = multiraft_core::typ::Snapshot {
+                meta: candidate.meta.clone(),
+                snapshot: io::Cursor::new(candidate.snapshot.get_ref().clone()),
+            };
+            let refused = tokio::time::timeout(Duration::from_secs(2), peer.snapshot(request))
+                .await
+                .unwrap();
+            assert!(
+                refused.is_err(),
+                "pending ingress must refuse before Core dispatch"
+            );
+            assert_eq!(fs::read(&authority_path).unwrap(), authority);
+            assert_eq!(
+                proof.inputs.lock().unwrap().len(),
+                1,
+                "candidate must not restore/capture proof"
+            );
+            assert_eq!(proof.validated.load(Ordering::SeqCst), 0);
+            assert!(!starting.is_finished());
+        }
+        proof.release.notify_one();
+        // Native fatal shutdown would make this owned start fail, even if the
+        // direct store could finish its own proof after a WouldBlock response.
+        let owner = starting
+            .await
+            .unwrap()
+            .expect("deferred peer did not stop the native Group");
+        let handle = owner.handle();
+        assert_eq!(
+            handle
+                .try_read_applied(7, deadline(), |fsm| Ok::<_, io::Error>(
+                    fsm.counter.value(7)
+                ))
+                .await
+                .unwrap(),
+            15
+        );
+        let before = handle.local_group_status(7, deadline()).await.unwrap();
+        let installing_peer = match &peer {
+            Peer::Grpc(router) => Peer::Grpc(router.clone()),
+            Peer::InProcess(router) => Peer::InProcess(router.clone()),
+        };
+        let installing = tokio::spawn(async move { installing_peer.snapshot(candidate).await });
+        entered(&proof).await;
+        let inputs = proof.inputs.lock().unwrap().clone();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[1].0.kind, ValidationKind::PeerInstall);
+        assert!(inputs[1].0.generation > startup_input.0.generation);
+        assert_eq!(inputs[1].0.applied, Some((50, 9)));
+        assert_eq!(inputs[1].1, 99);
+        assert_eq!(fs::read(&authority_path).unwrap(), authority);
+        assert!(handle
+            .try_read_applied(7, deadline(), |fsm| Ok::<_, io::Error>(fsm.ready))
+            .await
+            .is_err());
+        let during = handle.local_group_status(7, deadline()).await.unwrap();
+        assert_eq!(during.last_applied, before.last_applied);
+        proof.release.notify_one();
+        installing.await.unwrap().unwrap();
+        assert_eq!(
+            handle
+                .try_read_applied(7, deadline(), |fsm| Ok::<_, io::Error>((
+                    fsm.counter.value(7),
+                    fsm.ready
+                )))
+                .await
+                .unwrap(),
+            (99, true)
+        );
+        assert_ne!(fs::read(&authority_path).unwrap(), authority);
+        assert_eq!(proof.validated.load(Ordering::SeqCst), 2);
+        assert_eq!(proof.local_checks.load(Ordering::SeqCst), 1);
+        owner.shutdown(deadline()).await.unwrap();
+        if let Peer::Grpc(router) = peer {
+            router.join().await.unwrap();
+        }
+        reclaimed(&proof, port).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovering_native_group_refuses_peers_without_invoking_fatal_sm_guard() {
+    use multiraft_store::{
+        FileLogStoreOf, NativeSmOptions, SnapshotCatalog, StateMachineStore, StubNetworkFactory,
+    };
+    use openraft::async_runtime::WatchReceiver;
+    use openraft::storage::RaftStateMachine;
+    use std::collections::BTreeMap;
+    for grpc in [true, false] {
+        let disk = fixture();
+        let leases = scratch();
+        let proof = Proof {
+            leases: leases.path().to_owned(),
+            ..Proof::default()
+        };
+        let catalog = Arc::new(SnapshotCatalog::new(disk.path().join("snapshots"), 1));
+        catalog.startup_provenance(7, 1024).unwrap();
+        let mut sm = StateMachineStore::with_native_options(
+            7,
+            Consumer {
+                counter: CounterFsm::new(),
+                proof: proof.clone(),
+                ready: false,
+            },
+            NativeSmOptions {
+                catalog,
+                max_snapshot_bytes: 1024,
+                build_budget: Arc::new(Semaphore::new(1)),
+            },
+        )
+        .unwrap();
+        sm.begin_recovery_validation();
+        let log = FileLogStoreOf::open_with_options(
+            disk.path().join("group-7"),
+            0,
+            FileLogSyncLevel::Data,
+        )
+        .unwrap();
+        let raft = openraft::Raft::new(
+            1,
+            Arc::new(
+                openraft::Config {
+                    enable_tick: false,
+                    snapshot_policy: openraft::SnapshotPolicy::Never,
+                    ..Default::default()
+                }
+                .validate()
+                .unwrap(),
+            ),
+            StubNetworkFactory,
+            log,
+            sm.clone(),
+        )
+        .await
+        .unwrap();
+        raft.wait(Some(Duration::from_secs(3)))
+            .applied_index_at_least(Some(12), "fixture committed suffix")
+            .await
+            .unwrap();
+        let applied = sm.applied_state().await.unwrap();
+        let authority_path = disk.path().join("snapshots/7/native-v1/active.json");
+        let authority = fs::read(&authority_path).unwrap();
+        let groups = Arc::new(Mutex::new(BTreeMap::from([(
+            7,
+            multiraft_net::GroupApp {
+                node_id: 1,
+                group_id: 7,
+                raft: raft.clone(),
+                state_machine: sm.clone(),
+            },
+        )])));
+        let port = address();
+        let (peer, transport) = if grpc {
+            let listener = tokio::net::TcpListener::bind(port).await.unwrap();
+            let serving = tokio::spawn(async move {
+                multiraft_net::GrpcServer::serve_with_listener(listener, groups)
+                    .await
+                    .unwrap();
+            });
+            (Peer::Grpc(GrpcRouter::new(vec![(1, port)], 2)), serving)
+        } else {
+            let router = Router::new();
+            let (node, tx) = multiraft_net::Node::with_groups(1, router.clone(), groups);
+            drop(tx);
+            let serving = tokio::spawn(async move {
+                node.run().await.unwrap();
+            });
+            (Peer::InProcess(router), serving)
+        };
+        let candidate = peer_image(disk.path());
+        // Proof has not even begun: this is RECOVERING, the exact state in which
+        // the old native-SM WouldBlock error was converted into Fatal::StorageError.
+        for _ in 0..2 {
+            let request = multiraft_core::typ::Snapshot {
+                meta: candidate.meta.clone(),
+                snapshot: io::Cursor::new(candidate.snapshot.get_ref().clone()),
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), peer.snapshot(request))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(raft.metrics().borrow_watched().running_state.is_ok());
+            assert_eq!(sm.applied_state().await.unwrap(), applied);
+            assert_eq!(fs::read(&authority_path).unwrap(), authority);
+            assert!(proof.inputs.lock().unwrap().is_empty());
+        }
+        let validating = sm.clone();
+        let validation = tokio::spawn(async move {
+            validating
+                .validate_recovery(|fsm| {
+                    assert_eq!(fsm.counter.value(7), 15);
+                    assert!(!fsm.ready);
+                    Ok(())
+                })
+                .await
+        });
+        entered(&proof).await;
+        proof.release.notify_one();
+        validation.await.unwrap().unwrap();
+        assert_eq!(
+            sm.try_with_fsm(|fsm| fsm.counter.value(7)).await.unwrap(),
+            15
+        );
+        let installing_peer = match &peer {
+            Peer::Grpc(router) => Peer::Grpc(router.clone()),
+            Peer::InProcess(router) => Peer::InProcess(router.clone()),
+        };
+        let install = tokio::spawn(async move { installing_peer.snapshot(candidate).await });
+        entered(&proof).await;
+        assert_eq!(
+            proof.inputs.lock().unwrap()[1].0.kind,
+            ValidationKind::PeerInstall
+        );
+        assert_eq!(proof.inputs.lock().unwrap()[1].1, 99);
+        assert_eq!(sm.applied_state().await.unwrap(), applied);
+        proof.release.notify_one();
+        install.await.unwrap().unwrap();
+        assert_eq!(
+            sm.try_with_fsm(|fsm| (fsm.counter.value(7), fsm.ready))
+                .await
+                .unwrap(),
+            (99, true)
+        );
+        assert_eq!(sm.applied_state().await.unwrap().0.unwrap().index, 50);
+        assert!(raft.metrics().borrow_watched().running_state.is_ok());
+        sm.close_native_intake();
+        raft.shutdown().await.unwrap();
+        sm.wait_native_quiescent().await;
+        match peer {
+            Peer::Grpc(router) => {
+                router.join().await.unwrap();
+                transport.abort();
+                let _ = transport.await;
+            }
+            Peer::InProcess(router) => {
+                router.unregister_node(1);
+                transport.await.unwrap();
+            }
+        }
+        drop(raft);
+        drop(sm);
+        reclaimed(&proof, port).await;
+    }
 }

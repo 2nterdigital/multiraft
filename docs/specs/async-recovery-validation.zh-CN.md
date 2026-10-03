@@ -47,7 +47,9 @@ owned node 启动调用 `begin_recovery_validation`，加载已有 active provid
 
 运行中 native peer install 与 apply、另一 install 串行。它暂存 durable bytes，在业务 read/capture 被门控时恢复候选，冻结证明输入，释放 FSM 锁后等待证明，并在激活前核对代次与 owner 关闭状态。候选仍受门控时先运行可拒绝的 readiness hook，再次核对代次与关闭状态，然后 durable 激活 provider、更新 applied/membership、开放应用门，最后返回成功。legacy install 也在 catalog write 前完成该 hook。等待中的应用输入不能改变候选或借用旧证明。
 
-启用校验的 startup recovery 期间，新 peer 候选在 restore、代次变化或 catalog 发布前返回可重试的 `io::ErrorKind::WouldBlock`；启动校验成功后重试。原 `RECOVERING` 状态保持，既有 active snapshot＋committed suffix 能继续完成校验。完全匹配既有 native active 的加载仍获准，它不是新 provider 发布。默认 consumer 不进入这一 pending recovery 状态。
+启用校验的 startup recovery 期间，owned peer ingress 在 native Core/SM 派发前拒绝新 snapshot：gRPC 返回 `Status::unavailable`，in-process router 返回 transport `Unreachable` 拒绝。peer 可以在启动校验成功后重试。拒绝立即完成并释放 receive/send 准入；不等待 startup proof，也不 restore 候选、改变应用代次/applied 或发布 provider。该门同时覆盖冻结证明前的 `RECOVERING` 与证明执行中的 `VALIDATING`。既有 active snapshot＋committed suffix 能继续完成校验。内部启动路径加载完全匹配的既有 native active 仍获准，它不是新 provider 发布。默认 consumer 不进入这一 pending startup 状态。
+
+底层 state-machine install guard 是失败隔离的绕过检查，不是 native 重试协议。它在 `RECOVERING` 期间、任何变更前对新 image 返回 `InvalidInput`。直接调用 OpenRaft 原生 install API 会绕过库的 ingress；精确固定的 native worker 将所有 SM install error（包括 `WouldBlock`）转成 fatal `StorageError`。使用原生 handle 的 consumer 必须提供同等 ingress 隔离，不能把 SM error 当作可重试的 native 延后。
 
 ## 失败、取消与资源 owner
 
@@ -63,6 +65,8 @@ validation permit 随 future 完成/取消释放。native staging/activation 的
 
 ## 验证
 
-`multiraft-store/tests/async_validation.rs` 覆盖成功、read/capture/apply 隔离、不同代次并发安装、拒绝/deadline/调用者 abort/owner close、准入超时、既有 provider 保留与重复失败清理。readiness hook 拒绝覆盖 native 与 legacy catalog、原 native authority/bytes、applied 不变及应用 fencing；启动新候选延后保持代次，随后原 snapshot＋committed suffix 成功通过校验。validator 拥有真实临时文件 lease，从外部观察资源回收。
+`multiraft-store/tests/async_validation.rs` 覆盖成功、read/capture/apply 隔离、不同代次并发安装、拒绝/deadline/调用者 abort/owner close、准入超时、既有 provider 保留与重复失败清理。readiness hook 拒绝覆盖 native 与 legacy catalog、原 native authority/bytes、applied 不变及应用 fencing；直接 Store 绕过拒绝保持代次，随后原 snapshot＋committed suffix 成功通过校验；该 Store 直调检查不证明 native 延后安全。validator 拥有真实临时文件 lease，从外部观察资源回收。
 
-`multiraft-net/tests/async_recovery_validation.rs` 使用既有 `legacy-native-alpha30` fixture，校验 manifest hash 与来源提交，证明启动只对 snapshot＋committed suffix 实际状态执行一次校验，覆盖外部证明拒绝、readiness hook 拒绝、超时、启动取消和 dynamic Group 校验期间 owned shutdown。通用库测试不证明特定数据库事务协议；consumer 仍须独立验证真实外部证明实现。
+`multiraft-net/tests/async_recovery_validation.rs` 使用既有 `legacy-native-alpha30` fixture，校验 manifest hash 与来源提交，证明启动只对 snapshot＋committed suffix 实际状态执行一次校验，覆盖外部证明拒绝、readiness hook 拒绝、超时、启动取消和 dynamic Group 校验期间 owned shutdown。新增两个真实 peer 回归场景同时覆盖 gRPC 与 in-process ingress：NodeOwner startup 在 pending proof 期间重复立即拒绝 snapshot，随后应用可读，并允许同一候选完成 peer proof 后安装；期间 read/applied/provider 仍受门控。明确停留在 `RECOVERING` 的 native Group 接收重复 peer 请求后保持运行，完成原 snapshot＋suffix 校验，再安装重试候选。临时移除 ingress 隔离会使后一个场景的 native running-state 断言失败。两个场景都实际观察应用与 listener 回收。
+
+通用库测试不证明特定数据库事务协议；consumer 仍须独立验证真实外部证明实现。

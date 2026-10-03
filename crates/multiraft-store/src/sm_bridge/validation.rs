@@ -188,8 +188,8 @@ impl<S: StateMachine> StateMachineStore<S> {
         let recovering = self.validation.recovering();
         if recovering {
             return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "peer snapshot deferred until startup recovery is validated",
+                io::ErrorKind::InvalidInput,
+                "peer snapshot bypassed pending startup ingress validation",
             ));
         }
         self.validation.begin()?;

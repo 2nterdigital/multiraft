@@ -662,7 +662,7 @@ async fn rejecting_readiness_preserves_native_and_legacy_authority_and_applied_s
 }
 
 #[tokio::test]
-async fn pending_startup_defers_new_peer_image_without_changing_recovery_generation() {
+async fn direct_store_rejects_new_image_without_changing_pending_recovery_generation() {
     let disk = scratch();
     let old = image(disk.path(), 5).await;
     let leases = scratch();
@@ -695,7 +695,7 @@ async fn pending_startup_defers_new_peer_image_without_changing_recovery_generat
             .await
             .unwrap_err()
             .kind(),
-        io::ErrorKind::WouldBlock
+        io::ErrorKind::InvalidInput
     );
     assert!(proof.inputs.lock().unwrap().is_empty());
     assert_eq!(store.applied_state().await.unwrap(), applied);
