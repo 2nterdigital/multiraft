@@ -44,11 +44,12 @@ impl<S: StateMachine> StateMachineStore<S> {
         }
         self.validation.applicable()?;
         if recovering {
-            // Startup proof must bind the existing authority plus its committed
-            // suffix. A different peer candidate can retry after startup is ready.
+            // Internal loading admits only the existing recovery authority.
+            // Peer ingress must refuse new images before native Core dispatch;
+            // bypassing that boundary is a fatal storage error to OpenRaft.
             return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "peer snapshot deferred until startup recovery is validated",
+                io::ErrorKind::InvalidInput,
+                "peer snapshot bypassed pending startup ingress validation",
             ));
         }
         {
