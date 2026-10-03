@@ -17,6 +17,7 @@ pub use sm_bridge::build_standby_snapshot_async;
 pub use sm_bridge::SmOptions;
 pub use sm_bridge::StateMachineStore;
 pub use sm_bridge::TriggerCb;
+pub use sm_bridge::ValidationOptions;
 pub use sm_bridge::{NativeBuildReservation, NativeCaptureError, NativeSmOptions};
 pub use sm_bridge::{StateMachineRelease, WeakStateMachineStore};
 pub use snapshot_catalog::CatalogEntry;

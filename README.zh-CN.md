@@ -16,6 +16,7 @@
 - 同进程多 Group；peer 连接 **O(节点)**，非 O(Group)
 - `MultiRaft`：`propose` / `propose_batch` / `read_linearizable` / 归一化 Group 观察 / 领导权回调
 - 每 Group 文件持久化（可重启恢复）；sync 档位 **0/1/2**（与 Aeron 对齐）
+- 启动与 native 同伴快照的[受控异步应用校验](docs/specs/async-recovery-validation.zh-CN.md)，带有界准入、取消和候选 fencing
 - Aeron 启发式热路径：类型化进程内 RPC、流水线 propose、合并 / 流式落盘
 - Standby learner 与成员变更，以及仅实验室使用的 snapshot catalog/checksum/ad 生成；实时 Standby 恢复已禁用
 - 多进程 gRPC Demo + Admin HTTP（验收 / Jepsen）

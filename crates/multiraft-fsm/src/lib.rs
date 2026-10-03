@@ -6,6 +6,26 @@ pub use counter_fsm::CounterFsm;
 pub type GroupId = u64;
 pub type NodeId = u64;
 
+/// The actual application generation frozen for external recovery validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationContext {
+    pub group_id: GroupId,
+    pub generation: u64,
+    pub applied: Option<(u64, u64)>,
+    pub kind: ValidationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationKind {
+    Startup,
+    PeerInstall,
+}
+
+/// Own all inputs and remote resources. Dropping this future must cancel and
+/// release its work; do not detach tasks or perform remote IO in `apply`.
+pub type ValidationFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOut {
     pub effects: Vec<u8>,
@@ -33,6 +53,24 @@ pub trait StateMachine: Send + 'static {
     fn snapshot(&self, group: GroupId) -> Result<Vec<u8>, Self::Error>;
 
     fn restore(&mut self, group: GroupId, snapshot: &[u8]) -> Result<(), Self::Error>;
+
+    /// Opt into gating reads/capture from construction until startup validation.
+    fn requires_recovery_validation(&self) -> bool {
+        false
+    }
+
+    /// Freeze bounded, owned validation inputs from this exact restored image.
+    /// Called under the brief FSM lock; the returned future runs outside it.
+    /// Startup includes the committed suffix; peer install includes its candidate.
+    fn recovery_validation(&self, _context: ValidationContext) -> Option<ValidationFuture> {
+        None
+    }
+
+    /// Publish a consumer readiness marker only after external proof succeeds.
+    /// This synchronous local hook cannot perform external waits.
+    fn recovery_validated(&mut self, _context: ValidationContext) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Capture within the supplied byte bound, checking while constructing bytes.
     /// The default refuses without calling the legacy unbounded serializer.

@@ -198,6 +198,7 @@ impl<S: StateMachine> RuntimeShared<S> {
     pub(super) fn begin_cleanup(self: &Arc<Self>) {
         self.accepting.store(false, Ordering::Release);
         self.closed.send_replace(true);
+        self.node.cancel_pending_validation();
         self.slots.close();
         if self.cleanup_started.swap(true, Ordering::AcqRel) {
             return;

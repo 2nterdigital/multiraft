@@ -225,6 +225,20 @@ fn publication_crash_cuts_keep_valid_old_or_new_checkpoint() {
                 meta(25)
             }
         );
+        let reopened = SnapshotCatalog::new(dir.path(), 1);
+        if matches!(cut, "data_synced" | "metadata_synced" | "generation_synced") {
+            // Partial construction is diagnostic evidence, not authority. Keep
+            // the original fail-closed rule for unknown/incomplete namespaces.
+            assert!(reopened.startup_provenance(42, 1024).is_err());
+            assert_eq!(generation_count(dir.path()), 2);
+        } else {
+            assert_eq!(
+                reopened.startup_provenance(42, 1024).unwrap(),
+                multiraft_core::StartupProvenance::Persisted
+            );
+            assert_eq!(generation_count(dir.path()), 1, "cut {cut}");
+            assert!(!dir.path().join("42/native-v1/active.pending").exists());
+        }
     }
 }
 
@@ -305,4 +319,248 @@ fn native_description_validates_metadata_and_data_without_returning_an_image() {
     assert_eq!(info.size, 6);
     std::fs::write(active_generation(dir.path()).join("data.bin"), b"broken").unwrap();
     assert!(catalog.describe_native(42, 1024).is_err());
+}
+
+fn generation_count(root: &std::path::Path) -> usize {
+    std::fs::read_dir(root.join("42/native-v1"))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().unwrap().is_dir())
+        .count()
+}
+
+#[test]
+fn rejected_and_discarded_candidates_keep_disk_use_constant() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = SnapshotCatalog::new(dir.path(), 1);
+    catalog
+        .publish_native(42, &meta(25), b"active", 1024)
+        .unwrap();
+    for index in 3..25 {
+        assert!(catalog
+            .publish_native(42, &meta(index), b"older", 1024)
+            .is_err());
+        assert_eq!(generation_count(dir.path()), 1);
+        let candidate = catalog
+            .stage_native(42, &meta(30 + index), b"reject", 1024)
+            .unwrap();
+        assert_eq!(generation_count(dir.path()), 2);
+        candidate.discard().unwrap();
+        assert_eq!(generation_count(dir.path()), 1);
+    }
+    let candidate = catalog
+        .stage_native(42, &meta(100), b"cancel", 1024)
+        .unwrap();
+    drop(candidate);
+    assert_eq!(generation_count(dir.path()), 1);
+    assert_eq!(
+        catalog.load_native(42, 1024).unwrap().unwrap().data,
+        b"active"
+    );
+}
+
+#[test]
+fn duplicate_candidates_and_reopened_catalogs_share_generation_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = SnapshotCatalog::new(dir.path(), 1);
+    let reopened = SnapshotCatalog::new(dir.path().join("."), 1);
+    let first = catalog.stage_native(42, &meta(25), b"same", 1024).unwrap();
+    let second = reopened.stage_native(42, &meta(25), b"same", 1024).unwrap();
+    drop(first);
+    assert_eq!(generation_count(dir.path()), 1);
+    assert_eq!(
+        catalog.startup_provenance(42, 1024).unwrap(),
+        multiraft_core::StartupProvenance::Pristine
+    );
+    reopened.activate_native(second).unwrap();
+    assert_eq!(generation_count(dir.path()), 1);
+    let active_candidate = catalog.stage_native(42, &meta(25), b"same", 1024).unwrap();
+    drop(active_candidate);
+    assert_eq!(
+        catalog.load_native(42, 1024).unwrap().unwrap().data,
+        b"same"
+    );
+}
+
+#[test]
+fn replacing_active_generation_preserves_candidate_owners_then_reclaims_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = SnapshotCatalog::new(dir.path(), 1);
+    catalog.publish_native(42, &meta(19), b"old", 1024).unwrap();
+    let active_owner = catalog.stage_native(42, &meta(19), b"old", 1024).unwrap();
+    catalog.publish_native(42, &meta(25), b"new", 1024).unwrap();
+    assert_eq!(generation_count(dir.path()), 2);
+    drop(active_owner);
+    assert_eq!(generation_count(dir.path()), 1);
+    assert_eq!(catalog.load_native(42, 1024).unwrap().unwrap().data, b"new");
+}
+
+#[test]
+fn stage_admission_is_bounded_and_released_by_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = SnapshotCatalog::new(dir.path(), 1);
+    let mut candidates: Vec<_> = (0..16)
+        .map(|index| {
+            catalog
+                .stage_native(42, &meta(index + 10), b"candidate", 1024)
+                .unwrap()
+        })
+        .collect();
+    let error = catalog
+        .stage_native(42, &meta(40), b"excess", 1024)
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(generation_count(dir.path()), 16);
+    drop(candidates.pop());
+    let admitted = catalog
+        .stage_native(42, &meta(40), b"excess", 1024)
+        .unwrap();
+    drop(admitted);
+    drop(candidates);
+    assert_eq!(generation_count(dir.path()), 0);
+}
+
+#[test]
+fn failed_stage_construction_cleans_temporary_directory_and_preserves_active_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = SnapshotCatalog::new(dir.path(), 1);
+    catalog
+        .publish_native(42, &meta(25), b"original", 1024)
+        .unwrap();
+    let data = active_generation(dir.path()).join("data.bin");
+    std::fs::write(&data, b"corrupt").unwrap();
+    for _ in 0..20 {
+        assert!(catalog
+            .stage_native(42, &meta(25), b"original", 1024)
+            .is_err());
+        assert_eq!(generation_count(dir.path()), 1);
+    }
+    assert_eq!(std::fs::read(data).unwrap(), b"corrupt");
+    assert!(catalog.startup_provenance(42, 1024).is_err());
+}
+
+#[test]
+fn malformed_manifests_block_new_staging_without_accumulating_candidates() {
+    for name in ["active.json", "active.pending"] {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path(), 1);
+        catalog
+            .publish_native(42, &meta(19), b"active", 1024)
+            .unwrap();
+        let path = dir.path().join("42/native-v1").join(name);
+        std::fs::write(&path, b"corrupt").unwrap();
+        for index in 20..40 {
+            assert!(catalog
+                .stage_native(42, &meta(index), b"candidate", 1024)
+                .is_err());
+            assert_eq!(generation_count(dir.path()), 1);
+        }
+        assert!(catalog.startup_provenance(42, 1024).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"corrupt");
+    }
+}
+
+#[test]
+fn startup_entry_budget_refuses_without_destroying_diagnostic_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = SnapshotCatalog::new(dir.path(), 1);
+    catalog
+        .publish_native(42, &meta(19), b"active", 1024)
+        .unwrap();
+    // Construct every inactive generation through the public catalog API, then
+    // relocate it to represent historical ownerless on-disk candidates.
+    for index in 20..84 {
+        let source = tempfile::tempdir().unwrap();
+        let staging = SnapshotCatalog::new(source.path(), 1);
+        let candidate = staging
+            .stage_native(42, &meta(index), b"candidate", 1024)
+            .unwrap();
+        let generation = std::fs::read_dir(source.path().join("42/native-v1"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::rename(
+            generation.path(),
+            dir.path().join("42/native-v1").join(generation.file_name()),
+        )
+        .unwrap();
+        drop(candidate);
+    }
+    let manifest = std::fs::read(dir.path().join("42/native-v1/active.json")).unwrap();
+    let error = catalog.startup_provenance(42, 1024).err().unwrap();
+    assert!(error.to_string().contains("entry budget"));
+    assert_eq!(generation_count(dir.path()), 65);
+    assert_eq!(
+        std::fs::read(dir.path().join("42/native-v1/active.json")).unwrap(),
+        manifest
+    );
+    assert_eq!(
+        catalog.load_native(42, 1024).unwrap().unwrap().data,
+        b"active"
+    );
+}
+
+#[test]
+fn failed_cleanup_fences_new_candidates_until_same_group_provenance_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = SnapshotCatalog::new(dir.path(), 1);
+    catalog
+        .publish_native(42, &meta(19), b"active", 1024)
+        .unwrap();
+    let candidate = catalog
+        .stage_native(42, &meta(25), b"candidate", 1024)
+        .unwrap();
+    let path = dir.path().join("42/native-v1/active.json");
+    let valid_manifest = std::fs::read(&path).unwrap();
+    std::fs::write(&path, b"broken").unwrap();
+    assert!(candidate.discard().is_err());
+    assert_eq!(generation_count(dir.path()), 2);
+    std::fs::write(&path, valid_manifest).unwrap();
+    // Repairing only the authority file does not erase the cleanup obligation.
+    assert!(catalog.stage_native(42, &meta(30), b"new", 1024).is_err());
+    assert_eq!(
+        catalog.startup_provenance(43, 1024).unwrap(),
+        multiraft_core::StartupProvenance::Pristine
+    );
+    assert!(catalog.stage_native(42, &meta(30), b"new", 1024).is_err());
+    assert_eq!(
+        catalog.startup_provenance(42, 1024).unwrap(),
+        multiraft_core::StartupProvenance::Persisted
+    );
+    assert_eq!(generation_count(dir.path()), 1);
+    let recovered = catalog.stage_native(42, &meta(30), b"new", 1024).unwrap();
+    recovered.discard().unwrap();
+    assert_eq!(generation_count(dir.path()), 1);
+}
+
+#[test]
+fn concurrent_same_content_discard_cannot_remove_published_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = SnapshotCatalog::new(dir.path(), 1);
+    for index in 20..28 {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                let candidate = catalog
+                    .stage_native(42, &meta(index), b"same", 1024)
+                    .unwrap();
+                barrier.wait();
+                candidate.discard().unwrap();
+            });
+            threads.spawn(|| {
+                let candidate = catalog
+                    .stage_native(42, &meta(index), b"same", 1024)
+                    .unwrap();
+                barrier.wait();
+                catalog.activate_native(candidate).unwrap();
+            });
+        });
+        assert_eq!(
+            catalog.load_native(42, 1024).unwrap().unwrap().meta,
+            meta(index)
+        );
+        assert_eq!(generation_count(dir.path()), 1);
+    }
 }
