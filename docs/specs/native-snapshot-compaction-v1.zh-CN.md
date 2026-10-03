@@ -17,7 +17,8 @@ Disabled 不再继承旧的 5000 条日志自动快照策略。Standby HTTP/cata
 并发界限；超限字节在不必要的复制与安装之前拒绝。
 
 每个 Group 使用已有 catalog 的不可变代文件，保存 Group 身份、完整
-SnapshotMeta、应用字节、长度和校验和。文件与目录同步后才能原子切换 active
+SnapshotMeta、应用字节、长度和校验和。应用可选的外部证明及候选隔离遵循
+[受控异步恢复校验契约](async-recovery-validation.zh-CN.md)。文件与目录同步后才能原子切换 active
 清单。损坏 active 不会静默回退到旧代；旧切点的晚到构建不能覆盖较新的安装。
 相同切点的等价业务编码不被强制规范化。启动由 OpenRaft 安装已验证的持久
 快照并重放后缀；bridge 检查原生 apply 序列的连续性，不另建重放流程。

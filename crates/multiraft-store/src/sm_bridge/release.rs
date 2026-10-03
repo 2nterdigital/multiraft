@@ -56,6 +56,7 @@ pub struct WeakStateMachineStore<S: multiraft_fsm::StateMachine> {
     catalog: Option<Arc<crate::SnapshotCatalog>>,
     trigger: Option<WeakTrigger>,
     release: StateMachineRelease,
+    validation: std::sync::Weak<super::validation::ValidationRuntime>,
 }
 impl<S: multiraft_fsm::StateMachine> super::StateMachineStore<S> {
     /// Create a resource-neutral weak reference for owned background callbacks.
@@ -68,6 +69,7 @@ impl<S: multiraft_fsm::StateMachine> super::StateMachineStore<S> {
             catalog: self.catalog.clone(),
             trigger: self.on_standby_trigger.as_ref().map(Arc::downgrade),
             release: self.release.clone(),
+            validation: Arc::downgrade(&self.validation),
         }
     }
 }
@@ -84,6 +86,7 @@ impl<S: multiraft_fsm::StateMachine> WeakStateMachineStore<S> {
             catalog: self.catalog.clone(),
             on_standby_trigger: self.trigger.as_ref().and_then(std::sync::Weak::upgrade),
             release: self.release.clone(),
+            validation: self.validation.upgrade()?,
         })
     }
 }

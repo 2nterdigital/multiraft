@@ -166,6 +166,14 @@ impl<S: StateMachine> MultiRaft<S> {
             }
         }
         let state_machine_store = if self.config.snapshot_mode == SnapshotMode::NativeDurable {
+            // Every native Group startup, including the legacy facade/owner path,
+            // bounds and validates orphan cleanup before loading recovery authority.
+            self.snapshot_rt
+                .catalog
+                .as_ref()
+                .expect("validated durable catalog")
+                .startup_provenance(group, self.config.max_snapshot_bytes)
+                .map_err(|error| MultiRaftError::Other(error.into()))?;
             StateMachineStore::with_native_options(
                 group,
                 fsm,
@@ -191,6 +199,23 @@ impl<S: StateMachine> MultiRaft<S> {
                 },
             )
         };
+        let state_machine_store = state_machine_store
+            .with_validation_options(multiraft_store::ValidationOptions {
+                deadline: self.fsm_factory.validation_timeout(context),
+                budget: self
+                    .fsm_factory
+                    .validation_budget()
+                    .unwrap_or_else(|| self.snapshot_rt.validation_budget.clone()),
+            })
+            .map_err(|error| MultiRaftError::Other(error.into()))?;
+        state_machine_store.begin_recovery_validation();
+        if self
+            .snapshot_rt
+            .validation_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            state_machine_store.cancel_pending_validation();
+        }
         {
             let mut releases = self.fsm_releases.lock().unwrap();
             releases.retain(|release| !release.is_released());

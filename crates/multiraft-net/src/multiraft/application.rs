@@ -8,6 +8,7 @@ impl<S: StateMachine> MultiRaft<S> {
     /// for this group). Non-leader → [`MultiRaftError::NotLeader`].
     /// Timeout / disconnect ⇒ outcome **unknown**; retry with the same idempotency key.
     pub async fn propose(&self, group: u64, data: Vec<u8>) -> Result<ProposeOk, MultiRaftError> {
+        self.ensure_application_ready(group)?;
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
@@ -25,6 +26,7 @@ impl<S: StateMachine> MultiRaft<S> {
         group: u64,
         data: Vec<u8>,
     ) -> Result<ProposeApplied, MultiRaftError> {
+        self.ensure_application_ready(group)?;
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
@@ -48,6 +50,7 @@ impl<S: StateMachine> MultiRaft<S> {
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_application_ready(group)?;
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
@@ -68,6 +71,7 @@ impl<S: StateMachine> MultiRaft<S> {
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_application_ready(group)?;
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
@@ -94,6 +98,18 @@ impl<S: StateMachine> MultiRaft<S> {
             }
         }
         Ok(out)
+    }
+
+    fn ensure_application_ready(&self, group: GroupId) -> Result<(), MultiRaftError> {
+        let sm = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(&group)
+            .map(|group| group.state_machine.clone())
+            .ok_or(MultiRaftError::UnknownGroup(group))?;
+        sm.application_ready()
+            .map_err(|error| MultiRaftError::Other(error.into()))
     }
 
     pub(super) async fn client_write_one(
@@ -236,7 +252,7 @@ impl<S: StateMachine> MultiRaft<S> {
             .unwrap()
             .get(&group)
             .map(|g| g.state_machine.clone())?;
-        Some(sm.with_fsm(f).await)
+        sm.try_with_fsm(f).await.ok()
     }
 
     /// Local FSM read for Standby (or other) service offload.
@@ -260,7 +276,10 @@ impl<S: StateMachine> MultiRaft<S> {
             .map(|g| g.state_machine.clone())
             .ok_or(MultiRaftError::UnknownGroup(group))?;
         let (applied_index, applied_term) = self.local_applied(group).await.unwrap_or((0, 0));
-        let value = sm.with_fsm(f).await;
+        let value = sm
+            .try_with_fsm(f)
+            .await
+            .map_err(|error| MultiRaftError::Other(error.into()))?;
         Ok(StaleRead {
             value,
             applied_index,

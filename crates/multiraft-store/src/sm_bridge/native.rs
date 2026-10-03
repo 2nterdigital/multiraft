@@ -1,5 +1,6 @@
 //! Durable-native builder/install seams; application lock never spans filesystem IO.
 use super::*;
+mod install;
 use multiraft_fsm::{CaptureError, CaptureRefusal};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -79,6 +80,7 @@ impl<S: StateMachine> StateMachineStore<S> {
 
     /// Close new native snapshot intake while allowing already-started transitions to finish.
     pub fn close_native_intake(&self) {
+        self.validation.close();
         if let Some(native) = &self.native {
             native
                 .closing
@@ -95,6 +97,8 @@ impl<S: StateMachine> StateMachineStore<S> {
 
     /// Called after native core shutdown; wait for owned transition/capture work.
     pub async fn wait_native_quiescent(&self) {
+        let _validation = self.validation.transition.lock().await;
+        let _work = self.validation.work.clone().acquire_owned().await;
         if let Some(native) = &self.native {
             let _transition = native.transition.lock().await;
             let _application = self.inner.lock().await;
@@ -114,7 +118,7 @@ impl<S: StateMachine> StateMachineStore<S> {
                 capture: None,
             });
         };
-        if self.native_is_closing() {
+        if self.native_is_closing() || self.validation.readable().is_err() {
             return if force {
                 Some(SnapshotBuilder {
                     store: self.clone(),
@@ -222,6 +226,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             .map_err(|_| NativeCaptureError::Refused(CaptureRefusal::Busy))?;
         let _transition = native.transition.lock().await;
         let inner = self.inner.lock().await;
+        self.validation.readable().map_err(NativeCaptureError::Io)?;
         if self.native_is_closing() {
             return Err(NativeCaptureError::Io(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -308,67 +313,6 @@ impl<S: StateMachine> StateMachineStore<S> {
             })
         })
     }
-
-    pub(super) async fn install_native_snapshot(
-        &self,
-        meta: &SnapshotMetaOf<TypeConfig>,
-        data: Vec<u8>,
-    ) -> io::Result<()> {
-        let native = self.native.as_ref().unwrap().clone();
-        if data.len() > native.options.max_snapshot_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "snapshot install limit",
-            ));
-        }
-        let _transition = native.transition.lock().await;
-        if self.native_is_closing() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "native snapshot owner closed",
-            ));
-        }
-        // Stage before restoring business state; no success/ack before durable activation.
-        let options = native.options.clone();
-        let owned_meta = meta.clone();
-        let group = self.group_id;
-        let stage_started = std::time::Instant::now();
-        let (stage, data) = tokio::task::spawn_blocking(move || {
-            let stage = options.catalog.stage_native(
-                group,
-                &owned_meta,
-                &data,
-                options.max_snapshot_bytes,
-            )?;
-            Ok::<_, io::Error>((stage, data))
-        })
-        .await
-        .map_err(io::Error::other)??;
-        tracing::info!(target: "multiraft::native_install", phase = "staged", group_id = group, snapshot_bytes = data.len(), stage_elapsed_us = stage_started.elapsed().as_micros() as u64, "native snapshot install");
-        {
-            let mut inner = self.inner.lock().await;
-            if inner.last_applied_log > meta.last_log_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "snapshot install would regress applied state",
-                ));
-            }
-            inner.fsm.restore(group, &data).map_err(io::Error::other)?;
-        }
-        tracing::debug!(target: "multiraft::native_install", phase = "application_restored", group_id = group, "native snapshot install");
-        let catalog = native.options.catalog.clone();
-        tokio::task::spawn_blocking(move || catalog.activate_native(stage))
-            .await
-            .map_err(io::Error::other)??;
-        tracing::debug!(target: "multiraft::native_install", phase = "activated", group_id = group, "native snapshot install");
-        let mut inner = self.inner.lock().await;
-        inner.last_applied_log = meta.last_log_id;
-        inner.last_membership = meta.last_membership.clone();
-        // Durable bytes remain owned by the catalog, not a historical RAM snapshot.
-        inner.current_snapshot = None;
-        tracing::debug!(target: "multiraft::native_install", phase = "bridge_updated", group_id = group, "native snapshot install");
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -398,6 +342,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
         }
         let native = self.store.native.as_ref().unwrap().clone();
         let _transition = native.transition.lock().await;
+        self.store.validation.readable()?;
         if self.store.native_is_closing() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,

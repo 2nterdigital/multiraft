@@ -16,6 +16,8 @@ pub(super) struct SnapshotRuntime {
     pub(super) operations: Mutex<
         std::collections::HashMap<multiraft_core::GroupId, Arc<super::maintenance::Operation>>,
     >,
+    pub(super) validation_closed: std::sync::atomic::AtomicBool,
+    pub(super) validation_budget: Arc<tokio::sync::Semaphore>,
     pub(super) build_budget: Arc<tokio::sync::Semaphore>,
     pub(super) catalog: Option<Arc<SnapshotCatalog>>,
     pub(super) ads: Mutex<Vec<SnapshotAdvertisement>>,
@@ -43,6 +45,8 @@ impl SnapshotRuntime {
             maintenance_tasks: super::tasks::OwnedTasks::default(),
             sampler_budget: Arc::new(tokio::sync::Semaphore::new(1)),
             operations: Mutex::new(Default::default()),
+            validation_closed: std::sync::atomic::AtomicBool::new(false),
+            validation_budget: Arc::new(tokio::sync::Semaphore::new(1)),
             build_budget: Arc::new(tokio::sync::Semaphore::new(1)),
             catalog,
             ads: Mutex::new(Self::load_ads(&config.data_dir)),

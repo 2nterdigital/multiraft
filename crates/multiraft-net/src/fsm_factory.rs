@@ -45,6 +45,19 @@ where
     /// Returns an error when the state machine cannot be constructed.
     fn create(&self, context: FsmFactoryContext) -> anyhow::Result<S>;
 
+    /// Deadline for the owned asynchronous FSM validation hook, including admission.
+    /// Node Groups share one concurrent external validator slot by default.
+    fn validation_timeout(&self, _context: FsmFactoryContext) -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
+
+    /// Optional consumer-owned shared validator admission. Return the same
+    /// semaphore for all Groups that share the resource; `None` uses one slot
+    /// for this node. Acquisition is covered by `validation_timeout`.
+    fn validation_budget(&self) -> Option<std::sync::Arc<tokio::sync::Semaphore>> {
+        None
+    }
+
     /// Validate the local application image after native recovery reaches the
     /// persisted commit point, before the owned runtime admits Group requests.
     ///

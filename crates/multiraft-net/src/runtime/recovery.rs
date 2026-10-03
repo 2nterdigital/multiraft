@@ -71,7 +71,15 @@ impl<S: StateMachine> RuntimeShared<S> {
         self.node
             .wait_for_owned_recovery(group.group_id, timeout)
             .await?;
-        self.node.validate_recovered(group.group_id).await?;
+        let mut closed = self.closed.subscribe();
+        if *closed.borrow() {
+            return Err(RuntimeError::Closed);
+        }
+        tokio::select! {
+            biased;
+            _ = closed.changed() => return Err(RuntimeError::Closed),
+            result = self.node.validate_recovered(group.group_id) => result?,
+        }
         self.node.ensure_recovery_running(group.group_id)?;
         Ok(())
     }
