@@ -4,8 +4,10 @@
 
 mod native;
 mod release;
+mod validation;
 pub use native::{NativeBuildReservation, NativeCaptureError, NativeSmOptions, SnapshotBuilder};
 pub use release::{StateMachineRelease, WeakStateMachineStore};
+pub use validation::ValidationOptions;
 
 use std::io;
 use std::io::Cursor;
@@ -94,6 +96,7 @@ pub struct StateMachineStore<S: StateMachine> {
     catalog: Option<Arc<SnapshotCatalog>>,
     on_standby_trigger: Option<TriggerCb>,
     release: StateMachineRelease,
+    validation: Arc<validation::ValidationRuntime>,
 }
 
 impl<S: StateMachine> std::fmt::Debug for StateMachineStore<S> {
@@ -117,6 +120,7 @@ impl<S: StateMachine> Clone for StateMachineStore<S> {
             catalog: self.catalog.clone(),
             on_standby_trigger: self.on_standby_trigger.clone(),
             release: self.release.clone(),
+            validation: self.validation.clone(),
         }
     }
 }
@@ -136,6 +140,7 @@ impl<S: StateMachine> StateMachineStore<S> {
 
     pub fn with_options(group_id: GroupId, fsm: S, opts: SmOptions) -> Self {
         let released = Arc::new(release::ReleaseState::default());
+        let required = fsm.requires_recovery_validation();
         Self {
             group_id,
             inner: Arc::new(Mutex::new(StateMachineStoreInner::new(
@@ -148,6 +153,10 @@ impl<S: StateMachine> StateMachineStore<S> {
             catalog: opts.catalog,
             on_standby_trigger: opts.on_standby_trigger,
             release: StateMachineRelease { state: released },
+            validation: Arc::new(validation::ValidationRuntime::new(
+                required,
+                ValidationOptions::default(),
+            )),
         }
     }
 
@@ -166,8 +175,9 @@ impl<S: StateMachine> StateMachineStore<S> {
 
     /// Inspect the underlying FSM (for tests / local reads).
     pub async fn with_fsm<R>(&self, f: impl FnOnce(&S) -> R) -> R {
-        let inner = self.inner.lock().await;
-        f(&inner.fsm)
+        self.try_with_fsm(f)
+            .await
+            .expect("application generation is not validated")
     }
 
     /// Last applied `(index, term)` from the SM store (source of truth for FSM watermark).
@@ -192,6 +202,7 @@ impl<S: StateMachine> StateMachineStore<S> {
     ) -> Result<CatalogEntry, io::Error> {
         let data = {
             let inner = self.inner.lock().await;
+            self.validation.readable()?;
             inner
                 .fsm
                 .freeze_for_snapshot(group)
@@ -273,6 +284,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         }
 
         let mut inner = self.inner.lock().await;
+        self.validation.readable()?;
 
         let data = inner
             .fsm
@@ -353,6 +365,8 @@ where
     where
         Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend,
     {
+        let _transition = self.validation.transition.lock().await;
+        self.validation.applicable()?;
         let mut pending_triggers: Vec<(GroupId, u64, u64)> = Vec::new();
 
         {
@@ -381,6 +395,7 @@ where
                         ));
                     }
                 }
+                self.validation.changed();
                 inner.last_applied_log = Some(entry.log_id);
 
                 let response = match &entry.payload {
@@ -441,49 +456,17 @@ where
                 .install_native_snapshot(meta, snapshot.into_inner())
                 .await;
         }
-        tracing::info!(
-            { snapshot_size = snapshot.get_ref().len() },
-            "decoding snapshot for installation"
-        );
-
-        let data = snapshot.into_inner();
-        let new_snapshot = StoredSnapshot {
-            meta: meta.clone(),
-            data: data.clone(),
-        };
-
-        let mut inner = self.inner.lock().await;
-        let group_id = inner.group_id;
-        inner
-            .fsm
-            .restore(group_id, &data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        inner.last_applied_log = meta.last_log_id;
-        inner.last_membership = meta.last_membership.clone();
-        inner.current_snapshot = Some(new_snapshot);
-        drop(inner);
-
-        if let Some(catalog) = &self.catalog {
-            let (last_index, last_term) = match &meta.last_log_id {
-                Some(id) => (id.index(), id.committed_leader_id().term),
-                None => (0, 0),
-            };
-            catalog.write(
-                group_id,
-                last_index,
-                last_term,
-                meta.snapshot_id.clone(),
-                &data,
-            )?;
-        }
-
-        Ok(())
+        self.install_legacy_validated(meta, snapshot.into_inner())
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<SnapshotOf<TypeConfig, Self::SnapshotData>>, io::Error> {
+        if !self.validation.recovering() {
+            self.validation.readable()?;
+        }
         if self.native.is_some() {
             return self.load_native_snapshot().await;
         }

@@ -145,6 +145,11 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
     let res = match req.path.as_str() {
         "/raft/append" => api::append(&raft, &req.payload).await,
         "/raft/snapshot" => {
+            // Native storage errors are fatal, including WouldBlock. Refuse peer
+            // input here, before Core/SM dispatch, while startup proof is pending.
+            state_machine.application_ready().map_err(|_| {
+                Status::unavailable("application validation pending; peer snapshot not dispatched")
+            })?;
             let result =
                 api::snapshot(&raft, &req.payload, state_machine.snapshot_byte_limit()).await;
             // Fatal/Stopped can close the native API waiter before the application

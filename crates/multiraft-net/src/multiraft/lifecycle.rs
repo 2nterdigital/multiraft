@@ -2,6 +2,15 @@
 use super::*;
 
 impl<S: StateMachine> MultiRaft<S> {
+    pub(crate) fn cancel_pending_validation(&self) {
+        self.snapshot_rt
+            .validation_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        for group in self.groups.lock().unwrap().values() {
+            group.state_machine.cancel_pending_validation();
+        }
+    }
+
     pub(crate) fn abort_background(&self) {
         self.snapshot_rt
             .stopping

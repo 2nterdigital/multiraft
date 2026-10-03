@@ -82,8 +82,7 @@ fn fully_validated_inactive_generation_is_inert_and_never_promoted_to_active() {
         last_membership: Default::default(),
         snapshot_id: "inert".to_owned(),
     };
-    let staged = catalog.stage_native(7, &meta, b"inert-data", 1024).unwrap();
-    drop(staged);
+    let _staged = catalog.stage_native(7, &meta, b"inert-data", 1024).unwrap();
     assert_eq!(
         catalog.startup_provenance(7, 1024).unwrap(),
         StartupProvenance::Pristine

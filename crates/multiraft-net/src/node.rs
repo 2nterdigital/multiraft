@@ -158,6 +158,12 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
         RaftCall::Vote(req) => RaftReply::Vote(raft.vote(req).await),
         RaftCall::Append(req) => RaftReply::Append(raft.append_entries(req).await),
         RaftCall::Snapshot { vote, meta, data } => {
+            // Deferral belongs to transport ingress: returning a storage error
+            // from the SM worker would fatally stop this native Group.
+            if state_machine.application_ready().is_err() {
+                let _ = response_tx.send(RaftReply::SnapshotUnavailable);
+                return;
+            }
             let snapshot_cap = state_machine.snapshot_byte_limit();
             if data.len() > snapshot_cap
                 || bincode::serialized_size(&(vote, &meta, &data))
