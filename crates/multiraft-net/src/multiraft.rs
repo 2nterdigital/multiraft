@@ -54,6 +54,7 @@ use crate::GroupControlRequestResult;
 use crate::StateMachineFactory;
 use multiraft_core::ClusterConfig;
 use multiraft_core::GroupId;
+use multiraft_core::LogStorageBackend;
 use multiraft_core::MultiRaftError;
 use multiraft_core::NodeId;
 use multiraft_core::NodeRole;
@@ -77,6 +78,7 @@ use multiraft_store::SmOptions;
 use multiraft_store::SnapshotCatalog;
 use multiraft_store::StateMachineStore;
 use multiraft_store::TriggerCb;
+use multiraft_store::{NativeRaftLogStore, RocksLogDb};
 use openraft::async_runtime::WatchReceiver;
 use openraft::error::InitializeError;
 use openraft::error::RaftError;
@@ -200,6 +202,7 @@ enum NetBackend {
 pub struct MultiRaft<S: StateMachine = CounterFsm> {
     node_id: NodeId,
     config: ClusterConfig,
+    rocks_log_db: Mutex<Option<RocksLogDb<TypeConfig>>>,
     net: NetBackend,
     groups: GroupMap<S>,
     tasks: tasks::OwnedTasks,

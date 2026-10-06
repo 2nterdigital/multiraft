@@ -12,6 +12,8 @@ impl<S: StateMachine> MultiRaft<S> {
         let snapshot_policy_name = "never";
         let storage = if self.config.data_dir.as_os_str().is_empty() {
             "memory"
+        } else if self.config.log_storage_backend == LogStorageBackend::RocksDb {
+            "rocksdb"
         } else {
             "file"
         };
@@ -198,125 +200,20 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         let _ = sm_holder.set(state_machine_store.downgrade());
 
-        let mut durable_basis = None;
+        let mut log_store = self.open_native_log(group)?;
+        let durable_basis = if recovery::durable_local_mode(&self.config) {
+            Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?)
+        } else {
+            None
+        };
         let raft = match &self.net {
             NetBackend::InProcess { router, .. } => {
                 let network = crate::election_source::ObservedFactory::new(NetworkFactory::new(router.clone(), group), group, self.election_source.clone());
-                if self.config.data_dir.as_os_str().is_empty() {
-                    let log_store = MemLogStore::default();
-                    openraft::Raft::new_with_election_observer(
-                        self.node_id,
-                        config,
-                        network,
-                        log_store,
-                        state_machine_store.clone(),
-                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
-                    )
-                    .await
-                } else {
-                    let dir = self.config.data_dir.join(format!("group-{group}"));
-                    let mut log_store = FileLogStoreOf::open_with_full_options(
-                        &dir,
-                        self.config.file_log_coalesce_us,
-                        self.config.file_log_sync_level,
-                        FileLogStreamOptions {
-                            stream_buf_bytes: self.config.file_log_stream_buf_bytes,
-                            stream_flush_ms: self.config.file_log_stream_flush_ms,
-                            hold_overlap: self.config.file_log_hold_overlap,
-                        },
-                    )
-                    .map_err(|error| {
-                        tracing::error!(
-                            target: "multiraft::recovery",
-                            operation = "group_start",
-                            phase = "error",
-                            node_id = self.node_id,
-                            group_id = group,
-                            transport,
-                            storage,
-                            directory = %dir.display(),
-                            error = %error,
-                            error_debug = ?error,
-                            "failed to open file-backed Raft log"
-                        );
-                        let message = format!(
-                            "open file log for node {}, group {} at {}: {error}",
-                            self.node_id, group, dir.display()
-                        );
-                        MultiRaftError::Other(anyhow::Error::new(error).context(message))
-                    })?;
-                    if recovery::durable_local_mode(&self.config) {
-                        durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
-                    }
-                    openraft::Raft::new_with_election_observer(
-                        self.node_id,
-                        config,
-                        network,
-                        log_store,
-                        state_machine_store.clone(),
-                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
-                    )
-                    .await
-                }
+                openraft::Raft::new_with_election_observer(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>)).await
             }
             NetBackend::Grpc { router } => {
                 let network = crate::election_source::ObservedFactory::new(GrpcNetworkFactory::new(router.clone(), group), group, self.election_source.clone());
-                if self.config.data_dir.as_os_str().is_empty() {
-                    let log_store = MemLogStore::default();
-                    openraft::Raft::new_with_election_observer(
-                        self.node_id,
-                        config,
-                        network,
-                        log_store,
-                        state_machine_store.clone(),
-                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
-                    )
-                    .await
-                } else {
-                    let dir = self.config.data_dir.join(format!("group-{group}"));
-                    let mut log_store = FileLogStoreOf::open_with_full_options(
-                        &dir,
-                        self.config.file_log_coalesce_us,
-                        self.config.file_log_sync_level,
-                        FileLogStreamOptions {
-                            stream_buf_bytes: self.config.file_log_stream_buf_bytes,
-                            stream_flush_ms: self.config.file_log_stream_flush_ms,
-                            hold_overlap: self.config.file_log_hold_overlap,
-                        },
-                    )
-                    .map_err(|error| {
-                        tracing::error!(
-                            target: "multiraft::recovery",
-                            operation = "group_start",
-                            phase = "error",
-                            node_id = self.node_id,
-                            group_id = group,
-                            transport,
-                            storage,
-                            directory = %dir.display(),
-                            error = %error,
-                            error_debug = ?error,
-                            "failed to open file-backed Raft log"
-                        );
-                        let message = format!(
-                            "open file log for node {}, group {} at {}: {error}",
-                            self.node_id, group, dir.display()
-                        );
-                        MultiRaftError::Other(anyhow::Error::new(error).context(message))
-                    })?;
-                    if recovery::durable_local_mode(&self.config) {
-                        durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
-                    }
-                    openraft::Raft::new_with_election_observer(
-                        self.node_id,
-                        config,
-                        network,
-                        log_store,
-                        state_machine_store.clone(),
-                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
-                    )
-                    .await
-                }
+                openraft::Raft::new_with_election_observer(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>)).await
             }
         }
         .map_err(|error| {

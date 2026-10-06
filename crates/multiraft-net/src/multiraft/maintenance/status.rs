@@ -1,13 +1,19 @@
 //! One sampler's validated provider/native/log facts, never application payloads.
 use super::*;
 
+pub(super) enum LogInspection {
+    Memory,
+    File(PathBuf),
+    Rocks(RocksLogDb<TypeConfig>),
+}
+
 pub(super) async fn collect<S: StateMachine>(
     node: NodeId,
     group: GroupId,
     mode: SnapshotMode,
     raft: Raft<S>,
     sm: StateMachineStore<S>,
-    directory: Option<PathBuf>,
+    inspection: LogInspection,
     state: Option<Arc<Mutex<(CompactionProgress, bool)>>>,
 ) -> Result<LocalStorageStatus, CompactionRejection> {
     tracing::trace!(target: "multiraft::maintenance", operation = "storage_status",
@@ -22,18 +28,21 @@ pub(super) async fn collect<S: StateMachine>(
             bytes: snapshot.size,
         });
     let metrics = raft.metrics().borrow_watched().clone();
-    let retained_log_bytes = if let Some(directory) = directory {
-        Some(
-            tokio::task::spawn_blocking(move || {
-                FileLogStoreOf::measure_retained_log_bytes(directory)
-            })
-            .await
-            .map_err(|_| CompactionRejection::StorageFailure)?
-            .map_err(|_| CompactionRejection::StorageFailure)?,
-        )
-    } else {
-        None
+    let log_storage_backend = match &inspection {
+        LogInspection::Memory => None,
+        LogInspection::File(_) => Some(LogStorageBackend::FileLog),
+        LogInspection::Rocks(_) => Some(LogStorageBackend::RocksDb),
     };
+    let retained_log_bytes = tokio::task::spawn_blocking(move || match inspection {
+        LogInspection::Memory => Ok(None),
+        LogInspection::File(directory) => {
+            FileLogStoreOf::measure_retained_log_bytes(directory).map(Some)
+        }
+        LogInspection::Rocks(db) => db.retained_log_bytes(group).map(Some),
+    })
+    .await
+    .map_err(|_| CompactionRejection::StorageFailure)?
+    .map_err(|_| CompactionRejection::StorageFailure)?;
     let state = state
         .map(|state| *state.lock().unwrap())
         .unwrap_or((CompactionProgress::Idle, false));
@@ -44,6 +53,12 @@ pub(super) async fn collect<S: StateMachine>(
         durable_snapshot,
         native_snapshot: metrics.snapshot.map(observed),
         purged: metrics.purged.map(observed),
+        retained_log_bytes_kind: match log_storage_backend {
+            None => "unavailable",
+            Some(LogStorageBackend::FileLog) => "physical_file",
+            Some(LogStorageBackend::RocksDb) => "encoded_entries",
+        },
+        log_storage_backend,
         retained_log_bytes,
         progress: state.0,
         no_purge_needed: state.1,

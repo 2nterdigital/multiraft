@@ -1,6 +1,6 @@
 //! Independent multi-Group byte FSM consumer, using only owned runtime APIs.
-use multiraft_core::{ClusterConfig, FileLogSyncLevel};
-use multiraft_fsm::{ApplyOut, GroupId, StateMachine};
+use multiraft_core::{ClusterConfig, FileLogSyncLevel, LogStorageBackend, SnapshotMode};
+use multiraft_fsm::{ApplyOut, CaptureError, CaptureRefusal, GroupId, StateMachine};
 use multiraft_net::{GroupConfig, NodeOwner, RuntimeConfig, RuntimeHandle};
 use std::{
     io,
@@ -31,6 +31,12 @@ impl StateMachine for Bytes {
         })
     }
     fn snapshot(&self, _: GroupId) -> Result<Vec<u8>, Self::Error> {
+        Ok(self.value.clone())
+    }
+    fn freeze_bounded(&self, _: GroupId, cap: usize) -> Result<Vec<u8>, CaptureError<Self::Error>> {
+        if self.value.len() > cap {
+            return Err(CaptureError::Refused(CaptureRefusal::SizeLimit));
+        }
         Ok(self.value.clone())
     }
     fn restore(&mut self, _: GroupId, bytes: &[u8]) -> Result<(), Self::Error> {
@@ -100,7 +106,19 @@ async fn write_read(handles: &[RuntimeHandle<Bytes>], group: GroupId, bytes: &[u
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_group_majority_requires_restarted_peer_and_shutdown_releases_resources() {
-    let root = tempfile::tempdir().unwrap();
+    multi_group_restart(LogStorageBackend::FileLog).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rocksdb_multi_group_restart_compaction_and_backend_observation() {
+    multi_group_restart(LogStorageBackend::RocksDb).await;
+}
+
+async fn multi_group_restart(backend: LogStorageBackend) {
+    let scratch =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/issue267/runtime");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let root = tempfile::tempdir_in(scratch).unwrap();
     let listeners: Vec<_> = (0..3)
         .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -117,6 +135,11 @@ async fn multi_group_majority_requires_restarted_peer_and_shutdown_releases_reso
             config.peers = peers.clone();
             config.data_dir = root.path().join(format!("node-{node}"));
             config.file_log_sync_level = FileLogSyncLevel::Data;
+            config.log_storage_backend = backend;
+            if backend == LogStorageBackend::RocksDb {
+                config.snapshot_mode = SnapshotMode::NativeDurable;
+                config.retain_log_entries = 1;
+            }
             config
         })
         .collect();
@@ -129,6 +152,29 @@ async fn multi_group_majority_requires_restarted_peer_and_shutdown_releases_reso
     let handles = [first.handle(), second.handle(), third.handle()];
     write_read(&handles, 7, b"first Group").await;
     write_read(&handles, 8, b"second Group").await;
+    if backend == LogStorageBackend::RocksDb {
+        for group in [7, 8] {
+            let leader = authoritative(&handles, group).await;
+            leader.request_compaction(group, deadline()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let status = leader
+                        .local_storage_status(group, deadline())
+                        .await
+                        .unwrap();
+                    assert_eq!(status.log_storage_backend, Some(LogStorageBackend::RocksDb));
+                    assert_eq!(status.retained_log_bytes_kind, "encoded_entries");
+                    assert!(status.retained_log_bytes.is_some());
+                    if status.durable_snapshot.is_some() && status.purged.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
     third.shutdown(deadline()).await.unwrap();
     assert_eq!(released.load(Ordering::SeqCst), 2);
     TcpListener::bind(peers[2].1).unwrap();

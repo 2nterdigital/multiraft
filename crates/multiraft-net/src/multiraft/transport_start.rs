@@ -11,6 +11,7 @@ impl<S: StateMachine> MultiRaft<S> {
         config
             .validate_snapshot_storage()
             .map_err(anyhow::Error::msg)?;
+        let rocks_log_db = recovery::open_node_log(&config).await?;
         let groups: GroupMap<S> = Arc::new(Mutex::new(BTreeMap::new()));
         let (node, _tx) = Node::with_groups(config.node_id, router.clone(), groups.clone());
         let tasks = tasks::OwnedTasks::default();
@@ -26,6 +27,7 @@ impl<S: StateMachine> MultiRaft<S> {
         Ok(Self {
             node_id: config.node_id,
             config,
+            rocks_log_db: Mutex::new(rocks_log_db),
             net: NetBackend::InProcess { router, glue },
             groups,
             tasks,
@@ -65,6 +67,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 )
             })?;
 
+        let rocks_log_db = recovery::open_node_log(&config).await?;
         let groups: GroupMap<S> = Arc::new(Mutex::new(BTreeMap::new()));
         let grpc_router = GrpcRouter::from_config(&config);
         let standby_throttle = grpc_router.throttle().clone();
@@ -96,6 +99,7 @@ impl<S: StateMachine> MultiRaft<S> {
         Ok(Self {
             node_id: config.node_id,
             config,
+            rocks_log_db: Mutex::new(rocks_log_db),
             net: NetBackend::Grpc {
                 router: grpc_router,
             },

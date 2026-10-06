@@ -6,6 +6,8 @@
 mod durability;
 mod log_file;
 mod log_mem;
+mod log_rocks;
+mod native_log;
 mod sm_bridge;
 mod snapshot_catalog;
 pub mod stub_network;
@@ -13,6 +15,8 @@ pub mod stub_network;
 pub use log_file::FileLogStore;
 pub use log_file::FileLogStreamOptions;
 pub use log_mem::LogStore;
+pub use log_rocks::{RocksLogDb, RocksLogStore};
+pub use native_log::NativeRaftLogStore;
 pub use sm_bridge::build_standby_snapshot_async;
 pub use sm_bridge::SmOptions;
 pub use sm_bridge::StateMachineStore;

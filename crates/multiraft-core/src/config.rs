@@ -26,6 +26,15 @@ pub enum SnapshotMode {
     NativeDurable,
 }
 
+/// Local durable Raft log backend. Empty data directories still use memory logs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogStorageBackend {
+    #[default]
+    FileLog,
+    /// Shared node database with group-scoped logs and synchronous WAL writes.
+    RocksDb,
+}
+
 /// Local file-log durability after each durable write (aligned with Aeron Archive/Cluster
 /// `file.sync.level`, PostgreSQL `fdatasync`/`fsync`, and common WAL sync grades).
 ///
@@ -69,8 +78,11 @@ pub struct ClusterConfig {
     pub node_id: NodeId,
     pub peers: Vec<(NodeId, SocketAddr)>,
     /// When empty, MultiRaft uses an in-memory log. When set, uses a file-backed
-    /// log at `{data_dir}/group-{id}/`.
+    /// log selected by log_storage_backend: FileLog at `{data_dir}/group-{id}/`
+    /// or one shared RocksDB at `{data_dir}/raft-rocksdb/`.
     pub data_dir: PathBuf,
+    /// Durable backend used when data_dir is non-empty.
+    pub log_storage_backend: LogStorageBackend,
     pub heartbeat_interval_ms: u64,
     pub election_timeout_min_ms: u64,
     pub election_timeout_max_ms: u64,
@@ -115,7 +127,8 @@ pub struct ClusterConfig {
     /// File log group-commit window in microseconds (`0` = flush each append immediately).
     /// Only used when [`Self::data_dir`] is set. Hotpath file benches typically use `100`.
     pub file_log_coalesce_us: u64,
-    /// Local disk sync strength for file-backed logs; ignored when `data_dir` is empty.
+    /// Local disk sync strength; ignored when data_dir is empty. RocksDB always
+    /// synchronizes WAL writes: Os/Data use fdatasync and All selects fsync.
     /// Default [`FileLogSyncLevel::Os`] (page-cache writes, Aeron level 0).
     pub file_log_sync_level: FileLogSyncLevel,
     /// Minimum pending `log.bin` bytes before a stream flush at [`FileLogSyncLevel::Os`]
@@ -155,9 +168,10 @@ impl ClusterConfig {
         }
         if self.snapshot_mode == SnapshotMode::NativeDurable {
             if self.data_dir.as_os_str().is_empty()
-                || self.file_log_sync_level == FileLogSyncLevel::Os
+                || (self.log_storage_backend == LogStorageBackend::FileLog
+                    && self.file_log_sync_level == FileLogSyncLevel::Os)
             {
-                return Err("native durable snapshots require Data-or-stronger file logs");
+                return Err("native durable snapshots require a durable log backend");
             }
             if self.role != NodeRole::Voter {
                 return Err("native durable snapshots require native voter mode");
@@ -199,6 +213,7 @@ impl ClusterConfig {
             node_id,
             peers,
             data_dir: PathBuf::new(),
+            log_storage_backend: LogStorageBackend::FileLog,
             heartbeat_interval_ms: 100,
             election_timeout_min_ms: 300,
             election_timeout_max_ms: 600,

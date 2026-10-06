@@ -16,6 +16,7 @@ mod type_config;
 
 pub use config::ClusterConfig;
 pub use config::FileLogSyncLevel;
+pub use config::LogStorageBackend;
 pub use config::NodeRole;
 pub use config::SnapshotMode;
 pub use error::MultiRaftError;

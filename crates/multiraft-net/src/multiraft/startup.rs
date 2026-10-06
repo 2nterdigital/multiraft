@@ -26,10 +26,9 @@ impl<S: StateMachine> MultiRaft<S> {
     ) -> Result<(StartupProvenance, tokio::time::Instant), MultiRaftError> {
         let mut provenance = StartupProvenance::Pristine;
         if !self.config.data_dir.as_os_str().is_empty() {
-            provenance = FileLogStoreOf::startup_provenance(
-                self.config.data_dir.join(format!("group-{group}")),
-            )
-            .map_err(|e| MultiRaftError::Other(e.into()))?;
+            provenance = self
+                .log_provenance(group)
+                .map_err(|e| MultiRaftError::Other(e.into()))?;
             let catalog = SnapshotCatalog::new(self.config.data_dir.join("snapshots"), 1);
             let snapshots = catalog
                 .startup_provenance(group, self.config.max_snapshot_bytes)

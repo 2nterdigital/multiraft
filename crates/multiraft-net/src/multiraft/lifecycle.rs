@@ -105,6 +105,9 @@ impl<S: StateMachine> MultiRaft<S> {
                 release.wait().await;
             }
         }
+        // All groups and retained sampler/operation children have joined. Release
+        // the node's engine even when the stopped direct facade remains alive.
+        self.rocks_log_db.lock().unwrap().take();
         tracing::info!(target: "multiraft::recovery", operation = "node_shutdown", phase = "complete",
             node_id = self.node_id, remaining_groups = 0_u64, "shut down Multi-Raft node");
         if let Some(source) = &self.election_source {

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+rocksdb = { version = "=0.25.0", default-features = false }
 futures = { workspace = true }
 multiraft-core = { path = "../multiraft-core" }
 multiraft-fsm = { path = "../multiraft-fsm" }
