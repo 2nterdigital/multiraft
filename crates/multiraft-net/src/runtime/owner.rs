@@ -118,6 +118,7 @@ impl<S: StateMachine> NodeOwner<S> {
                 group_creation: tokio::sync::Mutex::new(()),
                 startups: OwnedTasks::default(),
                 source_jobs: OwnedTasks::default(),
+                proposals: OwnedTasks::default(),
                 startup_admission: Mutex::new(startup::StartupAdmission::default()),
                 cleanup_started: AtomicBool::new(false),
                 completed,
@@ -200,6 +201,7 @@ impl<S: StateMachine> RuntimeShared<S> {
         self.closed.send_replace(true);
         self.node.cancel_pending_validation();
         self.slots.close();
+        self.proposals.close();
         if self.cleanup_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -232,9 +234,17 @@ impl<S: StateMachine> RuntimeShared<S> {
                         .join()
                         .await
                         .map_err(|error| RuntimeError::Source(MultiRaftError::Other(error)));
+                    let proposal_result = shared
+                        .proposals
+                        .join()
+                        .await
+                        .map_err(|error| RuntimeError::Source(MultiRaftError::Other(error)));
                     // A failed/panicked owner task must not bypass native cleanup.
                     let native_result = shared.node.shutdown().await.map_err(RuntimeError::Source);
-                    source_result.and(startup_result).and(native_result)
+                    source_result
+                        .and(startup_result)
+                        .and(proposal_result)
+                        .and(native_result)
                 };
                 let graceful = match tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await {
                     Ok(result) => result,
@@ -255,6 +265,9 @@ impl<S: StateMachine> RuntimeShared<S> {
                             let startup_result = shared.startups.join().await.map_err(|error| {
                                 RuntimeError::Source(MultiRaftError::Other(error))
                             });
+                            let proposal_result = shared.proposals.join().await.map_err(|error| {
+                                RuntimeError::Source(MultiRaftError::Other(error))
+                            });
                             // Keep this full stop/join future IN PLACE across every native
                             // budget window. A timer expiration abandons only that poll,
                             // never retained tasks, blocking children or FSM witnesses.
@@ -270,7 +283,10 @@ impl<S: StateMachine> RuntimeShared<S> {
                             let source_result = shared.source_jobs.join().await.map_err(|error| {
                                 RuntimeError::Source(MultiRaftError::Other(error))
                             });
-                            let retained = source_result.and(startup_result).and(native_result);
+                            let retained = source_result
+                                .and(startup_result)
+                                .and(proposal_result)
+                                .and(native_result);
                             // A real graceful source failure remains the original cause.
                             // For an expired graceful wait, a subsequently observed source
                             // failure is more specific; otherwise retain its uncertainty.

@@ -16,6 +16,7 @@ impl<S: StateMachine> MultiRaft<S> {
             .stopping
             .store(true, std::sync::atomic::Ordering::Release);
         self.snapshot_rt.maintenance_tasks.close();
+        self.log_open_tasks.close();
         self.ingress_accepting
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
@@ -36,6 +37,7 @@ impl<S: StateMachine> MultiRaft<S> {
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.snapshot_rt.maintenance_tasks.close();
+        self.log_open_tasks.close();
         self.ingress_accepting
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
@@ -79,6 +81,9 @@ impl<S: StateMachine> MultiRaft<S> {
         if let Err(error) = self.ingress_tasks.join().await {
             first_error.get_or_insert(MultiRaftError::Other(error));
         }
+        if let Err(error) = self.log_open_tasks.join().await {
+            first_error.get_or_insert(MultiRaftError::Other(error));
+        }
         // Retained operation and sampler jobs include their blocking provider/log
         // children. A canceled join never drops their handles or releases permits.
         if let Err(error) = self.snapshot_rt.maintenance_tasks.join().await {
@@ -114,6 +119,9 @@ impl<S: StateMachine> MultiRaft<S> {
                 release.wait().await;
             }
         }
+        // All groups and retained sampler/operation children have joined. Release
+        // the node's engine even when the stopped direct facade remains alive.
+        self.rocks_log_db.lock().unwrap().take();
         tracing::info!(target: "multiraft::recovery", operation = "node_shutdown", phase = "complete",
             node_id = self.node_id, remaining_groups = 0_u64, "shut down Multi-Raft node");
         if let Some(source) = &self.election_source {

@@ -65,11 +65,24 @@ impl GrpcServer {
         accepting: std::sync::Arc<std::sync::atomic::AtomicBool>,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
+        Self::serve_owned_bound(listener, groups, cap, tasks, accepting, None, shutdown).await
+    }
+
+    pub(crate) async fn serve_owned_bound<S: StateMachine + 'static>(
+        listener: tokio::net::TcpListener,
+        groups: GroupMap<S>,
+        cap: usize,
+        tasks: std::sync::Arc<crate::multiraft::tasks::OwnedTasks>,
+        accepting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fingerprint: Option<[u8; 32]>,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(cap > 0 && cap <= 64 * 1024 * 1024, "invalid snapshot cap");
         let incoming = TcpListenerStream::new(listener);
         let wire_limit = (cap + 1024 * 1024).max(4 * 1024 * 1024);
         let svc = RaftServiceServer::new(RaftServiceImpl {
             groups,
+            fingerprint,
             tasks,
             accepting,
             snapshot_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -87,6 +100,7 @@ impl GrpcServer {
 
 pub(crate) struct RaftServiceImpl<S: StateMachine> {
     pub(crate) groups: GroupMap<S>,
+    fingerprint: Option<[u8; 32]>,
     snapshot_slots: std::sync::Arc<tokio::sync::Semaphore>,
     tasks: std::sync::Arc<crate::multiraft::tasks::OwnedTasks>,
     accepting: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -95,6 +109,7 @@ pub(crate) struct RaftServiceImpl<S: StateMachine> {
 #[tonic::async_trait]
 impl<S: StateMachine + 'static> RaftService for RaftServiceImpl<S> {
     async fn call(&self, request: Request<RaftRequest>) -> Result<Response<RaftResponse>, Status> {
+        super::fingerprint::validate(request.metadata(), self.fingerprint)?;
         if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Status::unavailable("native ingress is closed"));
         }
@@ -115,11 +130,15 @@ impl<S: StateMachine + 'static> RaftService for RaftServiceImpl<S> {
             if !registered {
                 return Err(Status::unavailable("native ingress is closed"));
             }
-            return result
+            let mut response = result
                 .await
-                .map_err(|_| Status::internal("native snapshot task stopped"))?;
+                .map_err(|_| Status::internal("native snapshot task stopped"))??;
+            super::fingerprint::insert(response.metadata_mut(), self.fingerprint);
+            return Ok(response);
         }
-        demux_raft_call(&self.groups, request).await
+        let mut response = demux_raft_call(&self.groups, request).await?;
+        super::fingerprint::insert(response.metadata_mut(), self.fingerprint);
+        Ok(response)
     }
 }
 
@@ -173,3 +192,7 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
 #[cfg(test)]
 #[path = "../../tests/native_service_cancellation/mod.rs"]
 mod cancellation_tests;
+
+#[cfg(test)]
+#[path = "../../tests/raft_fingerprint/mod.rs"]
+mod fingerprint_tests;

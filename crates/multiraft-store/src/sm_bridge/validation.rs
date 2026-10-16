@@ -277,6 +277,17 @@ impl<S: StateMachine> StateMachineStore<S> {
         self.validation.readable()?;
         Ok(f(&inner.fsm))
     }
+    /// Query a validated local FSM and its applied log identity under one lock.
+    /// The callback must be bounded and nonblocking. The watermark describes the
+    /// same view as the returned value; `None` preserves the never-applied state.
+    pub async fn try_with_fsm_and_applied<R>(
+        &self,
+        query: impl FnOnce(&S) -> R,
+    ) -> io::Result<(R, Option<LogIdOf<TypeConfig>>)> {
+        let inner = self.inner.lock().await;
+        self.validation.readable()?;
+        Ok((query(&inner.fsm), inner.last_applied_log))
+    }
     /// Validate the actual snapshot plus applied suffix, then execute the legacy
     /// local consumer check and publish the readiness marker, all on the same generation.
     pub async fn validate_recovery(

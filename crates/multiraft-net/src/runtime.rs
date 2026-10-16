@@ -10,6 +10,8 @@ mod local;
 mod maintenance;
 mod observation;
 mod owner;
+mod proposal;
+pub use proposal::ProposalReceipt;
 mod read;
 mod recovery;
 mod requests;
@@ -168,6 +170,7 @@ pub(super) struct RuntimeShared<S: StateMachine> {
     pub(super) group_creation: tokio::sync::Mutex<()>,
     pub(super) startups: OwnedTasks,
     source_jobs: OwnedTasks,
+    proposals: OwnedTasks,
     startup_admission: Mutex<startup::StartupAdmission>,
     cleanup_started: AtomicBool,
     completed: watch::Sender<Option<Result<(), Arc<RuntimeError>>>>,

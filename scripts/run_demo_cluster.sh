@@ -137,9 +137,14 @@ esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BASE_PORT="${BASE_PORT:-21000}"
-GROUPS="${GROUPS:-10}"
+# Read only exported GROUPS; Bash otherwise supplies the system group IDs.
+CLUSTER_GROUP_COUNT="$(printenv GROUPS || true)"
+CLUSTER_GROUP_COUNT="${CLUSTER_GROUP_COUNT:-10}"
+unset GROUPS
+GROUPS="$CLUSTER_GROUP_COUNT"
 NODES="${NODES:-3}"
 DATA="${DATA_DIR:-$ROOT/.demo-data}"
+export DATA_DIR="$DATA"
 # gRPC peer table must include Standby ids or voters cannot replicate to it.
 PEER_NODES="$NODES"
 if [[ "$STANDBY" == "1" ]]; then
@@ -250,3 +255,9 @@ if [[ "$STANDBY" == "1" ]]; then
 fi
 
 echo "  metrics: http://127.0.0.1:$((BASE_PORT + 100))/metrics/links"
+
+# shellcheck source=scripts/cluster_lib.sh
+. "$ROOT/scripts/cluster_lib.sh"
+export DEMO_BIN="$BIN"
+cluster_write_descriptor
+echo "  descriptor: $DATA/cluster.json"

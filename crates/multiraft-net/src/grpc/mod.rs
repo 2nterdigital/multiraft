@@ -4,6 +4,7 @@
 //! carries `group_id` + path + bincode payload (native Raft request/response types).
 
 mod channel_pool;
+mod fingerprint;
 pub mod router;
 pub mod server;
 

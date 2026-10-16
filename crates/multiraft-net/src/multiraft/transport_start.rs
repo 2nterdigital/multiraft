@@ -8,9 +8,14 @@ impl<S: StateMachine> MultiRaft<S> {
         glue: ClusterGlue,
         factory: Arc<dyn StateMachineFactory<S>>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.raft_transport_fingerprint.is_none(),
+            "fingerprinted Raft transport requires gRPC"
+        );
         config
             .validate_snapshot_storage()
             .map_err(anyhow::Error::msg)?;
+        recovery::check_node_log(&config)?;
         let groups: GroupMap<S> = Arc::new(Mutex::new(BTreeMap::new()));
         let (node, _tx) = Node::with_groups(config.node_id, router.clone(), groups.clone());
         let tasks = tasks::OwnedTasks::default();
@@ -26,6 +31,9 @@ impl<S: StateMachine> MultiRaft<S> {
         Ok(Self {
             node_id: config.node_id,
             config,
+            rocks_log_db: Arc::new(Mutex::new(None)),
+            log_opening: Arc::new(tokio::sync::Mutex::new(false)),
+            log_open_tasks: tasks::OwnedTasks::default(),
             net: NetBackend::InProcess { router, glue },
             groups,
             tasks,
@@ -65,6 +73,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 )
             })?;
 
+        recovery::check_node_log(&config)?;
         let groups: GroupMap<S> = Arc::new(Mutex::new(BTreeMap::new()));
         let grpc_router = GrpcRouter::from_config(&config);
         let standby_throttle = grpc_router.throttle().clone();
@@ -72,6 +81,7 @@ impl<S: StateMachine> MultiRaft<S> {
 
         let groups_for_server = groups.clone();
         let snapshot_cap = config.max_snapshot_bytes;
+        let fingerprint = config.raft_transport_fingerprint;
         let listener = tokio::net::TcpListener::bind(self_addr).await?;
         let tasks = tasks::OwnedTasks::default();
         let ingress_tasks = Arc::new(tasks::OwnedTasks::default());
@@ -80,12 +90,13 @@ impl<S: StateMachine> MultiRaft<S> {
         let service_tasks = ingress_tasks.clone();
         let service_accepting = ingress_accepting.clone();
         tasks.spawn_result(async move {
-            GrpcServer::serve_owned(
+            GrpcServer::serve_owned_bound(
                 listener,
                 groups_for_server,
                 snapshot_cap,
                 service_tasks,
                 service_accepting,
+                fingerprint,
                 async move {
                     let _ = stopped.await;
                 },
@@ -96,6 +107,9 @@ impl<S: StateMachine> MultiRaft<S> {
         Ok(Self {
             node_id: config.node_id,
             config,
+            rocks_log_db: Arc::new(Mutex::new(None)),
+            log_opening: Arc::new(tokio::sync::Mutex::new(false)),
+            log_open_tasks: tasks::OwnedTasks::default(),
             net: NetBackend::Grpc {
                 router: grpc_router,
             },

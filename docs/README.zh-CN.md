@@ -28,6 +28,8 @@
 | [2026-07-21-aeron-inspired-hotpath-design.md](./specs/2026-07-21-aeron-inspired-hotpath-design.md) | [2026-07-21-aeron-inspired-hotpath-design.zh-CN.md](./specs/2026-07-21-aeron-inspired-hotpath-design.zh-CN.md) | 热路径 + 设计理念（M1–M4） |
 | [2026-07-22-sync1-disk-pipeline-merge.md](./specs/2026-07-22-sync1-disk-pipeline-merge.md) | [2026-07-22-sync1-disk-pipeline-merge.zh-CN.md](./specs/2026-07-22-sync1-disk-pipeline-merge.zh-CN.md) | M4：深流水线 / sync=1 组提交 / 复制批与拐点 |
 | [2026-07-22-aeron-next-borrow.md](./specs/2026-07-22-aeron-next-borrow.md) | [2026-07-22-aeron-next-borrow.zh-CN.md](./specs/2026-07-22-aeron-next-borrow.zh-CN.md) | 下一阶段 Aeron 借鉴 backlog（N1–N3） |
+| [2026-10-16-slot-multiraft-feasibility.md](./specs/2026-10-16-slot-multiraft-feasibility.md) | [2026-10-16-slot-multiraft-feasibility.zh-CN.md](./specs/2026-10-16-slot-multiraft-feasibility.zh-CN.md) | Slot MultiRaft 可行性与已确认实施范围 |
+| [2026-10-16-slot-multiraft-foundation.md](./specs/2026-10-16-slot-multiraft-foundation.md) | [2026-10-16-slot-multiraft-foundation.zh-CN.md](./specs/2026-10-16-slot-multiraft-foundation.zh-CN.md) | 固定 Slot MultiRaft 底座：合同、路由、恢复与边界 |
 
 ## 对照 / 定位
 
@@ -44,6 +46,7 @@
 |-----------|------|------|
 | [2026-07-18-multiraft.md](./plans/2026-07-18-multiraft.md) | [2026-07-18-multiraft.zh-CN.md](./plans/2026-07-18-multiraft.zh-CN.md) | 一期库 + Demo |
 | [2026-07-18-multiraft-grpc.md](./plans/2026-07-18-multiraft-grpc.md) | [2026-07-18-multiraft-grpc.zh-CN.md](./plans/2026-07-18-multiraft-grpc.zh-CN.md) | 跨进程 gRPC（Phase-1.5） |
+| [2026-10-16-slot-multiraft-foundation.md](./plans/2026-10-16-slot-multiraft-foundation.md) | [2026-10-16-slot-multiraft-foundation.zh-CN.md](./plans/2026-10-16-slot-multiraft-foundation.zh-CN.md) | 已授权实施步骤与固定源码验证证据 |
 
 ## 运维
 

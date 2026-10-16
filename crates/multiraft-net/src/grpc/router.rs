@@ -78,6 +78,7 @@ struct RpcTransport {
     channels: GrpcPeerChannelPool,
     throttle: StandbyThrottle,
     snapshot_cap: usize,
+    fingerprint: Option<[u8; 32]>,
 }
 impl RpcTransport {
     async fn send<Req, Resp>(
@@ -129,13 +130,17 @@ impl RpcTransport {
                 if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
                     return Err(SendCause::Deadline { dispatched: false });
                 }
+                let mut request = tonic::Request::new(RaftRequest {
+                    group_id: group,
+                    path: method.to_owned(),
+                    payload,
+                });
+                super::fingerprint::insert(request.metadata_mut(), self.fingerprint);
                 let response = client
-                    .call(RaftRequest {
-                        group_id: group,
-                        path: method.to_owned(),
-                        payload,
-                    })
+                    .call(request)
                     .await
+                    .map_err(|error| SendCause::Rpc(Box::new(error)))?;
+                super::fingerprint::validate(response.metadata(), self.fingerprint)
                     .map_err(|error| SendCause::Rpc(Box::new(error)))?;
                 let result = bincode::deserialize::<Result<Resp, typ::RaftError>>(
                     &response.into_inner().payload,
@@ -205,6 +210,7 @@ impl GrpcRouter {
                 channels: GrpcPeerChannelPool::new(peers),
                 throttle,
                 snapshot_cap: 64 * 1024 * 1024,
+                fingerprint: None,
             },
             snapshot_sender: Arc::new(SnapshotSender::default()),
         }
@@ -216,6 +222,7 @@ impl GrpcRouter {
             StandbyThrottle::from_config(config),
         );
         router.transport.snapshot_cap = config.max_snapshot_bytes;
+        router.transport.fingerprint = config.raft_transport_fingerprint;
         router
     }
     pub fn self_id(&self) -> NodeId {

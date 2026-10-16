@@ -1,0 +1,19 @@
+[package]
+name = "multiraft-slot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+bincode = { workspace = true }
+anyhow = { workspace = true }
+multiraft-core = { path = "../multiraft-core" }
+multiraft-net = { path = "../multiraft-net" }
+multiraft-fsm = { path = "../multiraft-fsm" }

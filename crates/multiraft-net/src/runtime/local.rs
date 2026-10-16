@@ -33,6 +33,37 @@ impl<S: StateMachine> RuntimeHandle<S> {
             .map_err(TryReadError::Application)
     }
 
+    /// Query this replica and capture its applied watermark in the same FSM view.
+    /// No authority or freshness is implied. Callbacks must be bounded and
+    /// nonblocking, and execute under the local application lock.
+    pub async fn try_read_applied_with_watermark<R, E>(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+        query: impl FnOnce(&S) -> Result<R, E>,
+    ) -> Result<crate::AppliedView<R>, TryReadError<E>> {
+        let admitted = self.admit(deadline).await.map_err(TryReadError::Runtime)?;
+        admitted
+            .ensure_group(group)
+            .map_err(TryReadError::Runtime)?;
+        let view = admitted
+            .run(
+                deadline,
+                RuntimePhase::LocalRead,
+                false,
+                admitted
+                    .shared
+                    .node
+                    .read_applied_with_watermark(group, query),
+            )
+            .await
+            .map_err(TryReadError::Runtime)?;
+        Ok(crate::AppliedView {
+            value: view.value.map_err(TryReadError::Application)?,
+            applied: view.applied,
+        })
+    }
+
     /// Copy one local full-metrics point. No ReadIndex, network work or scan of
     /// other Groups is performed. Holding the value retains no runtime owner.
     pub async fn local_group_status(

@@ -51,6 +51,16 @@ pub use group_observation::LocalMembershipRole;
 pub use group_observation::MembershipObservation;
 pub use group_observation::ObservedLogId;
 pub use group_observation::VoteObservation;
+
+/// A local FSM query and the applied log identity captured under the same lock.
+/// This replica may be stale; the watermark does not establish quorum authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedView<R> {
+    pub value: R,
+    /// `None` means no log has been applied to this FSM generation.
+    pub applied: Option<ObservedLogId>,
+}
+
 pub use grpc::node_rpc;
 pub use grpc::GrpcPeerChannelError;
 pub use grpc::GrpcPeerChannelLease;
@@ -93,8 +103,8 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
 }
 
 pub use runtime::{
-    GroupConfig, NodeOwner, RuntimeConfig, RuntimeError, RuntimeHandle, RuntimePhase,
-    RuntimeTransport,
+    GroupConfig, NodeOwner, ProposalReceipt, RuntimeConfig, RuntimeError, RuntimeHandle,
+    RuntimePhase, RuntimeTransport,
 };
 
 pub use leader_hint::{HintSource, LeaderHint, LeaderHintReceiver};

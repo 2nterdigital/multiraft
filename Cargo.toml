@@ -6,6 +6,8 @@ members = [
   "crates/multiraft-net",
   "crates/multiraft-core",
   "crates/multiraft-demo",
+  "crates/multiraft-slot",
+  "crates/multiraft-slot-demo",
 ]
 
 [workspace.package]

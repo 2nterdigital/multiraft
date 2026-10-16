@@ -1,5 +1,6 @@
 //! Independent application factory with owned file leases and bounded gates.
 #![allow(dead_code)]
+use futures::{stream::FuturesUnordered, StreamExt};
 use multiraft_core::{ClusterConfig, FileLogSyncLevel, MultiRaftError};
 use multiraft_fsm::{ApplyOut, GroupId, StateMachine};
 use multiraft_net::{
@@ -8,6 +9,7 @@ use multiraft_net::{
 };
 use std::{
     fs::{self, OpenOptions},
+    future::Future,
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
@@ -15,7 +17,7 @@ use std::{
 };
 use tokio::{
     sync::Notify,
-    time::{timeout, Instant},
+    time::{timeout_at, Instant},
 };
 pub const GRACE: Duration = Duration::from_millis(100);
 pub fn deadline() -> Instant {
@@ -227,21 +229,106 @@ pub fn reusable(root: &Path, peers: &[(u64, SocketAddr)]) {
     }
 }
 pub async fn leader(handles: &[RuntimeHandle<Bytes>], group: u64) -> &RuntimeHandle<Bytes> {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            for h in handles {
-                match h.read_linearizable(group, deadline(), |_| ()).await {
-                    Ok(()) => return h,
-                    Err(RuntimeError::Source(MultiRaftError::NotLeader { .. }))
-                    | Err(RuntimeError::Source(MultiRaftError::ReadIndex(
-                        multiraft_core::ReadIndexFailure::QuorumUnavailable { .. },
-                    ))) => (),
-                    Err(e) => panic!("unexpected leader read {e:?}"),
+    let nodes: Vec<_> = handles.iter().map(RuntimeHandle::node_id).collect();
+    let index = confirmed_leader(&nodes, group, |index, until| {
+        handles[index].read_linearizable(group, until, |_| ())
+    })
+    .await;
+    &handles[index]
+}
+
+async fn confirmed_leader<F, Probe>(nodes: &[u64], group: u64, probe: F) -> usize
+where
+    F: Fn(usize, Instant) -> Probe,
+    Probe: Future<Output = Result<(), RuntimeError>>,
+{
+    let until = deadline();
+    let outcomes: Vec<_> = nodes
+        .iter()
+        .map(|_| Mutex::new(String::from("not probed")))
+        .collect();
+    let result = timeout_at(until, async {
+        // Each node retries independently: a stalled follower must not conceal
+        // either a completed ReadIndex or a later election on another node.
+        let mut pending = FuturesUnordered::new();
+        for (index, outcome) in outcomes.iter().enumerate() {
+            let probe = &probe;
+            pending.push(async move {
+                loop {
+                    *outcome.lock().unwrap() = String::from("pending");
+                    match probe(index, until).await {
+                        Ok(()) => return index,
+                        Err(error @ RuntimeError::Source(MultiRaftError::NotLeader { .. }))
+                        | Err(
+                            error @ RuntimeError::Source(MultiRaftError::ReadIndex(
+                                multiraft_core::ReadIndexFailure::QuorumUnavailable { .. },
+                            )),
+                        ) => *outcome.lock().unwrap() = format!("{error:?}"),
+                        Err(error) => panic!(
+                            "unexpected leader read: group={group} node={} error={error:?}",
+                            nodes[index]
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+        }
+        pending.next().await.expect("leader probe requires nodes")
+    })
+    .await;
+    result.unwrap_or_else(|_| {
+        let probes: Vec<_> = nodes
+            .iter()
+            .zip(&outcomes)
+            .map(|(node, outcome)| (node, outcome.lock().unwrap().clone()))
+            .collect();
+        panic!("leader read timed out: group={group} probes={probes:?}")
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn confirmed_leader_does_not_wait_for_an_earlier_pending_read() {
+    let confirmed = tokio::time::timeout(
+        Duration::from_secs(1),
+        confirmed_leader(&[1, 2], 7, |index, _| async move {
+            if index == 0 {
+                std::future::pending().await
+            } else {
+                Ok(())
+            }
+        }),
+    )
+    .await
+    .expect("a pending read must not hide another node's confirmed ReadIndex");
+    assert_eq!(confirmed, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn confirmed_leader_retries_while_another_read_is_pending() {
+    let calls = Mutex::new([0; 2]);
+    let confirmed = tokio::time::timeout(
+        Duration::from_secs(1),
+        confirmed_leader(&[1, 2], 7, |index, _| {
+            let attempt = {
+                let mut calls = calls.lock().unwrap();
+                calls[index] += 1;
+                calls[index]
+            };
+            async move {
+                if index == 0 {
+                    std::future::pending().await
+                } else if attempt == 1 {
+                    Err(RuntimeError::Source(MultiRaftError::NotLeader {
+                        hint: None,
+                    }))
+                } else {
+                    Ok(())
                 }
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        }),
+    )
     .await
-    .unwrap()
+    .expect("a pending read must not prevent another node's next ReadIndex attempt");
+    assert_eq!(confirmed, 1);
+    assert_eq!(*calls.lock().unwrap(), [1, 2]);
 }
