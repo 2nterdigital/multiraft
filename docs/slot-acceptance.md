@@ -8,6 +8,9 @@ state machine, TiKV integration, an ordered message protocol, or a capacity test
 
 The first verification run at `76ce0dd` passed all seven cases across the three scenario sets; exact source bindings, limits, retained failures and the open historical observer risk are in the [evidence ledger](./evidence/2026-10-16-slot-foundation.md).
 
+
+The [Channel fair-admission specification](./specs/2026-10-16-slot-channel-fair-admission.md) and [G0–G6/H1 plan](./plans/2026-10-16-slot-channel-fair-admission.md) describe a future mixed-load harness; it is Planned, not implemented and unrun, with no new CLI flags. The current gated assertion proves one different-Slot progress event, not same-Slot Channel fairness, sustained cold SLO or shared-DB isolation. New evidence must cover same-Slot and cross-Slot hot/cold traffic with observed leaders, multi-source ingress, fresh owned data, source/binary/harness identities, frozen profiles/limits and process cleanup; preserve this runner's old receipts and scenarios.
+
 Build from the repository root:
 
 ```sh

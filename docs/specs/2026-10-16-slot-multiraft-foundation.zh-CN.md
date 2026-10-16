@@ -7,6 +7,8 @@
 
 本轮交付通过新通用 Slot API 服务多个固定 Slot 的三进程 RF3 可运行底座，使用 RocksDB 共识日志和具有快照/恢复能力的最小确定性测试 FSM。生产 ech0 Admit/TiKV 接入、旧数据迁移、在线 reshard 和容量认证留待后续。[可行性评估](./2026-10-16-slot-multiraft-feasibility.zh-CN.md)保留固定源码事实；[实施计划](../plans/2026-10-16-slot-multiraft-foundation.zh-CN.md)规定实施与证据门槛。
 
+已采纳的下一阶段 [Channel 公平准入设计](./2026-10-16-slot-channel-fair-admission.zh-CN.md)与[实施计划](../plans/2026-10-16-slot-channel-fair-admission.zh-CN.md)尚未实现、尚未验证，保持固定 layout 与每 node 一个 RocksDB。历史 430-pass/A–F 证据及不同 Slot 冷请求的一次进展不能证明 Channel 公平性。
+
 ## 1. 基线与兼容性
 
 从 C `28e668b676c803838eb64a04ba160fb10ad88316` 出发，审查吸收 M `44baed14b3717b6b6f5f7327790cc97299889e19` 的必要通用改进，包括 descriptor/shared restart 和 Jepsen portability。专项移植 R `d6a5dbbb6d2f1c68e9e8bddbbfca18f562c1185c` 的 RocksDB 日志，保留 C 的 runtime 合同。维持 OpenRaft fork 精确 pin，依赖变化须明确记录。

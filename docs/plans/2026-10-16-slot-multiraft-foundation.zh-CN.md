@@ -73,8 +73,6 @@ RocksDB 继续只承担本地共识 log/metadata；TiKV 继续承担长期消息
 
 ## 7. 可执行后续顺序
 
-1. 保留已完成固定源码收据与原失败。生产接入前，用能区分原因的失败证据追查未定位 observer wake，明确并测试通知合同，不能压制原断言。
-2. 生产接入前实现并注入故障验证 Slot-local quarantine/recovery：明确断言一个坏 Slot 与一个健康 Slot 的服务行为；共享 DB/身份错误仍为 node 级。
-3. 规定确定性 Admit 的 command/result/snapshot schema 与原子 apply 不变量；联合测试 dedup/seq/head/pending/flush/stop、Unknown/取消和永久成功结果重放。
-4. 实现 fenced 全状态迁移/import validator 和中断切换流程，再接生产 admission、TiKV persistence 与 delivery；保留 collector 跨 Channel 事务合同。
-5. 正确性与迁移通过后固定实验分母/阈值，进行可比 baseline/candidate 交替负载；成功延迟须与失败/unissued/资源一起报告。本底座记录不代表已达任何性能目标。
+[Channel 公平准入后续计划](./2026-10-16-slot-channel-fair-admission.zh-CN.md)细化 G0–G6 与后续 H1 热点隔离评审。全部新增步骤均 Planned、未实现、未运行；A–F 及固定源码证据保持首验证范围完成状态。
+
+G0 冻结合同/profile；G1–G3 实现目的端准入、有界公平与生命周期；G4–G5 增加模型、混合负载 harness 与可比报告。observer 调查不阻塞文档/模型开发；生产 wiring 前 G6 仍须关闭该风险，证明 Slot 局部隔离、确定性 Admit 不变量及 fenced 全状态迁移/TiKV 接入。H1 保持后续决策门槛，当前保留固定 Slot 与每 node 一个 DB。

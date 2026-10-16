@@ -7,6 +7,9 @@ effects、业务 key 身份校验与确定性去重；不实现生产 Admit、Ti
 
 `76ce0dd` 首验证运行已通过三组场景共七项检查；精确源码绑定、限额、保留失败和历史 observer 未定位风险见[证据台账](./evidence/2026-10-16-slot-foundation.zh-CN.md)。
 
+
+[Channel 公平准入规范](./specs/2026-10-16-slot-channel-fair-admission.zh-CN.md)和 [G0–G6/H1 计划](./plans/2026-10-16-slot-channel-fair-admission.zh-CN.md)规划后续混合负载 harness；均 Planned、未实现、未运行，没有新增 CLI flags。当前 gate 断言仅证明一次 different-Slot 进展，不证明 same-Slot Channel 公平、持续 cold SLO 或共享 DB 隔离。新证据须覆盖 same-Slot/cross-Slot 热冷、实际 leader、多源入口、全新自有 data、source/binary/harness 身份、冻结 profile/limits 和进程清理；保留旧 runner 收据及场景能力。
+
 在仓库根目录运行：
 
 ```sh

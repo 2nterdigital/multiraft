@@ -32,6 +32,7 @@
 | [2026-07-22-aeron-next-borrow.md](./specs/2026-07-22-aeron-next-borrow.md) | [2026-07-22-aeron-next-borrow.zh-CN.md](./specs/2026-07-22-aeron-next-borrow.zh-CN.md) | 下一阶段 Aeron 借鉴 backlog（N1–N3） |
 | [2026-10-16-slot-multiraft-feasibility.md](./specs/2026-10-16-slot-multiraft-feasibility.md) | [2026-10-16-slot-multiraft-feasibility.zh-CN.md](./specs/2026-10-16-slot-multiraft-feasibility.zh-CN.md) | Slot MultiRaft 可行性与已确认实施范围 |
 | [2026-10-16-slot-multiraft-foundation.md](./specs/2026-10-16-slot-multiraft-foundation.md) | [2026-10-16-slot-multiraft-foundation.zh-CN.md](./specs/2026-10-16-slot-multiraft-foundation.zh-CN.md) | 固定 Slot MultiRaft 底座：合同、路由、恢复与边界 |
+| [2026-10-16-slot-channel-fair-admission.md](./specs/2026-10-16-slot-channel-fair-admission.md) | [2026-10-16-slot-channel-fair-admission.zh-CN.md](./specs/2026-10-16-slot-channel-fair-admission.zh-CN.md) | 有界 Channel 公平准入、混合负载验证与后续热点隔离（规划） |
 
 ## 对照 / 定位
 
@@ -49,6 +50,7 @@
 | [2026-07-18-multiraft.md](./plans/2026-07-18-multiraft.md) | [2026-07-18-multiraft.zh-CN.md](./plans/2026-07-18-multiraft.zh-CN.md) | 一期库 + Demo |
 | [2026-07-18-multiraft-grpc.md](./plans/2026-07-18-multiraft-grpc.md) | [2026-07-18-multiraft-grpc.zh-CN.md](./plans/2026-07-18-multiraft-grpc.zh-CN.md) | 跨进程 gRPC（Phase-1.5） |
 | [2026-10-16-slot-multiraft-foundation.md](./plans/2026-10-16-slot-multiraft-foundation.md) | [2026-10-16-slot-multiraft-foundation.zh-CN.md](./plans/2026-10-16-slot-multiraft-foundation.zh-CN.md) | 已授权实施步骤与固定源码验证证据 |
+| [2026-10-16-slot-channel-fair-admission.md](./plans/2026-10-16-slot-channel-fair-admission.md) | [2026-10-16-slot-channel-fair-admission.zh-CN.md](./plans/2026-10-16-slot-channel-fair-admission.zh-CN.md) | G0–G6 后续门槛与 H1 评审；未实现/未运行 |
 
 ## 运维
 

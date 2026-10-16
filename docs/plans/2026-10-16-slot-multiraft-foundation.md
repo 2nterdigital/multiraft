@@ -73,8 +73,6 @@ RocksDB remains local consensus log/metadata storage. TiKV remains long-term mes
 
 ## 7. Executable follow-up order
 
-1. Preserve the completed fixed-source receipts and original failures. Before production integration, investigate the unlocated observer wake with discriminating failure evidence; establish and test the intended notification contract without suppressing the original assertion.
-2. Before production wiring, implement and fault-test Slot-local quarantine/recovery; use one damaged Slot and one healthy Slot with explicit service assertions. Keep shared DB/identity failures node-wide.
-3. Specify the deterministic Admit command/result/snapshot schema and its atomic apply invariants. Test dedup/seq/head/pending/flush/stop together, including Unknown/cancellation and permanent successful-result replay.
-4. Build the fenced full-state migration/import validator and interrupted-cutover procedure; only then wire production admission, TiKV persistence and delivery. Preserve existing collector cross-Channel transaction contracts.
-5. After correctness and migration gates, freeze experimental denominators and thresholds, then run comparable alternating baseline/candidate workloads and report failure/unissued/resource data alongside successful latency. No performance target has been achieved by this foundation record.
+The [Channel fair-admission follow-up plan](./2026-10-16-slot-channel-fair-admission.md) refines G0–G6 and the later H1 hot-isolation review. All new steps are Planned, not implemented and unrun; A–F and their fixed-source evidence remain completed for the first verification scope.
+
+G0 freezes contracts/profiles; G1–G3 implement destination admission, bounded fairness and lifecycle; G4–G5 add models, mixed-load harness and comparable reports. The observer investigation does not block documentation/model work. Before production wiring, G6 still requires closing that risk, proving Slot-local isolation, deterministic Admit invariants and fenced full-state migration/TiKV integration. H1 remains a later decision gate, with fixed Slots and one DB per node retained now.

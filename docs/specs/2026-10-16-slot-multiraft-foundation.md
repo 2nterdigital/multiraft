@@ -7,6 +7,8 @@
 
 The delivery is a runnable three-process RF3 foundation serving multiple fixed Slots through a new generic Slot API. It uses RocksDB consensus logs and a minimal deterministic test FSM with snapshots and recovery. Production ech0 Admit/TiKV integration, old-data migration, online resharding and capacity certification are later work. The [feasibility assessment](./2026-10-16-slot-multiraft-feasibility.md) retains fixed-source facts; the [plan](../plans/2026-10-16-slot-multiraft-foundation.md) defines implementation and evidence gates.
 
+The adopted next-stage [Channel fair admission design](./2026-10-16-slot-channel-fair-admission.md) and [implementation plan](../plans/2026-10-16-slot-channel-fair-admission.md) are not implemented or verified. They preserve the fixed layout and one RocksDB per node. Historical 430-pass/A–F evidence and a different-Slot cold request progressing do not prove Channel fairness.
+
 ## 1. Baseline and compatibility
 
 Start from C `28e668b676c803838eb64a04ba160fb10ad88316`. Review and integrate necessary general improvements from M `44baed14b3717b6b6f5f7327790cc97299889e19`, including descriptor/shared restart and Jepsen portability. Port the RocksDB log from R `d6a5dbbb6d2f1c68e9e8bddbbfca18f562c1185c` without replacing C's runtime contracts. Keep the exact OpenRaft fork pin and record any dependency change explicitly.
