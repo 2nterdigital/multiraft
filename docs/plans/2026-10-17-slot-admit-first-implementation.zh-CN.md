@@ -34,13 +34,14 @@
 | 仓库 | 起始参考 | worktree 策略 |
 | --- | --- | --- |
 | multiraft | `9e63b454848d18ceea4510b3f3ea0fb52af71b68`，`codex/slot-multiraft` | 继续 `/Users/wei/Documents/WorktreesSpace/slot-multiraft` |
-| ech0 | main `8098a4f7` | 冻结实际完整 SHA/tree，创建独立 worktree |
-| ech0 当前 checkout | `claude/memory-docs-20261017`，`2f73a7d7` | 记忆/文档上下文，不是实施基线 |
+| ech0 | main `1606f85fc787604057f2ff7829df291c9ddc857b`；代码基线仍为 `8098a4f7` | 冻结实际完整 SHA/tree，创建独立 worktree |
+| ech0 编写早期 checkout 观察 | `claude/memory-docs-20261017`，`2f73a7d7` | 之后文档已合并，checkout 现为 main |
 | 旧 multiraft checkout | `/Volumes/Space/2nterdigital/multiraft`，旧 `28e…` 参考 | 保持原样 |
 
 multiraft `9e63b45` 是本计划编写前的实现/文档基线：保留承载本交接的后续文档提交，记录实际 HEAD 并验证代码等价；不要为回到该基线 reset 或删除新计划。
 编辑前记录每个精确 commit、tree、dirty 状态、manifest 与 lockfile 哈希。
-重新核实参考；不能把 ech0 缩写 SHA 或当前分支当作充分冻结。
+执行时读取实际 branch/HEAD；main `1606f85fc787604057f2ff7829df291c9ddc857b` 已包含后续文档合并。
+已核对与 `8098a4f7` 的差异仅 docs/memory；Cargo.toml/Cargo.lock/crates/tools/vendor 未变，故 `8098a4f7` 源码引用仍有效。
 不要 switch、reset 或 merge 共享 ech0 主工作目录。
 新 worktree 统一放在 `/Users/wei/Documents/WorktreesSpace/`。
 建议 ech0 分支名 `codex/admit-fsm`；执行者可选其他无冲突名称。
@@ -277,8 +278,8 @@ T0 → T1 → T2 → T3 → T4 是实施关键路径。
 计划：`/Users/wei/Documents/WorktreesSpace/slot-multiraft/docs/plans/2026-10-17-slot-admit-first-implementation.zh-CN.md`。
 继续 multiraft worktree `/Users/wei/Documents/WorktreesSpace/slot-multiraft`，基线 `9e63b454848d18ceea4510b3f3ea0fb52af71b68`。
 保留承载本计划的后续文档提交并记录实际 multiraft HEAD，不要 reset 到编写前基线。
-冻结 ech0 main `8098a4f7` 的实际完整 SHA/tree，在 `/Users/wei/Documents/WorktreesSpace/` 创建新 worktree。
-共享 ech0 `/Volumes/Space/2nterdigital/ech0-1delivery` 当前为记忆分支 `claude/memory-docs-20261017`，不要 switch/reset/merge。
+冻结 ech0 main `1606f85fc787604057f2ff7829df291c9ddc857b`（代码基线仍 `8098a4f7`），重新读取实际 branch/HEAD，在 `/Users/wei/Documents/WorktreesSpace/` 创建新 worktree。
+共享 ech0 `/Volumes/Space/2nterdigital/ech0-1delivery` 在文档合并后观察为 main；读取实际 branch/HEAD，不要 switch/reset/merge。
 选择如 `codex/admit-fsm` 的无冲突分支，exact dependency revision，单 manifest/lock/runtime integration owner。
 隔离旧锁定 OpenRaft 0.9.25（manifest semver 0.9.21）与新 alpha.30/fork `ea46d0e571f7497f1f549e125254dfcb2ff45e2e`，先完成 §2 源码/依赖前置检查，再进入 T0。
 实现确定性真实 Admit 与全部 authority 变更、真实三进程 RF3/多 Slot，再接新隔离 namespace 的真实 HTTP/WS + TiKV + delivery/read 闭环。

@@ -34,13 +34,14 @@ The implementation authorization in this handoff does not include production cut
 | Repository | Starting reference | Worktree policy |
 | --- | --- | --- |
 | multiraft | `9e63b454848d18ceea4510b3f3ea0fb52af71b68`, `codex/slot-multiraft` | Continue `/Users/wei/Documents/WorktreesSpace/slot-multiraft` |
-| ech0 | main `8098a4f7` | Freeze the full actual SHA/tree and create an isolated worktree |
-| ech0 current checkout | `claude/memory-docs-20261017`, `2f73a7d7` | Memory/documentation context, not the implementation baseline |
+| ech0 | main `1606f85fc787604057f2ff7829df291c9ddc857b`; code baseline remains `8098a4f7` | Freeze the full actual SHA/tree and create an isolated worktree |
+| ech0 earlier checkout observation | `claude/memory-docs-20261017`, `2f73a7d7` | Observed early in drafting; documentation subsequently merged, checkout now main |
 | old multiraft checkout | `/Volumes/Space/2nterdigital/multiraft`, old `28e…` reference | Leave untouched |
 
 The multiraft `9e63b45` reference is the implementation/documentation baseline before this plan: retain later documentation commits carrying this handoff, record actual HEAD and verify code equivalence; do not reset to it or delete the new plan.
 Before editing, record each exact commit, tree, dirty status, manifest and lockfile hashes.
-Revalidate references rather than assuming the abbreviated ech0 SHA or current branch is sufficient.
+Read the actual branch/HEAD at execution time; main `1606f85fc787604057f2ff7829df291c9ddc857b` includes the subsequent documentation merge.
+The verified diff from `8098a4f7` changes only docs/memory; Cargo.toml/Cargo.lock/crates/tools/vendor are unchanged, so source-code references at `8098a4f7` remain valid.
 Never switch, reset or merge the shared ech0 main working directory.
 Create new worktrees only under `/Users/wei/Documents/WorktreesSpace/`.
 Suggested ech0 branch: `codex/admit-fsm`; the executor may choose another collision-free name.
@@ -279,8 +280,8 @@ Implement T0–T4 of this latest plan, first report M1, then continue to M2 when
 Plan: `/Users/wei/Documents/WorktreesSpace/slot-multiraft/docs/plans/2026-10-17-slot-admit-first-implementation.md`.
 Continue multiraft worktree `/Users/wei/Documents/WorktreesSpace/slot-multiraft`, baseline `9e63b454848d18ceea4510b3f3ea0fb52af71b68`.
 Retain subsequent documentation commits carrying this plan and record actual multiraft HEAD; do not reset to the pre-plan baseline.
-Freeze ech0 main `8098a4f7` to its full actual SHA/tree and create a new worktree under `/Users/wei/Documents/WorktreesSpace/`.
-The shared ech0 checkout at `/Volumes/Space/2nterdigital/ech0-1delivery` is on memory branch `claude/memory-docs-20261017`; do not switch/reset/merge it.
+Freeze ech0 main `1606f85fc787604057f2ff7829df291c9ddc857b` (code baseline remains `8098a4f7`), recheck actual branch/HEAD and create a new worktree under `/Users/wei/Documents/WorktreesSpace/`.
+The shared ech0 checkout at `/Volumes/Space/2nterdigital/ech0-1delivery` was observed on main after the documentation merge; read its actual branch/HEAD and do not switch/reset/merge it.
 Use a collision-free branch such as `codex/admit-fsm`, exact dependency revisions and one manifest/lock/runtime integration owner.
 Keep old locked OpenRaft 0.9.25 (manifest semver 0.9.21) and new alpha.30/fork `ea46d0e571f7497f1f549e125254dfcb2ff45e2e` isolated; complete the §2 source/dependency preliminaries before T0.
 Build real deterministic Admit + all authority mutations, real three-process RF3/multi-Slot admission, then real HTTP/WS + TiKV + delivery/read loop in a new isolated namespace.
