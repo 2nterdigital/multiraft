@@ -6,6 +6,8 @@ counter and command-id table demonstrate opaque effects, business-key identity
 validation and deterministic deduplication. This is not the production Admit
 state machine, TiKV integration, an ordered message protocol, or a capacity test.
 
+The first verification run at `76ce0dd` passed all seven cases across the three scenario sets; exact source bindings, limits, retained failures and the open historical observer risk are in the [evidence ledger](./evidence/2026-10-16-slot-foundation.md).
+
 Build from the repository root:
 
 ```sh
@@ -20,7 +22,7 @@ On macOS, a source RocksDB build may also require `LIBCLANG_PATH` and
 `DYLD_LIBRARY_PATH` pointing at the Xcode toolchain's `usr/lib` directory.
 `--binary PATH` selects a prebuilt binary. `--output-dir PATH` must name a new
 directory; the default is a unique directory below `.tmp/slot-foundation/`.
-`--case normal`, `--case recovery` and `--case fingerprint` run the two independent scenario sets.
+`--case normal`, `--case recovery` and `--case fingerprint` run the three independent scenario sets; `--case all` runs all three.
 
 The Python standard-library harness launches three actual `Popen` OS processes,
 with distinct PIDs, loopback Raft/application/admin ports and per-node data.

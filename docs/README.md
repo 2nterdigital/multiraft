@@ -17,6 +17,8 @@ Self-contained docs for the **multiraft** GitHub repository (no links outside th
 | [jepsen.md](./jepsen.md) | [jepsen.zh-CN.md](./jepsen.zh-CN.md) | Consistency Contract, porcupine, Jepsen |
 | [chaos-checklist.md](./chaos-checklist.md) | [chaos-checklist.zh-CN.md](./chaos-checklist.zh-CN.md) | Chaos / failover coverage |
 | [upstream.md](./upstream.md) | [upstream.zh-CN.md](./upstream.zh-CN.md) | openraft pin & upgrade notes |
+| [slot-acceptance.md](./slot-acceptance.md) | [slot-acceptance.zh-CN.md](./slot-acceptance.zh-CN.md) | Local three-process RF3 fixed-Slot acceptance runner |
+| [evidence/2026-10-16-slot-foundation.md](./evidence/2026-10-16-slot-foundation.md) | [evidence/2026-10-16-slot-foundation.zh-CN.md](./evidence/2026-10-16-slot-foundation.zh-CN.md) | First verification evidence, preserved failures and production gates |
 
 ## Designs (specs)
 

@@ -4,7 +4,7 @@
 
 **日期：** 2026-10-16
 
-**状态：** 2026-10-16 已授权底座实施，实施中；整合与验收结果尚未验证。下文历史评估事实仍以原固定提交为准。
+**状态：** 76ce0dd 首验证版完成：最终 workspace 和本机 RF3/legacy 验收通过；生产接入及历史未定位 observer 风险仍为后续门槛。下文历史评估事实继续绑定原固定源码；当前 API 和检查见[底座设计](./2026-10-16-slot-multiraft-foundation.zh-CN.md)与[证据](../evidence/2026-10-16-slot-foundation.zh-CN.md)。
 
 **范围：** 基于 OpenRaft 的现有 fork 能否承载通用 Slot 层，以及 ech0 如何接入。
 
@@ -107,7 +107,7 @@ C `net/src/runtime/startup.rs:16,85` 的 input_digest 是 opaque 输入，不由
 预留 GroupId/domain 以免与元数据组冲突；禁止使用 `std::DefaultHasher` 或随意修改 N 后取模。
 slot_count 必须经资源和负载测试确定；本文不推荐 256，也不直接复制 Wukong 默认值。
 
-下图是候选模块依赖方案，尚未实现；箭头表示依赖，不表示 WAL 位于 apply 之后的执行顺序。共享资源约束作用于所有组，异步 TiKV 写入属于业务 adapter。
+原评估时，下图是候选模块依赖方案；当前通用 Slot 实现见底座设计，生产 ech0 adapter 仍为后续工作。箭头表示依赖，不表示 WAL 位于 apply 之后的执行顺序。共享资源约束作用于所有组，异步 TiKV 写入属于业务 adapter。
 
 ```mermaid
 flowchart TD
@@ -142,7 +142,7 @@ Query(slot, query_bytes, consistency, absolute_deadline)
   -> QueryResult | NotReady | Unavailable(reason)
 ```
 
-M 的 propose 只有 index/term；C 的 ProposeApplied 已能返回精确项 effects，但上面的 Slot API 和业务结果模型仍未实现。
+原评估时 M propose 只有 index/term，C 的 ProposeApplied 已能返回精确项 effects，上述 Slot 草案当时尚未实现。底座现已实现设计中所列通用 Slot API，生产 Admit 结果模型仍未实现。
 Query 的 linearizable 模式必须完成目标组原生 ReadIndex 并满足 apply 可见性；stale 模式显式返回 watermark。
 leader status 只供路由提示，真实写入与读取安全依赖 native 合同。
 纯读取失败不产生写入 Unknown；查询此前 Unknown 写入的结果时，miss 或查询失败不能证明原写未提交或不会稍后应用。

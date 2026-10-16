@@ -17,6 +17,8 @@
 | [jepsen.md](./jepsen.md) | [jepsen.zh-CN.md](./jepsen.zh-CN.md) | Consistency Contract、porcupine、Jepsen |
 | [chaos-checklist.md](./chaos-checklist.md) | [chaos-checklist.zh-CN.md](./chaos-checklist.zh-CN.md) | Chaos / 切主覆盖 |
 | [upstream.md](./upstream.md) | [upstream.zh-CN.md](./upstream.zh-CN.md) | openraft 锁定与升版说明 |
+| [slot-acceptance.md](./slot-acceptance.md) | [slot-acceptance.zh-CN.md](./slot-acceptance.zh-CN.md) | 本机三进程 RF3 固定 Slot 验收 runner |
+| [evidence/2026-10-16-slot-foundation.md](./evidence/2026-10-16-slot-foundation.md) | [evidence/2026-10-16-slot-foundation.zh-CN.md](./evidence/2026-10-16-slot-foundation.zh-CN.md) | 首验证版证据、保留失败与生产门槛 |
 
 ## 设计（specs）
 

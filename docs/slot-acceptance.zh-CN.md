@@ -2,8 +2,10 @@
 
 `multiraft-slot-demo` 是 `multiraft-slot` 的测试消费者，使用新数据、不可变布局、
 RocksDB 日志及 NativeDurable FSM 快照。计数器和 command-id 表用于证明精确
- effects、业务 key 身份校验与确定性去重；不实现生产 Admit、TiKV、消息顺序协议，
+effects、业务 key 身份校验与确定性去重；不实现生产 Admit、TiKV、消息顺序协议，
 也不认证容量。
+
+`76ce0dd` 首验证运行已通过三组场景共七项检查；精确源码绑定、限额、保留失败和历史 observer 未定位风险见[证据台账](./evidence/2026-10-16-slot-foundation.zh-CN.md)。
 
 在仓库根目录运行：
 
@@ -18,7 +20,7 @@ python3 scripts/slot_acceptance.py
 macOS 从源码构建 RocksDB 时可能需要将 `LIBCLANG_PATH`、`DYLD_LIBRARY_PATH`
 设为 Xcode toolchain 的 `usr/lib`。`--binary PATH` 指定已构建二进制；
 `--output-dir PATH` 必须是尚不存在的目录，默认在 `.tmp/slot-foundation/`
-创建唯一目录。`--case normal`、`--case recovery` 或 `--case fingerprint` 可单独运行独立场景集。
+创建唯一目录。`--case normal`、`--case recovery` 或 `--case fingerprint` 可分别运行三个独立场景集；`--case all` 运行全部三组。
 
 Python 标准库脚本通过 `Popen` 启动三个真实 OS 进程，分别持有不同 PID、
 loopback Raft／应用 RPC／管理端口和数据目录。候选端口同时保留，启动前释放；

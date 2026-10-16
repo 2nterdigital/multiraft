@@ -3,7 +3,7 @@
 **中文：** [2026-10-16-slot-multiraft-foundation.zh-CN.md](./2026-10-16-slot-multiraft-foundation.zh-CN.md)
 
 **Date:** 2026-10-16
-**Status:** Implementation authorized and in progress. The table below is a work plan, not a successful test receipt.
+**Status:** First verification version completed at 76ce0dd; final integrated checks and local RF3/legacy acceptance passed. Production readiness is not certified and the unlocated historical observer risk remains open. See the [evidence ledger](../evidence/2026-10-16-slot-foundation.md).
 
 Implement the [adopted foundation design](../specs/2026-10-16-slot-multiraft-foundation.md). The [feasibility assessment](../specs/2026-10-16-slot-multiraft-feasibility.md) preserves historical source facts and explains the later ech0 integration gates. The user has confirmed the scope and start of implementation; these steps require verification evidence, not renewed approval of settled choices.
 
@@ -17,14 +17,14 @@ Freeze slot_count, hash version and one-to-one Slot/Group mapping in the persist
 
 | Step | Current state | Deliverable | Verification gate |
 | --- | --- | --- | --- |
-| A — C + RocksDB | In progress | Focused R backend port with node-owned DB, group namespaces, durable callbacks and backend marker checks; preserve C ownership, exact results, validation/readiness and shutdown behavior | Backend tests; sync/callback/cancel behavior; missing-DB/backend mismatch; snapshot/replay/restart; no bypass of C proof gates |
-| B — M integration review | Planned | Source-bounded inventory of M-only descriptor/shared restart and scripts/Jepsen portability; integrate relevant behavior and record deliberate exclusions | Exercise retained descriptor mismatch and shared restart behavior; check affected scripts, not only cargo compilation |
-| C — Slot contracts | Planned | New `multiraft-slot` crate with canonical manifest/digest/disk binding, fixed hash/layout, limit configuration and test FSM seam | Known hash vectors, restart mapping, invalid versions/counts/mapping/replicas, node/disk mismatch and cross-node digest mismatch fail closed |
-| D — Route and lifecycle | Planned | Key/Slot server validation, local and single-attempt remote path, exact result/query semantics, owned accepted work, deadlines and bounded close | Wrong-key/Slot/digest requests rejected before mutation; stale hint classified; post-dispatch Unknown; no retry loop; cancellation/drain and capacity release assertions |
-| E — Runnable demo and RF3 | Planned | Minimal deterministic result-bearing FSM and reproducible three-OS-process RF3 multiple-Slot runner using RocksDB and new directories | Local/remote writes and reads; snapshot/purge/restart; leader change; committed response loss and same-ID retry; limits/hot-cold progress; shutdown and recovery proof failure |
-| F — Independent review and evidence | Planned | Review integrated diff/contracts, repair verified issues, document exact-source command results and remaining gaps in both languages | Relevant tests/build and real-process acceptance pass for the actual source; reviewer findings resolved or explicitly recorded; no borrowed historical pass counts |
+| A — C + RocksDB | Done for first verification scope | Focused R backend port with node-owned DB, group namespaces, durable callbacks and backend marker checks; preserve C ownership, exact results, validation/readiness and shutdown behavior | Backend tests; sync/callback/cancel behavior; missing-DB/backend mismatch; snapshot/replay/restart; no bypass of C proof gates |
+| B — M integration review | Done for first verification scope | Source-bounded inventory of M-only descriptor/shared restart and scripts/Jepsen portability; integrate relevant behavior and record deliberate exclusions | Exercise retained descriptor mismatch and shared restart behavior; check affected scripts, not only cargo compilation |
+| C — Slot contracts | Done for first verification scope | New `multiraft-slot` crate with canonical manifest/digest/disk binding, fixed hash/layout, limit configuration and test FSM seam | Known hash vectors, restart mapping, invalid versions/counts/mapping/replicas, node/disk mismatch and cross-node digest mismatch fail closed |
+| D — Route and lifecycle | Done for first verification scope | Key/Slot server validation, local and single-attempt remote path, exact result/query semantics, owned accepted work, deadlines and bounded close | Wrong-key/Slot/digest requests rejected before mutation; stale hint classified; post-dispatch Unknown; no retry loop; cancellation/drain and capacity release assertions |
+| E — Runnable demo and RF3 | Done for first verification scope | Minimal deterministic result-bearing FSM and reproducible three-OS-process RF3 multiple-Slot runner using RocksDB and new directories | Local/remote writes and reads; snapshot/purge/restart; leader change; committed response loss and same-ID retry; limits/hot-cold progress; shutdown and recovery proof failure |
+| F — Independent review and evidence | Done for first verification scope | Review integrated diff/contracts, repair verified issues, document exact-source command results and remaining gaps in both languages | Relevant tests/build and real-process acceptance pass for the actual source; reviewer findings resolved or explicitly recorded; no borrowed historical pass counts |
 
-A and B precede the final integrated baseline check. C establishes the contracts consumed by D and E; implementations may proceed in parallel only with disjoint file ownership and coordinated interfaces. F reviews the completed integrated behavior. No step is marked complete until its actual evidence is attached.
+A and B precede the final integrated baseline check. C establishes the contracts consumed by D and E; implementations may proceed in parallel only with disjoint file ownership and coordinated interfaces. F reviews the completed integrated behavior. The evidence ledger now attaches the completed first-verification receipts; it does not close later production gates.
 
 ## 3. Validation procedure
 
@@ -37,7 +37,7 @@ A and B precede the final integrated baseline check. C establishes the contracts
 7. Exercise snapshot restore/log replay, recovery proof rejection, cancellation after acceptance, saturated node/Slot byte/count limits, hot/cold progress and bounded shutdown. Record unfinished owned work and errors; do not call a run clean solely because client tasks exited.
 8. Review the final integrated diff, fix verified findings, rerun affected checks and bind the evidence to that final source. Adjust API documentation to the actual implemented types, hash bytes and routing contract.
 
-Do not invent names of future test binaries or acceptance flags. Step E must supply exact reproducible commands once its runner exists. Existing `scripts/acceptance.sh` evidence is useful for its covered behavior but is not automatically evidence of new Slot ingress or a RocksDB multi-Slot test.
+The runner now exists: build with `cargo build -p multiraft-slot-demo`, then run `python3 scripts/slot_acceptance.py --case all` from the root using fresh data; see [instructions](../slot-acceptance.md). Existing `scripts/acceptance.sh` evidence is useful for its covered behavior but is not automatically evidence of new Slot ingress or a RocksDB multi-Slot test.
 
 ## 4. Acceptance matrix
 
@@ -58,15 +58,23 @@ Slot-local runtime fault isolation is a separate gate before production integrat
 
 | Item | Actual source / command / outcome |
 | --- | --- |
-| Integrated baseline A/B | Pending; no new successful result recorded |
-| Slot unit/contract checks C/D | Pending; no new successful result recorded |
-| Three-process RF3 multiple-Slot acceptance E | Pending; no new successful result recorded |
-| Independent review and final verification F | Pending; no new successful result recorded |
+| Integrated baseline A/B | Final verified source `76ce0dd6c686367f04de4cfc9772ed3942140c3c`; tree `6a7f7538c641dc3017ab9093283bc2b918f80503`; production implementation unchanged from e554; Rocks/backend/recovery checks and selected-M fixtures passed; Jepsen unit 3 tests/12 assertions passed |
+| Slot unit/contract checks C/D | Manifest 9, Slot runtime 12 plus budget unit 1; owned proposal 5 and watermark 4 + local observations 2 passed incrementally; see source/log boundaries in the evidence ledger |
+| Three-process RF3 multiple-Slot acceptance E | Final all-case receipt passed 7 cases, including raw HTTP RST; 13 process-start PIDs absent, nine ports reusable; earlier failures retained |
+| Independent review and final verification F | Final format/Clippy/build passed; serial workspace 430 passed/0 failed/12 ignored; harness 15 passed; legacy ACCEPTANCE OK with 3 PIDs absent/6 ports reusable; historical observer risk retained |
 
-Populate this ledger with actual commands and receipts after execution, including failures and unrun scenarios. The C historical `95c6e6c` record (366 passed, 12 ignored and one three-process acceptance) and R's backend commands are not passes of this worktree. A small 4/8-Slot acceptance does not certify production slot_count, resources, throughput or B4 latency.
+The [evidence ledger](../evidence/2026-10-16-slot-foundation.md) records commands, receipts, failures and unrun scenarios. Incremental counts are not additive final-source totals. The C historical `95c6e6c` record (366 passed, 12 ignored and one three-process acceptance) and R's backend commands are not passes of this worktree. A small 4/8-Slot acceptance does not certify production slot_count, resources, throughput or B4 latency.
 
 ## 6. Next-stage boundary
 
-Production integration first requires proven Slot-local isolation and a deterministic Admit design preserving atomic dedup/seq/head/pending/result plus flush/stop. Fence old admission/collector work and migrate full authoritative state and persisted progress; never bootstrap an existing Channel from a lagging TiKV head. Permanent command-result retention and cross-Channel TiKV transaction semantics cannot be silently narrowed.
+Production integration first requires closing the unlocated intermittent observer risk recorded in the evidence ledger and proven Slot-local isolation and a deterministic Admit design preserving atomic dedup/seq/head/pending/result plus flush/stop. Fence old admission/collector work and migrate full authoritative state and persisted progress; never bootstrap an existing Channel from a lagging TiKV head. Permanent command-result retention and cross-Channel TiKV transaction semantics cannot be silently narrowed.
 
 RocksDB remains local consensus log/metadata storage. TiKV remains long-term message transaction storage. Async delivery and async TiKV work start as parallel post-admission paths; SENDACK is committed + applied admission, not TiKV or RECV acknowledgement. These contracts constrain the next stage; this foundation does not implement it.
+
+## 7. Executable follow-up order
+
+1. Preserve the completed fixed-source receipts and original failures. Before production integration, investigate the unlocated observer wake with discriminating failure evidence; establish and test the intended notification contract without suppressing the original assertion.
+2. Before production wiring, implement and fault-test Slot-local quarantine/recovery; use one damaged Slot and one healthy Slot with explicit service assertions. Keep shared DB/identity failures node-wide.
+3. Specify the deterministic Admit command/result/snapshot schema and its atomic apply invariants. Test dedup/seq/head/pending/flush/stop together, including Unknown/cancellation and permanent successful-result replay.
+4. Build the fenced full-state migration/import validator and interrupted-cutover procedure; only then wire production admission, TiKV persistence and delivery. Preserve existing collector cross-Channel transaction contracts.
+5. After correctness and migration gates, freeze experimental denominators and thresholds, then run comparable alternating baseline/candidate workloads and report failure/unissued/resource data alongside successful latency. No performance target has been achieved by this foundation record.

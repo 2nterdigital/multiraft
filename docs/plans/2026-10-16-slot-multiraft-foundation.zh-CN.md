@@ -3,7 +3,7 @@
 **English：** [2026-10-16-slot-multiraft-foundation.md](./2026-10-16-slot-multiraft-foundation.md)
 
 **日期：** 2026-10-16
-**状态：** 已授权、实施中。下表是工作计划，不是测试通过收据。
+**状态：** 76ce0dd 首验证版完成，最终整合检查与本机 RF3/legacy 验收通过；不认证生产就绪，历史 observer 未定位风险保留。见[证据台账](../evidence/2026-10-16-slot-foundation.zh-CN.md)。
 
 按[已采纳底座设计](../specs/2026-10-16-slot-multiraft-foundation.zh-CN.md)实施。[可行性评估](../specs/2026-10-16-slot-multiraft-feasibility.zh-CN.md)保留历史源码事实，并解释后续 ech0 接入门槛。用户已确认范围并同意开始实施；以下步骤要求验证证据，不再次审批已定项。
 
@@ -17,14 +17,14 @@ manifest 固定 slot_count、hash version 和 Slot/Group 一对一映射。不�
 
 | 步骤 | 当前状态 | 产物 | 验证门槛 |
 | --- | --- | --- | --- |
-| A — C + RocksDB | 实施中 | 专项移植 R 后端，node-owned DB、组命名空间、耐久 callback 和 backend marker 检查；保留 C owner、精确结果、validation/readiness 和关闭行为 | 后端测试；sync/callback/cancel；DB 丢失/后端错配；snapshot/replay/restart；不绕过 C proof gate |
-| B — M 吸收审查 | 计划中 | M 独有 descriptor/shared restart、scripts/Jepsen portability 的固定源码清单；吸收相关行为并记录明确排除项 | 验证保留的 descriptor 错配与 shared restart；检查受影响脚本，不能仅 cargo 编译 |
-| C — Slot 合同 | 计划中 | 新 `multiraft-slot` crate，规范 manifest/digest/磁盘绑定、固定 hash/layout、限额配置和测试 FSM 接口 | 已知 hash 向量、重启映射；非法 version/count/mapping/replicas、node/磁盘与跨节点 digest 错配 fail closed |
-| D — 路由与生命周期 | 计划中 | key/Slot 服务端校验、本地/单次远端路径、精确结果/查询语义、accepted work owner、deadline 和有界 close | key/Slot/digest 错误在写前拒绝；过时 hint 分类；dispatch 后 Unknown；无重试环；取消/drain 与容量释放断言 |
-| E — demo 与 RF3 | 计划中 | 最小确定性、可返回结果的 FSM；使用 RocksDB 和新目录的可复现三 OS 进程 RF3 多 Slot runner | 本地/远端读写；snapshot/purge/restart；切主；提交后响应丢失与相同 ID 重试；限额/热冷进展；关闭与 recovery proof 失败 |
-| F — 独立审查与证据 | 计划中 | 审查整合 diff/合同、修复已核实问题、双语记录精确源码命令结果与剩余缺口 | 真实源码相关 tests/build 和实进程验收通过；审查发现已修复或明确记录；不借用历史通过数 |
+| A — C + RocksDB | 首验证范围已完成 | 专项移植 R 后端，node-owned DB、组命名空间、耐久 callback 和 backend marker 检查；保留 C owner、精确结果、validation/readiness 和关闭行为 | 后端测试；sync/callback/cancel；DB 丢失/后端错配；snapshot/replay/restart；不绕过 C proof gate |
+| B — M 吸收审查 | 首验证范围已完成 | M 独有 descriptor/shared restart、scripts/Jepsen portability 的固定源码清单；吸收相关行为并记录明确排除项 | 验证保留的 descriptor 错配与 shared restart；检查受影响脚本，不能仅 cargo 编译 |
+| C — Slot 合同 | 首验证范围已完成 | 新 `multiraft-slot` crate，规范 manifest/digest/磁盘绑定、固定 hash/layout、限额配置和测试 FSM 接口 | 已知 hash 向量、重启映射；非法 version/count/mapping/replicas、node/磁盘与跨节点 digest 错配 fail closed |
+| D — 路由与生命周期 | 首验证范围已完成 | key/Slot 服务端校验、本地/单次远端路径、精确结果/查询语义、accepted work owner、deadline 和有界 close | key/Slot/digest 错误在写前拒绝；过时 hint 分类；dispatch 后 Unknown；无重试环；取消/drain 与容量释放断言 |
+| E — demo 与 RF3 | 首验证范围已完成 | 最小确定性、可返回结果的 FSM；使用 RocksDB 和新目录的可复现三 OS 进程 RF3 多 Slot runner | 本地/远端读写；snapshot/purge/restart；切主；提交后响应丢失与相同 ID 重试；限额/热冷进展；关闭与 recovery proof 失败 |
+| F — 独立审查与证据 | 首验证范围已完成 | 审查整合 diff/合同、修复已核实问题、双语记录精确源码命令结果与剩余缺口 | 真实源码相关 tests/build 和实进程验收通过；审查发现已修复或明确记录；不借用历史通过数 |
 
-A/B 完成后才形成最终整合基线检查。C 规定 D/E 使用的合同；只有文件所有权不重叠、接口已协调时才并行实现。F 审查完成后的整合行为。未附实际证据，不把任何步骤标为完成。
+A/B 完成后才形成最终整合基线检查。C 规定 D/E 使用的合同；只有文件所有权不重叠、接口已协调时才并行实现。F 审查完成后的整合行为。证据台账现已附首验证版完成收据，不关闭后续生产门槛。
 
 ## 3. 验证过程
 
@@ -37,7 +37,7 @@ A/B 完成后才形成最终整合基线检查。C 规定 D/E 使用的合同；
 7. 覆盖 snapshot restore/log replay、recovery proof 拒绝、accepted 后取消、node/Slot count/byte 限额饱和、热冷进展和有界关闭。记录未完成 owned 工作和错误，不能只因 client tasks 已退出就称 clean。
 8. 审查最终整合 diff，修复已核实问题，重跑受影响检查，并将证据绑定最终源码。按实际类型、hash bytes 和路由合同修正文档 API。
 
-不虚构未来 test binary 或 acceptance flag 名。E 的 runner 存在后须给出准确复现命令。现有 `scripts/acceptance.sh` 只证明它覆盖的行为，不能自动视为新 Slot 入口或 RocksDB 多 Slot 验收。
+runner 已实现：根目录 `cargo build -p multiraft-slot-demo` 后以新数据运行 `python3 scripts/slot_acceptance.py --case all`；见[指南](../slot-acceptance.zh-CN.md)。现有 `scripts/acceptance.sh` 只证明它覆盖的行为，不能自动视为新 Slot 入口或 RocksDB 多 Slot 验收。
 
 ## 4. 验收矩阵
 
@@ -58,15 +58,23 @@ Slot 局部 runtime 故障隔离是生产接入前独立门槛。共享 DB 或 m
 
 | 项目 | 实际源码 / 命令 / 结果 |
 | --- | --- |
-| A/B 整合基线 | 待填；尚未记录本轮成功结果 |
-| C/D Slot unit/contract 检查 | 待填；尚未记录本轮成功结果 |
-| E 三进程 RF3 多 Slot 验收 | 待填；尚未记录本轮成功结果 |
-| F 独立审查与最终验证 | 待填；尚未记录本轮成功结果 |
+| A/B 整合基线 | 最终实测源码 `76ce0dd6c686367f04de4cfc9772ed3942140c3c`；tree `6a7f7538c641dc3017ab9093283bc2b918f80503`；生产实现与 e554 一致；Rocks/后端/recovery 和 M 选择性 fixture 通过；Jepsen 单元 3 tests/12 assertions 通过 |
+| C/D Slot unit/contract 检查 | manifest 9、Slot runtime 12 + budget unit 1；owned proposal 5、watermark 4 + local observation 2 增量通过；源码/日志边界见证据台账 |
+| E 三进程 RF3 多 Slot 验收 | 最终全部场景收据 7 项通过，含 raw HTTP RST；13 次启动 PID 均不存在、九端口可复用；保留此前失败 |
+| F 独立审查与最终验证 | 最终 format/Clippy/build 通过；串行 workspace 430 passed/0 failed/12 ignored；harness 15 项通过；legacy ACCEPTANCE OK、3 PID 不存在/六端口可复用；保留历史 observer 风险 |
 
-执行后按实际命令/收据填写，失败和未运行场景一并记录。C 历史 `95c6e6c`（366 passed、12 ignored、一次三进程 acceptance）和 R 后端命令不是本 worktree 通过结果。4/8 Slot 小布局验收不认证生产 slot_count、资源、吞吐或 B4 延迟。
+[证据台账](../evidence/2026-10-16-slot-foundation.zh-CN.md)记录命令、收据、失败与未运行场景；增量次数不能累加为最终源码总数。C 历史 `95c6e6c`（366 passed、12 ignored、一次三进程 acceptance）和 R 后端命令不是本 worktree 通过结果。4/8 Slot 小布局验收不认证生产 slot_count、资源、吞吐或 B4 延迟。
 
 ## 6. 后续边界
 
-生产接入先要求可证明 Slot 局部隔离，以及保留原子 dedup/seq/head/pending/result + flush/stop 的确定性 Admit 设计。fence 旧 admission/collector 后全量迁移权威状态及 persisted progress，不能从滞后 TiKV head 启动已有 Channel。永久 command result 保留和跨 Channel TiKV 事务语义不能偷改。
+生产接入先要求关闭证据台账记录的未定位 observer 间歇性风险，并可证明 Slot 局部隔离，以及保留原子 dedup/seq/head/pending/result + flush/stop 的确定性 Admit 设计。fence 旧 admission/collector 后全量迁移权威状态及 persisted progress，不能从滞后 TiKV head 启动已有 Channel。永久 command result 保留和跨 Channel TiKV 事务语义不能偷改。
 
 RocksDB 继续只承担本地共识 log/metadata；TiKV 继续承担长期消息事务 storage。异步投递与异步 TiKV 是接纳后并行路径；SENDACK 是 committed + applied 接纳，不是 TiKV 或 RECV 确认。这些合同约束下一阶段，本底座不实现该阶段。
+
+## 7. 可执行后续顺序
+
+1. 保留已完成固定源码收据与原失败。生产接入前，用能区分原因的失败证据追查未定位 observer wake，明确并测试通知合同，不能压制原断言。
+2. 生产接入前实现并注入故障验证 Slot-local quarantine/recovery：明确断言一个坏 Slot 与一个健康 Slot 的服务行为；共享 DB/身份错误仍为 node 级。
+3. 规定确定性 Admit 的 command/result/snapshot schema 与原子 apply 不变量；联合测试 dedup/seq/head/pending/flush/stop、Unknown/取消和永久成功结果重放。
+4. 实现 fenced 全状态迁移/import validator 和中断切换流程，再接生产 admission、TiKV persistence 与 delivery；保留 collector 跨 Channel 事务合同。
+5. 正确性与迁移通过后固定实验分母/阈值，进行可比 baseline/candidate 交替负载；成功延迟须与失败/unissued/资源一起报告。本底座记录不代表已达任何性能目标。

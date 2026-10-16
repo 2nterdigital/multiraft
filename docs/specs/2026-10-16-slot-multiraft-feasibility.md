@@ -4,7 +4,7 @@
 
 **Date:** 2026-10-16
 
-**Status:** Foundation implementation authorized on 2026-10-16 and in progress; integration and acceptance results remain unverified. Historical assessment facts below retain their fixed source commits.
+**Status:** First verification version completed at 76ce0dd: final workspace and local RF3/legacy acceptance passed. Production integration and the historical unlocated observer risk remain later gates. Historical assessment facts below retain their fixed source commits. Current APIs and checks are in the [foundation design](./2026-10-16-slot-multiraft-foundation.md) and [evidence](../evidence/2026-10-16-slot-foundation.md).
 
 **Scope:** Whether the existing OpenRaft fork can support a generic Slot layer and how ech0 could integrate it.
 
@@ -107,7 +107,7 @@ All nodes must validate the manifest at startup. Cross-node agreement and server
 Reserve GroupId/domain space to avoid metadata group collisions. Do not use `std::DefaultHasher` or arbitrarily change N before taking a modulus.
 Determine slot_count through resource and workload measurements; this document recommends neither 256 nor copying Wukong defaults.
 
-The diagram is a proposed module dependency structure, not an existing implementation. Arrows denote dependencies, not an execution sequence placing WAL after apply. Shared resource limits cover all groups; asynchronous TiKV persistence belongs to the business adapter.
+At the original assessment date, the diagram was a proposed module dependency structure. The current generic Slot implementation is documented in the foundation design; the production ech0 adapter remains future work. Arrows denote dependencies, not an execution sequence placing WAL after apply. Shared resource limits cover all groups; asynchronous TiKV persistence belongs to the business adapter.
 
 ```mermaid
 flowchart TD
@@ -142,7 +142,7 @@ Query(slot, query_bytes, consistency, absolute_deadline)
   -> QueryResult | NotReady | Unavailable(reason)
 ```
 
-M propose exposes index/term only. C's ProposeApplied can return exact entry effects, but the Slot API and business result model above are unimplemented.
+At the original assessment, M propose exposed index/term only and C's ProposeApplied returned exact entry effects; the Slot sketch above was then unimplemented. The foundation now implements the generic Slot API described in its design, while the production Admit result model remains unimplemented.
 A linearizable Query must complete native ReadIndex for the destination group and satisfy apply visibility; a stale query explicitly returns its watermark.
 Leader status is a routing hint. Native submission and read contracts provide safety.
 A pure read failure does not produce a write Unknown. When querying the result of a previous Unknown write, a miss or failed query does not prove that the original write did not commit or cannot apply later.
