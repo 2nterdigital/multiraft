@@ -1,6 +1,7 @@
 use multiraft_fsm::{ApplyOut, CaptureError, StateMachine};
 use multiraft_slot::*;
 use std::{
+    future::Future,
     net::{SocketAddr, TcpListener},
     path::PathBuf,
     sync::{
@@ -314,6 +315,98 @@ async fn validation_rejects_before_apply_and_manifest_mismatch_before_native_ope
     ));
 }
 
+// This fixture permits election rejection only for read-only attempts. A successful
+// response is checked immediately so retrying cannot hide a stale/wrong value.
+async fn assert_read_when_leader<F, Fut>(
+    mut read: F,
+    expected: &[u8],
+    until: Instant,
+) -> Result<(), RuntimeError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, RuntimeError>>,
+{
+    let mut last_error = RuntimeError::Deadline;
+    loop {
+        if Instant::now() >= until {
+            return Err(last_error);
+        }
+        match tokio::time::timeout_at(until, read()).await {
+            Ok(Ok(value)) => {
+                assert_eq!(value, expected, "successful linearizable read must match");
+                return Ok(());
+            }
+            Ok(Err(error @ RuntimeError::NotLeader { .. })) => last_error = error,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(last_error),
+        }
+        tokio::time::sleep_until((Instant::now() + Duration::from_millis(5)).min(until)).await;
+    }
+}
+
+#[tokio::test]
+async fn read_fixture_retries_not_leader_then_checks_success() {
+    let mut responses = [
+        Err(RuntimeError::NotLeader { hint: None }),
+        Ok(1u64.to_be_bytes().to_vec()),
+    ]
+    .into_iter();
+    assert_read_when_leader(
+        || std::future::ready(responses.next().expect("unexpected extra read")),
+        &1u64.to_be_bytes(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert!(responses.next().is_none());
+}
+
+#[tokio::test]
+#[should_panic(expected = "successful linearizable read must match")]
+async fn read_fixture_does_not_retry_wrong_successful_value() {
+    let mut responses = [
+        Ok(0u64.to_be_bytes().to_vec()),
+        Ok(1u64.to_be_bytes().to_vec()),
+    ]
+    .into_iter();
+    let _ = assert_read_when_leader(
+        || std::future::ready(responses.next().expect("unexpected extra read")),
+        &1u64.to_be_bytes(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn read_fixture_does_not_swallow_other_errors() {
+    let mut responses = [
+        Err(RuntimeError::Unavailable),
+        Ok(1u64.to_be_bytes().to_vec()),
+    ]
+    .into_iter();
+    assert_eq!(
+        assert_read_when_leader(
+            || std::future::ready(responses.next().expect("unexpected extra read")),
+            &1u64.to_be_bytes(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await,
+        Err(RuntimeError::Unavailable)
+    );
+    assert!(responses.next().unwrap().is_ok());
+}
+
+async fn voter_observations(
+    owners: &[SlotNodeOwner<Fsm>],
+    until: Instant,
+) -> Vec<Result<multiraft_net::LocalGroupStatus, RuntimeError>> {
+    let mut observations = Vec::new();
+    for owner in owners.iter().take(3) {
+        observations.push(owner.handle().local_group_status(SlotId(0), until).await);
+    }
+    observations
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn real_grpc_nonhosted_node_routes_single_write_and_linearizable_read() {
     let layout = layout(4, 2, vec![1, 2, 3]);
@@ -334,12 +427,50 @@ async fn real_grpc_nonhosted_node_routes_single_write_and_linearizable_read() {
         );
     }
     let h = owners[3].handle();
-    let result = h.propose(&k, b"one".to_vec(), deadline()).await.unwrap();
+    // Startup waits for local recovery, not a settled election. Establish this
+    // test's quorum-read precondition without issuing any application writes.
+    // All readiness, the single write, and read attempts share this fixed budget.
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observations = voter_observations(&owners, until).await;
+        let ready = observations.iter().all(|observation| {
+            matches!(observation, Ok(status) if status.leader_hint.is_some()
+                && observations.iter().all(|other| matches!(other, Ok(other)
+                    if other.current_term == status.current_term
+                    && other.leader_hint == status.leader_hint)))
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "voters did not converge: {observations:?}"
+        );
+        tokio::time::sleep_until((Instant::now() + Duration::from_millis(5)).min(until)).await;
+    }
+    if let Err(error) = assert_read_when_leader(
+        || h.read_linearizable(&k, &[], until),
+        &0u64.to_be_bytes(),
+        until,
+    )
+    .await
+    {
+        let observations = voter_observations(&owners, deadline()).await;
+        panic!("initial quorum read failed: {error:?}; later voter observations: {observations:?}");
+    }
+    let result = h.propose(&k, b"one".to_vec(), until).await.unwrap();
     assert_eq!(result.effects, 1u64.to_be_bytes());
-    assert_eq!(
-        h.read_linearizable(&k, &[], deadline()).await.unwrap(),
-        1u64.to_be_bytes()
-    );
+    if let Err(error) = assert_read_when_leader(
+        || h.read_linearizable(&k, &[], until),
+        &1u64.to_be_bytes(),
+        until,
+    )
+    .await
+    {
+        // These are later point samples, not authority at the failed read.
+        let observations = voter_observations(&owners, deadline()).await;
+        panic!("write succeeded but read failed: {error:?}; later voter observations: {observations:?}");
+    }
     assert!(h
         .leader_hint(SlotId(0), deadline())
         .await
