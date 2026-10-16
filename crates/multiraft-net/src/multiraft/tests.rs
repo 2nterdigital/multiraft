@@ -74,7 +74,7 @@ async fn group_observer_does_not_wake_on_data_progress() -> anyhow::Result<()> {
     let raft = leader.raft(group).expect("leader raft");
     let mut raw_full_metrics = raft.metrics();
     let _ = raw_full_metrics.borrow_and_update().clone();
-    let (_initial, mut observer) = leader.observe_group(group).expect("observe group");
+    let (initial, mut observer) = leader.observe_group(group).expect("observe group");
 
     let proposed = leader.propose(group, CounterFsm::encode_add(1, 1)).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -108,9 +108,22 @@ async fn group_observer_does_not_wake_on_data_progress() -> anyhow::Result<()> {
         }
     }
 
+    let wake = observer.changed().now_or_never();
+    if wake.is_some() {
+        // These later point samples help distinguish an unexpected data wake
+        // from a concurrent control change; they do not establish its cause.
+        for node in &nodes {
+            let metrics = node.raft(group).expect("group raft").metrics();
+            eprintln!(
+                "later full metrics for node {}: {:#?}",
+                node.node_id(),
+                metrics.borrow_watched().clone()
+            );
+        }
+    }
     assert!(
-        observer.changed().now_or_never().is_none(),
-        "server-metrics observer must not wake on data-only progress"
+        wake.is_none(),
+        "server-metrics observer must not wake on data-only progress; initial={initial:#?}; wake={wake:#?}"
     );
     Ok(())
 }
