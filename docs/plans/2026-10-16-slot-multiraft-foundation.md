@@ -7,6 +7,8 @@
 
 Implement the [adopted foundation design](../specs/2026-10-16-slot-multiraft-foundation.md). The [feasibility assessment](../specs/2026-10-16-slot-multiraft-feasibility.md) preserves historical source facts and explains the later ech0 integration gates. The user has confirmed the scope and start of implementation; these steps require verification evidence, not renewed approval of settled choices.
 
+For current follow-up execution, the [Admit-first implementation plan](./2026-10-17-slot-admit-first-implementation.md) has highest priority and overrides the old fairness-before-real-Admit order; see section 7. A–F and historical evidence retain their original scope.
+
 ## 1. Fixed scope
 
 Use C `28e668b676c803838eb64a04ba160fb10ad88316` as the working baseline, integrate necessary M `44baed14b3717b6b6f5f7327790cc97299889e19` improvements and port R `d6a5dbbb6d2f1c68e9e8bddbbfca18f562c1185c` RocksDB logs. Deliver a new Slot API, independent new data directories and a runnable three-process RF3 multiple-Slot test application. Retain old data without automatic API/WAL compatibility promises.
@@ -73,6 +75,6 @@ RocksDB remains local consensus log/metadata storage. TiKV remains long-term mes
 
 ## 7. Executable follow-up order
 
-The [Channel fair-admission follow-up plan](./2026-10-16-slot-channel-fair-admission.md) refines G0–G6 and the later H1 hot-isolation review. All new steps are Planned, not implemented and unrun; A–F and their fixed-source evidence remain completed for the first verification scope.
+The [Admit-first implementation plan](./2026-10-17-slot-admit-first-implementation.md) has highest priority for current execution: T0 freezes contract sources; T1 real business FSM and T2 Slot RF3 adapter form M1; T3 cross-Slot claims/TiKV handoff and T4 HTTP/WS, delivery/history in isolated new data namespaces form M2; T5 necessary bounded Channel fairness and hot/cold acceptance, T6 production fault isolation/observer/snapshot growth and T7 migration rehearsal/target acceptance form M3. M2 validates an isolated new namespace only; T6 remains a gate before production integration. This order does not authorize automatic deployment. Full DRR, client NODELAY and #173 reruns are not prerequisites for M1/M2; retain existing necessary configuration.
 
-G0 freezes contracts/profiles; G1–G3 implement destination admission, bounded fairness and lifecycle; G4–G5 add models, mixed-load harness and comparable reports. The observer investigation does not block documentation/model work. Before production wiring, G6 still requires closing that risk, proving Slot-local isolation, deterministic Admit invariants and fenced full-state migration/TiKV integration. H1 remains a later decision gate, with fixed Slots and one DB per node retained now.
+The old [Channel fair-admission plan](./2026-10-16-slot-channel-fair-admission.md) retains G0–G6/H1 IDs for reference, but its fairness-before-Admit dependencies are overridden by the new plan. G1–G3 follow their old internal dependencies only if T5 needs that detailed implementation package. G6 real Admit/persistence/delivery work moves forward into T1–T4 without waiting for G5 fairness evidence. Fault isolation and observer closure move to T6, full migration to T7; H1 remains a later evidence-based hot-isolation decision. M1/M2 retain hard bounds, identity validation, deadline/Unknown/ownership and read/control reserves; deferring fairness does not cancel those contracts. A–F and historical evidence retain their original scope.

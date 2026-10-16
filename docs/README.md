@@ -31,6 +31,7 @@ Self-contained docs for the **multiraft** GitHub repository (no links outside th
 | [2026-07-22-sync1-disk-pipeline-merge.md](./specs/2026-07-22-sync1-disk-pipeline-merge.md) | [2026-07-22-sync1-disk-pipeline-merge.zh-CN.md](./specs/2026-07-22-sync1-disk-pipeline-merge.zh-CN.md) | M4: deep pipeline / sync=1 group-commit / replication batch + knees |
 | [2026-07-22-aeron-next-borrow.md](./specs/2026-07-22-aeron-next-borrow.md) | [2026-07-22-aeron-next-borrow.zh-CN.md](./specs/2026-07-22-aeron-next-borrow.zh-CN.md) | Next Aeron borrow backlog (N1–N3) |
 | [2026-10-16-slot-multiraft-feasibility.md](./specs/2026-10-16-slot-multiraft-feasibility.md) | [2026-10-16-slot-multiraft-feasibility.zh-CN.md](./specs/2026-10-16-slot-multiraft-feasibility.zh-CN.md) | Slot MultiRaft feasibility and confirmed implementation scope |
+| [2026-10-17-slot-admit-first-implementation.md](./plans/2026-10-17-slot-admit-first-implementation.md) | [2026-10-17-slot-admit-first-implementation.zh-CN.md](./plans/2026-10-17-slot-admit-first-implementation.zh-CN.md) | Highest current execution priority: real Admit → persist/delivery → necessary fairness/hot isolation; T0–T7, M1–M3; no automatic deployment |
 | [2026-10-16-slot-multiraft-foundation.md](./specs/2026-10-16-slot-multiraft-foundation.md) | [2026-10-16-slot-multiraft-foundation.zh-CN.md](./specs/2026-10-16-slot-multiraft-foundation.zh-CN.md) | Fixed Slot MultiRaft foundation: contracts, routing, recovery and boundaries |
 | [2026-10-16-slot-channel-fair-admission.md](./specs/2026-10-16-slot-channel-fair-admission.md) | [2026-10-16-slot-channel-fair-admission.zh-CN.md](./specs/2026-10-16-slot-channel-fair-admission.zh-CN.md) | Bounded Channel fair admission, mixed-load validation and future hot isolation (planned) |
 
@@ -50,7 +51,7 @@ Self-contained docs for the **multiraft** GitHub repository (no links outside th
 | [2026-07-18-multiraft.md](./plans/2026-07-18-multiraft.md) | [2026-07-18-multiraft.zh-CN.md](./plans/2026-07-18-multiraft.zh-CN.md) | Phase-1 library + demo |
 | [2026-07-18-multiraft-grpc.md](./plans/2026-07-18-multiraft-grpc.md) | [2026-07-18-multiraft-grpc.zh-CN.md](./plans/2026-07-18-multiraft-grpc.zh-CN.md) | Cross-process gRPC (Phase-1.5) |
 | [2026-10-16-slot-multiraft-foundation.md](./plans/2026-10-16-slot-multiraft-foundation.md) | [2026-10-16-slot-multiraft-foundation.zh-CN.md](./plans/2026-10-16-slot-multiraft-foundation.zh-CN.md) | Authorized implementation steps and source-bound validation evidence |
-| [2026-10-16-slot-channel-fair-admission.md](./plans/2026-10-16-slot-channel-fair-admission.md) | [2026-10-16-slot-channel-fair-admission.zh-CN.md](./plans/2026-10-16-slot-channel-fair-admission.zh-CN.md) | G0–G6 follow-up gates and H1 review; not implemented or run |
+| [2026-10-16-slot-channel-fair-admission.md](./plans/2026-10-16-slot-channel-fair-admission.md) | [2026-10-16-slot-channel-fair-admission.zh-CN.md](./plans/2026-10-16-slot-channel-fair-admission.zh-CN.md) | G0–G6/H1 detailed package retained; execution dependencies overridden by Admit-first plan; not implemented or run |
 
 ## Operations
 

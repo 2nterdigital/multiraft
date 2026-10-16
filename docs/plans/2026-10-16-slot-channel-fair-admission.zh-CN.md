@@ -3,26 +3,40 @@
 **English：** [2026-10-16-slot-channel-fair-admission.md](./2026-10-16-slot-channel-fair-admission.md)
 
 **日期：** 2026-10-16
-**状态：** Planned；未实现；未执行任何新增测试或负载运行。
+**状态：** 保留的详细实现包；执行顺序已由 Admit 优先计划覆盖。Planned；未实现；未执行任何新增测试或负载运行。
 
 本计划依据[公平准入规范](../specs/2026-10-16-slot-channel-fair-admission.zh-CN.md)，细化[已完成底座计划](./2026-10-16-slot-multiraft-foundation.zh-CN.md)的后续工作。
 A–F 完成、workspace 430 passed、七项验收、原失败和未定位 observer 风险仍按[台账](../evidence/2026-10-16-slot-foundation.zh-CN.md)保留为历史事实。
 固定 Slot、持久化 hash/layout 和每 node 一个 RocksDB 保持为基线；本文不宣称已实现、性能通过或生产就绪。
 
+## 当前执行优先级与旧任务映射
+
+当前执行顺序以 [Admit 优先实施计划](./2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级：T0 合同来源冻结；T1 真实业务 FSM 与 T2 Slot RF3 adapter 构成 M1；T3 跨 Slot claims/TiKV 交接与 T4 HTTP/WS、delivery/history 的隔离新数据空间构成 M2；T5 必要的 Channel 有界公平与热冷验收、T6 生产故障隔离/observer/snapshot 增长、T7 迁移演练与目标验收构成 M3。M2 仅为隔离新命名空间验证，T6 仍是生产接入前门槛；此顺序不自动授权部署。完整 DRR、客户端 NODELAY 和 #173 复测均不是 M1/M2 前置，保留已有必要配置。
+
+G0–G6/H1 保留为详细包 ID，旧“公平证据先于真实 Admit”顺序已被覆盖；下述 G1–G5 的调度依赖仅适用于 T5 选用该详细包时。原身份、预算、Unknown、deadline、ownership 与各层 read/control reserve 约束持续有效，M1/M2 就须具备必要硬上界和完整生命周期。
+
+| 旧 ID | 当前归属 / 覆盖范围 |
+| --- | --- |
+| G0 | T0 冻结业务合同来源；调度 profile 在 T5 冻结 |
+| G1–G3 | 必要身份/预算/生命周期约束随 T1–T4 先落实；完整调度包在 T5 需要时按 G1 → G2 → G3 内部依赖实现 |
+| G4–G5 | T5 公平模型、热冷验收与可比报告；不阻塞 M1/M2 |
+| G6 | 真实 Admit、adapter、claims/TiKV 和业务链路拆至 T1–T4；生产隔离/observer/snapshot 增长归 T6，迁移归 T7；不再依赖 G5 才启动真实业务接入 |
+| H1 | T5 验收后按证据决定必要热点隔离，若需迁移仍遵守 T6/T7 生产门槛 |
+
 ## 1. 交付合同与集成顺序
 
 本地 `route_write` 与远端 RPC `accept_write` 必须汇合到同一个目的端准入 seam。
 业务 adapter 提供有界、无 I/O 的 key/command 身份及 cost 校验；通用 Slot 将 command 视为 opaque。
-node 对 ready Slot 做 round-robin，Slot 内对 Channel 做等权、有界 deficit round-robin（DRR）。
+T5 先采用满足热冷验收的有界 Channel round-robin；必要时再采用等权有界 DRR。
 Channel FIFO 仅指调度选择顺序，不承诺全局 FIFO 或全 node 所有 Channel 同吞吐。
 每次有界 dispatch 后轮转，不等待 proposal completion；Channel、Slot、node 的 active-key table、queue count/bytes 和 dispatched window 均有界。
-cost 为固定每 command 成本加 encoded bytes；quantum 为正，deficit cap 覆盖最大合法 cost，idle 清零，每次 visit 限定消息数/bytes/work。
+cost 为固定每 command 成本加 encoded bytes；每次 visit 限定消息数/bytes/work。T5 如需 DRR，quantum 为正，deficit cap 覆盖最大合法 cost，idle 清零。
 区分 source-forward、destination-queued、destination-inflight 容量；唯一目的端 reservation 从 queue 原子移交至 inflight；caller Unknown 后仍由 owner 持有至实际完成。目的端 `dispatched` 预算从 Queued→Dispatching 原子转移开始，覆盖 Dispatching/InFlight 及 owner 仍保留的完成资源，不等待 native receipt；这是预算记账，不是实际已提交证明，native dispatch 事件独立记录。
 在声明的受保护负载域内预留 new-cold active-key entry、count、bytes 与下层容量；任意 key churn 下不保证 cold always admitted 或无限进展。
 写限额必须在 Slot、native、application-RPC 各层给 read、reconcile、hint、maintenance 留容量。
 当前 native 最大额度被 read/write 共用，application-RPC handler 等待回复期间仍占 permit：两处都须明确改造并验证饱和行为。
 
-共享 seam 按 G1 → G2 → G3 集成，三项整合门槛均通过后才启用 candidate 调度。
+T5 选用此调度包时，共享 seam 按 G1 → G2 → G3 集成，三项整合门槛均通过后才启用该 candidate；此内部依赖不阻塞 T1–T4。
 G4 generator/accounting 可在 G0 后独立且分文件并行；candidate 负载仍须等待 G1–G3 与 G4 正确性门槛。
 每张实施票在编辑前确定精确文件；下列预计所有权是拆分起点，不代表已有接口。
 
@@ -44,10 +58,10 @@ G4 generator/accounting 可在 G0 后独立且分文件并行；candidate 负载
 
 ## 4. G2 — 有界分层公平调度
 
-- **目标：** 实现 node ready-Slot RR 与 Slot Channel DRR、有界 visit、独立 completion owner；queue depth/fair-gap 观测保持低基数。
+- **目标：** 在 T5 实现 node ready-Slot RR 与必要的有界 Channel RR（需要时 DRR）、有界 visit、独立 completion owner；queue depth/fair-gap 观测保持低基数。
 - **依赖：** G1 reservation/stage 合同；复用已校验 cost，不在 scheduler 解析业务 command。
 - **预计拥有：** `crates/multiraft-slot/src/` 新 scheduler/budget 模块，具体名称在 G0 确定；G1 owner 在 scheduler 审查后集成 `runtime.rs`，避免并发编辑同文件。
-- **完成标准：** 模型/性质测试证明合法 cost 进展、idle reset、deficit/work/state 有界、selection FIFO、饱和行为和受保护 new-cold headroom；冻结域内同 Slot hot backlog 不垄断 dispatch。
+- **完成标准：** 模型/性质测试证明合法工作进展、work/state 有界、selection FIFO、饱和行为和受保护 new-cold headroom；选用 DRR 时额外证明 idle reset 与 deficit 有界。冻结域内同 Slot hot backlog 不垄断 dispatch。
 - **状态 / 回滚：** Planned，未实现，未运行。G3 通过前不启用 candidate；回退 mode 前分类结束 queued reservation 并 drain。
 
 ## 5. G3 — Deadline、取消、领导权与关闭
@@ -87,12 +101,12 @@ G4 generator/accounting 可在 G0 后独立且分文件并行；candidate 负载
 - **目标：** 评估冻结混合 profile，正确性门槛独立于性能阈值。
 - **依赖：** G0 profile 签定、G1–G3 整合、G4 已验证；历史 observer 风险单独报告，生产接入前处理。
 - **预计拥有：** 新固定源码报告/证据产物与 harness receipt schema；不把底座台账改写为 candidate 证据。
-- **完成标准：** 同 binary（记录 ELF/build identity 或平台等价物）、可控有界 FIFO baseline/DRR candidate mode、同 classifier、queue/inflight/byte 限额、new-key/control reserve、观测/硬件/durability；两模式至少各两次交替运行，每次新建自有 data。
+- **完成标准：** 同 binary（记录 ELF/build identity 或平台等价物）、可控有界 FIFO baseline/所选有界 RR candidate mode（需要时 DRR）、同 classifier、queue/inflight/byte 限额、new-key/control reserve、观测/硬件/durability；两模式至少各两次交替运行，每次新建自有 data。
 - **正确性必过：** 按 logical command ID 零重复 effects、每 Channel scheduler-selection FIFO 无违反、最小 FSM effects 符合已提交顺序、状态恢复及全部资源上界独立通过。不要求并发入口 arrival order 或 owned-task dispatch order 等于实际 log order；失败不能混入平均延迟后宣称可接受。
 - **性能必需：** 预先冻结 cold SLO absolute/relative、completion minimum、reject/Unknown maximum、fair-gap/backlog 阈值；业务数值缺失仍是开放门槛，不编造通过条件。
 - **状态 / 回滚：** Planned，未实现，未运行。正确性失败或 generator_invalid 阻止 candidate；安全 drain 后仍可用 baseline。
 
-立即 Busy/无 queue 的底座可作额外行为参照，但差异不只 DRR，不能分离调度效应；历史测试收据不是本次新测 baseline。
+立即 Busy/无 queue 的底座可作额外行为参照，但差异不只调度策略，不能分离调度效应；历史测试收据不是本次新测 baseline。
 成功延迟与拒绝/error/Unknown、outstanding_at_measurement_cutoff、unissued 需求分别报告，保留分母与结果阶段。issued attempt 按 G4 的互斥 client-terminal/outstanding 划分核账；原 cohort Unknown 与关联的后续 resolution/retry attempt 同时保留。
 纳入 RocksDB stall/flush/compaction/I/O、per-Slot backlog 和低基数公平/资源指标；不导出无限 Channel 标签。
 每收据绑定 source/tree、binary/harness SHA、layout/hash、profile、limits、硬件/durability、进程身份与自有清理证据；保留失败及新数据。
@@ -101,13 +115,13 @@ G4 generator/accounting 可在 G0 后独立且分文件并行；candidate 负载
 ## 8. G6 — 后续 Admit 与生产接入
 
 - **目标：** 设计确定性 Admit，再通过全权威状态迁移接入生产 admission、persistence、delivery。
-- **依赖：** 公平证据及独立生产门槛：不压制断言地关闭 observer notification 风险；证明 Slot-local quarantine/recovery，DB/身份失败仍 node-wide。
+- **当前依赖覆盖：** 真实 Admit/persistence/delivery 按 T1–T4 启动，不依赖公平证据；M2 仅使用隔离新命名空间。生产接入前仍须 T6 不压制断言地关闭 observer notification 风险、证明 Slot-local quarantine/recovery 与 snapshot 增长有界；DB/身份失败仍 node-wide，并须 T7 完整迁移验收。
 - **预计拥有：** 后续业务 Admit adapter/FSM、migration/collector 接入模块；具体仓库/文件在独立生产计划确定。
 - **完成标准：** 原子 dedup/seq/head/pending/result + flush/stop、永久成功结果重放、persisted progress/claims/Unknown 与既有跨 Channel TiKV 事务合同，经 restart 与 fenced migration 保留；不从滞后 TiKV head 初始化已有 Channel。
 - **状态 / 回滚：** Planned，未实现，未运行。fence 旧 admission/collector；checkpoint + tail 和校验先于切换；新写发生后回滚须状态迁移和新 epoch。
 
 RocksDB 保持本地共识 log/metadata，TiKV 为长期消息事务 storage；异步 delivery/TiKV 为接纳后并行路径，SENDACK 保持 committed + applied 接纳。
-observer 调查不阻塞 G0 文档或独立模型/generator 开发，但生产 wiring 前必须关闭。
+observer 调查不阻塞 T0–T4 的隔离验证，但必须在 T6 关闭后才进入生产；G6 旧“生产 wiring”门槛不适用于 M2 的隔离新命名空间。
 
 ## 9. H1 — 后续热点隔离决策评审
 

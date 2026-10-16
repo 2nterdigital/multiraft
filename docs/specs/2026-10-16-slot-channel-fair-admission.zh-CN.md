@@ -2,13 +2,15 @@
 
 **English：** [English version](./2026-10-16-slot-channel-fair-admission.md)
 **日期：** 2026-10-16
-**状态：** 已采纳的下一阶段设计；尚未实现、尚未验证。
+**状态：** 已采纳的详细公平设计；执行顺序由 Admit 优先计划覆盖；尚未实现、尚未验证。
 
-本文规定下一阶段实现合同，不代表当前 runtime 行为。
+本文保留公平详细实现合同，按当前计划在 T5 必要时采用，不代表当前 runtime 行为。
 [底座规范](./2026-10-16-slot-multiraft-foundation.zh-CN.md)仍是已实现基线。
-[实施计划](../plans/2026-10-16-slot-channel-fair-admission.zh-CN.md)规定 G0–G6 与后续 H1 门槛。
+[旧实施计划](../plans/2026-10-16-slot-channel-fair-admission.zh-CN.md)保留 G0–G6 与后续 H1 详细包及其当前依赖覆盖。
 历史 430-pass 与 A–F 结果保持原有范围，不能证明本调度器有效。
 不同 Slot 的一个冷请求获得进展，也不能作为 Channel 公平性证据。
+
+当前执行以 [Admit 优先实施计划](../plans/2026-10-17-slot-admit-first-implementation.zh-CN.md) 的 T0–T7 为最高优先级，覆盖旧 G0–G6/H1 的公平先于 Admit 顺序：M1 先真实 Admit，M2 接通 claims/TiKV 与隔离新空间的 HTTP/WS、delivery/history，T5 再补必要公平。下述身份、预算、Unknown/deadline/ownership、预留与完整生命周期合同持续有效；M1/M2 先有必要硬上界和 read/control reserve。T6 生产隔离、observer 与 snapshot 增长门槛及 T7 迁移验收仍须在生产前完成。完整 DRR、客户端 NODELAY 与 #173 复测均不是 M1/M2 前置；保留已有必要配置。
 
 ## 1. 范围与固定约束
 
@@ -17,7 +19,7 @@
 本阶段不引入每 Slot DB、生产 Admit、resharding 或 write retry。
 Slot 故障隔离与性能公平是不同门槛，不能互相证明。
 历史 observer 风险、生产 Admit/TiKV 迁移与容量门槛继续保留。
-公平只覆盖已接纳且 eligible 的请求，依据估算成本，不承诺 wall-clock 硬上界。
+公平只覆盖按有界选择已接纳且 eligible 的请求（选用 DRR 时依据估算成本），不承诺 wall-clock 硬上界。
 冷新 key 的 SLO 还要求受保护的入口容量与明确的负载域。
 
 ## 2. 统一目的端准入 seam
@@ -56,7 +58,7 @@ G1 须让两个入口通过同一 Interface，测试 adapter 也如此。
 
 ## 3. 有界两级调度
 
-node 轮转 ready Slots；每 Slot 对 Channel 使用等权、有界 DRR 变体。
+T5 先采用满足热冷验收的有界 Channel round-robin，并有界轮转 ready Slots；完整 DRR 仅在成本差异等证据表明必要时选用。以下 cost/quantum/deficit 规则适用于选用的 DRR 变体；visit、窗口、active-key、blocked 跳过和 owner 上界适用于两种策略。
 Channel FIFO 只规定 scheduler 选择顺序，不承诺跨入口到达顺序，
 也不承诺多个同时 dispatched owned task 的实际日志顺序。
 业务若要求顺序，由未来 Admit 原子分配业务 seq；
@@ -137,7 +139,7 @@ source 饱和可能在目的端分类之前拒绝冷请求，须记录该 refusa
 
 启动配置校验必须覆盖：
 
-- 正 quantum 与 visit-work cap；有限 deficit cap 能支付所有可接纳 command cost。
+- visit-work cap 为正；选用 DRR 时 quantum 为正、有限 deficit cap 能支付所有可接纳 command cost。
   visit byte/work cap 至少容纳一个最大可接纳 head，保证能取得进展。
 - schema byte/apply-work 上限、cost 溢出检查与保守 retained-byte 上界。
 - Channel/Slot/node accepted limit、execution window 与 active-key limit 相容。
@@ -190,14 +192,14 @@ G4 建立模型测试与 RF3 harness；G5 在 correctness 门槛通过后评估 
 覆盖 queue expiry、cancel/dispatch race、lost reply 与 post-dispatch Unknown。
 覆盖 stepdown/generation 观察、shutdown 与 shared-DB flush/compaction 压力。
 断言伪造 key 被拒、计数有界、reservation 不泄漏且不重复释放。
-模型确定性断言 FIFO 选择、deficit reset/cap 与 eligible 工作最终获服务。
+模型确定性断言 FIFO 选择与 eligible 工作最终获服务；选用 DRR 时额外断言 deficit reset/cap。
 
-G5 主对照采用有界 FIFO 与 DRR，可行时使用同 ELF 的 feature off/on；
+T5/G5 主对照采用有界 FIFO 与所选有界 RR（必要时 DRR），可行时使用同 ELF 的 feature off/on；
 classifier、queue/inflight/byte limit、new-key/control reserve
 及 observability 全部相同。同 ELF 不可行时记录各 artifact。
 观测开销相等，每条件至少两次交替运行。
 当前立即 Busy/no-queue 底座仅作额外参照；其差异不止调度算法，
-不能把总改善归因于 DRR，也不能复用历史 430-pass/七场景作为此次对照。
+不能把总改善归因于所选调度策略，也不能复用历史 430-pass/七场景作为此次对照。
 不假定已有调度开关 CLI；实现并记录对照机制。
 固定 deadline、offered load、hardware、durability、mapping 与 storage 状态协议。
 四次运行是比较最低次数，不是统计证明或生产容量认证。
@@ -239,7 +241,7 @@ freeze/fence 旧 writer 与 collector；checkpoint + tail 与对账收敛后，
 独占 group 不能提高 single Channel ordered execution 上界。
 shared-DB 瓶颈可跨 Slot；未来少量 storage 分组或物理 I/O 隔离
 须另行设计验证，本阶段保持每 node 一个 DB。
-生产 Admit/TiKV readiness 与历史 observer 风险继续作为 G6 前置。
+旧 G6 真实 Admit/TiKV 工作已拆至 T1–T4，不再等待 G5 公平证据；历史 observer、生产 Slot 局部隔离与 snapshot 增长归 T6，完整迁移归 T7，仍是生产前门槛。M2 仅使用隔离新命名空间。
 
 ## 9. 参考范围
 

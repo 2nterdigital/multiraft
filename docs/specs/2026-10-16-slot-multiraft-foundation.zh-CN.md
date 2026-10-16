@@ -7,7 +7,9 @@
 
 本轮交付通过新通用 Slot API 服务多个固定 Slot 的三进程 RF3 可运行底座，使用 RocksDB 共识日志和具有快照/恢复能力的最小确定性测试 FSM。生产 ech0 Admit/TiKV 接入、旧数据迁移、在线 reshard 和容量认证留待后续。[可行性评估](./2026-10-16-slot-multiraft-feasibility.zh-CN.md)保留固定源码事实；[实施计划](../plans/2026-10-16-slot-multiraft-foundation.zh-CN.md)规定实施与证据门槛。
 
-已采纳的下一阶段 [Channel 公平准入设计](./2026-10-16-slot-channel-fair-admission.zh-CN.md)与[实施计划](../plans/2026-10-16-slot-channel-fair-admission.zh-CN.md)尚未实现、尚未验证，保持固定 layout 与每 node 一个 RocksDB。历史 430-pass/A–F 证据及不同 Slot 冷请求的一次进展不能证明 Channel 公平性。
+保留的详细 [Channel 公平准入设计](./2026-10-16-slot-channel-fair-admission.zh-CN.md)与[实施计划](../plans/2026-10-16-slot-channel-fair-admission.zh-CN.md)尚未实现、尚未验证，保持固定 layout 与每 node 一个 RocksDB。历史 430-pass/A–F 证据及不同 Slot 冷请求的一次进展不能证明 Channel 公平性。
+
+当前执行以 [Admit 优先实施计划](../plans/2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级：先 T0–T2 真实 Admit（M1），再 T3–T4 claims/TiKV 与 HTTP/WS、delivery/history 隔离新空间（M2），再 T5 必要公平、T6 生产隔离/observer/snapshot 增长与 T7 迁移验收（M3）。下述生产门槛保留；M2 不认证生产就绪。旧公平计划 G6 的“先公平后 Admit”依赖已覆盖；原硬上界、身份、Unknown/deadline/ownership 与 read/control reserve 不后移。
 
 ## 1. 基线与兼容性
 

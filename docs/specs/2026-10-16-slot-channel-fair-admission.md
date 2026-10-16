@@ -2,13 +2,15 @@
 
 **中文：** [中文版](./2026-10-16-slot-channel-fair-admission.zh-CN.md)
 **Date:** 2026-10-16
-**Status:** Adopted next-stage design; not implemented and not verified.
+**Status:** Adopted detailed fairness design; execution order overridden by the Admit-first plan; not implemented and not verified.
 
-This specification defines the next implementation contract, not current runtime behavior.
+This specification retains the detailed fairness contract for T5 if needed, not current runtime behavior.
 The [foundation](./2026-10-16-slot-multiraft-foundation.md) remains the implemented baseline.
-The [implementation plan](../plans/2026-10-16-slot-channel-fair-admission.md) supplies gates G0–G6 and later H1.
+The [old implementation plan](../plans/2026-10-16-slot-channel-fair-admission.md) retains detailed packages G0–G6 and later H1 with their current dependency overrides.
 Historical 430-pass and A–F results retain their original scope; they do not validate this scheduler.
 One cold request progressing in a different Slot is not evidence of Channel fairness.
+
+The [Admit-first implementation plan](../plans/2026-10-17-slot-admit-first-implementation.md) T0–T7 order has highest execution priority and overrides the old G0–G6/H1 fairness-before-Admit order: M1 delivers real Admit, M2 connects claims/TiKV and HTTP/WS, delivery/history in isolated new namespaces, and T5 adds necessary fairness. Identity, budgets, Unknown/deadline/ownership, reserves and the complete lifecycle below remain binding; M1/M2 already require necessary hard bounds and read/control reserves. T6 production isolation, observer and snapshot-growth gates and T7 migration acceptance still precede production use. Full DRR, client NODELAY and #173 reruns are not M1/M2 prerequisites; retain existing necessary configuration.
 
 ## 1. Scope and fixed constraints
 
@@ -17,7 +19,7 @@ Keep one RocksDB database per node, using the default column family and group na
 Do not introduce a database per Slot, production Admit, resharding or write retries here.
 Slot fault containment and performance fairness are separate gates; neither proves the other.
 Historical observer risk, production Admit/TiKV migration and capacity gates remain open.
-Fairness covers admitted, eligible requests according to estimated cost, not wall-clock bounds.
+Fairness covers admitted, eligible requests by bounded selections (estimated cost if DRR is selected), not wall-clock bounds.
 A cold new-key SLO additionally requires protected ingress capacity and a declared load domain.
 
 ## 2. One destination admission seam
@@ -56,7 +58,7 @@ G1 must make both ingress paths exercise this same Interface, including test ada
 
 ## 3. Bounded two-level scheduling
 
-A node rotates ready Slots; each Slot runs an equal-weight, bounded DRR variant over Channels.
+T5 starts with bounded Channel round-robin that meets hot/cold acceptance, with bounded ready-Slot rotation; select full DRR only when cost skew or other evidence makes it necessary. The cost/quantum/deficit rules below apply to the selected DRR variant; visit, window, active-key, blocked-skip and owner bounds apply to both policies.
 A Channel FIFO determines scheduler selection order only. It promises neither arrival order
 across entrances nor actual log order among multiple concurrently dispatched owned tasks.
 If business ordering requires it, future Admit atomically allocates business sequence numbers;
@@ -138,7 +140,7 @@ Source saturation may reject a cold request before destination classification; r
 
 Startup configuration validation MUST check all of the following:
 
-- Positive quantum and visit-work caps; finite cap sufficient for every accepted command cost.
+- Positive visit-work caps; when DRR is selected, positive quantum and a finite deficit cap sufficient for every accepted command cost.
   Visit byte/work caps must permit at least one maximum acceptable head to make progress.
 - Schema byte/apply-work limits, checked cost arithmetic and conservative retained-byte bounds.
 - Compatible Channel/Slot/node accepted limits, execution windows and active-key limits.
@@ -191,14 +193,14 @@ Exercise RPC/native saturation and read/reconcile/hint/maintenance reserves at e
 Exercise queued expiry, cancellation/dispatch races, lost replies and post-dispatch Unknown.
 Exercise stepdown/generation observation, shutdown and shared-DB flush/compaction pressure.
 Assert forged-key rejection, bounded counters and no leaked/double-released reservations.
-Use deterministic model assertions for FIFO selection, deficit reset/cap and eventual eligible service.
+Use deterministic model assertions for FIFO selection and eventual eligible service; if DRR is selected, also assert deficit reset/cap.
 
-For the primary G5 comparison use bounded FIFO versus DRR, preferably in the same ELF
+For the primary T5/G5 comparison use bounded FIFO versus the selected bounded RR (DRR if needed), preferably in the same ELF
 with feature off/on; keep classifier, queue/inflight/byte limits, new-key/control reserves
 and observability identical. Record artifacts if one ELF is infeasible.
 Use equivalent observation overhead and at least two alternating runs for each condition.
 The current immediate-Busy/no-queue foundation may be an additional reference only; its
-differences include more than scheduling, so total improvement cannot be attributed to DRR.
+differences include more than scheduling, so total improvement cannot be attributed to the selected policy.
 Do not reuse historical 430-pass/seven-case runs as this comparison or invent an existing CLI.
 Freeze deadlines, offered load, hardware, durability, mapping and storage state protocol.
 Four runs are a comparison minimum, not statistical proof or production certification.
@@ -240,7 +242,7 @@ Never temporarily change the hash or silently reinterpret the existing manifest.
 A dedicated group cannot raise a single Channel's ordered execution upper bound.
 Shared-DB bottlenecks can cross Slots; future small storage groups or physical I/O isolation
 need separate design and validation, while keeping this phase's one-DB-per-node constraint.
-Production Admit/TiKV readiness and historical observer risk remain prerequisites at G6.
+Old G6 real Admit/TiKV work is split into T1–T4 without waiting for G5 fairness evidence; historical observer, production Slot-local isolation and snapshot growth move to T6, full migration to T7, and remain preproduction gates. M2 uses isolated new namespaces only.
 
 ## 9. Reference scope
 

@@ -7,6 +7,8 @@
 
 按[已采纳底座设计](../specs/2026-10-16-slot-multiraft-foundation.zh-CN.md)实施。[可行性评估](../specs/2026-10-16-slot-multiraft-feasibility.zh-CN.md)保留历史源码事实，并解释后续 ech0 接入门槛。用户已确认范围并同意开始实施；以下步骤要求验证证据，不再次审批已定项。
 
+当前后续执行以 [Admit 优先实施计划](./2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级，覆盖旧公平先于真实 Admit 的顺序；详见第 7 节。A–F 与历史证据保持原范围。
+
 ## 1. 固定范围
 
 以 C `28e668b676c803838eb64a04ba160fb10ad88316` 为工作基线，吸收 M `44baed14b3717b6b6f5f7327790cc97299889e19` 必要改进，移植 R `d6a5dbbb6d2f1c68e9e8bddbbfca18f562c1185c` RocksDB 日志。交付新 Slot API、独立新 data 目录和可运行三进程 RF3 多 Slot 测试应用。旧数据保留，不承诺 API/WAL 自动兼容。
@@ -73,6 +75,6 @@ RocksDB 继续只承担本地共识 log/metadata；TiKV 继续承担长期消息
 
 ## 7. 可执行后续顺序
 
-[Channel 公平准入后续计划](./2026-10-16-slot-channel-fair-admission.zh-CN.md)细化 G0–G6 与后续 H1 热点隔离评审。全部新增步骤均 Planned、未实现、未运行；A–F 及固定源码证据保持首验证范围完成状态。
+当前执行顺序以 [Admit 优先实施计划](./2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级：T0 合同来源冻结；T1 真实业务 FSM 与 T2 Slot RF3 adapter 构成 M1；T3 跨 Slot claims/TiKV 交接与 T4 HTTP/WS、delivery/history 的隔离新数据空间构成 M2；T5 必要的 Channel 有界公平与热冷验收、T6 生产故障隔离/observer/snapshot 增长、T7 迁移演练与目标验收构成 M3。M2 仅为隔离新命名空间验证，T6 仍是生产接入前门槛；此顺序不自动授权部署。完整 DRR、客户端 NODELAY 和 #173 复测均不是 M1/M2 前置，保留已有必要配置。
 
-G0 冻结合同/profile；G1–G3 实现目的端准入、有界公平与生命周期；G4–G5 增加模型、混合负载 harness 与可比报告。observer 调查不阻塞文档/模型开发；生产 wiring 前 G6 仍须关闭该风险，证明 Slot 局部隔离、确定性 Admit 不变量及 fenced 全状态迁移/TiKV 接入。H1 保持后续决策门槛，当前保留固定 Slot 与每 node 一个 DB。
+旧 [Channel 公平准入计划](./2026-10-16-slot-channel-fair-admission.zh-CN.md)的 G0–G6/H1 ID 保留供引用，其“先公平后 Admit”依赖已由新计划覆盖。G1–G3 仅在 T5 需要该详细实现包时按旧内部依赖推进；G6 的真实 Admit/persistence/delivery 工作提前拆至 T1–T4，不等待 G5 公平证据。故障隔离与 observer 关闭归 T6，完整迁移归 T7；H1 仍是有证据时才考虑的后续热点隔离。M1/M2 先保留硬上界、身份校验、deadline/Unknown/ownership 与 read/control reserve，公平后移不取消这些合同。A–F 与历史证据保持原范围。

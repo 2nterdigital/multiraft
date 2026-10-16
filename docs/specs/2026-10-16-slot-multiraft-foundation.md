@@ -7,7 +7,9 @@
 
 The delivery is a runnable three-process RF3 foundation serving multiple fixed Slots through a new generic Slot API. It uses RocksDB consensus logs and a minimal deterministic test FSM with snapshots and recovery. Production ech0 Admit/TiKV integration, old-data migration, online resharding and capacity certification are later work. The [feasibility assessment](./2026-10-16-slot-multiraft-feasibility.md) retains fixed-source facts; the [plan](../plans/2026-10-16-slot-multiraft-foundation.md) defines implementation and evidence gates.
 
-The adopted next-stage [Channel fair admission design](./2026-10-16-slot-channel-fair-admission.md) and [implementation plan](../plans/2026-10-16-slot-channel-fair-admission.md) are not implemented or verified. They preserve the fixed layout and one RocksDB per node. Historical 430-pass/A–F evidence and a different-Slot cold request progressing do not prove Channel fairness.
+The retained detailed [Channel fair admission design](./2026-10-16-slot-channel-fair-admission.md) and [implementation plan](../plans/2026-10-16-slot-channel-fair-admission.md) are not implemented or verified. They preserve the fixed layout and one RocksDB per node. Historical 430-pass/A–F evidence and a different-Slot cold request progressing do not prove Channel fairness.
+
+The [Admit-first implementation plan](../plans/2026-10-17-slot-admit-first-implementation.md) has highest execution priority: T0–T2 real Admit (M1), then T3–T4 claims/TiKV and HTTP/WS, delivery/history in isolated new namespaces (M2), then T5 necessary fairness, T6 production isolation/observer/snapshot growth and T7 migration acceptance (M3). Production gates below remain; M2 does not certify production readiness. The old fair plan G6 fairness-before-Admit dependency is overridden; hard bounds, identity, Unknown/deadline/ownership and read/control reserves are not deferred.
 
 ## 1. Baseline and compatibility
 
