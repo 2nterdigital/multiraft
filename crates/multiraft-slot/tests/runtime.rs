@@ -336,39 +336,97 @@ async fn validation_rejects_before_apply_and_manifest_mismatch_before_native_ope
     ));
 }
 
-// This fixture permits election-transition refusals only for read-only attempts.
-// Besides `NotLeader`, a routed linearizable read across a leadership change is
-// refused as `Unavailable`: voters still hint the old leader, so the read goes to
-// a dead peer (transport `NotDispatched`) or to a deposed leader whose ReadIndex
-// cannot confirm a quorum (`QuorumUnavailable`). Both are non-mutating and never
-// outcome-unknown. Every other error is returned. A successful response is
-// checked immediately so retrying cannot hide a stale/wrong value.
-async fn assert_read_when_leader<F, Fut>(
-    mut read: F,
-    expected: &[u8],
+/// Leadership facts sampled from the voters: `(current_term, leader_hint)` per
+/// voter, `None` when a voter could not be observed.
+type Epoch = Vec<Option<(u64, Option<u64>)>>;
+fn converged(epoch: &Epoch) -> bool {
+    matches!(epoch.first(), Some(Some((_, Some(_))))) && epoch.iter().all(|e| *e == epoch[0])
+}
+
+/// Retry only refusals proven to come from a leadership transition.
+///
+/// `NotLeader` is the native election rejection and is always retried. A routed
+/// operation across a leadership change is also refused as `Unavailable`
+/// (voters still hint the old leader: during election churn the request
+/// reaches a deposed leader whose ReadIndex cannot confirm a quorum,
+/// `QuorumUnavailable`; after a failover it reaches a dead peer, transport
+/// `NotDispatched`; mid-election no voter hints a leader at all). Such an `Unavailable` is retried only when the voters'
+/// leadership facts were not converged before the attempt or changed during
+/// it; an `Unavailable` under a stable, agreed leader is returned, so transport
+/// or handler defects stay visible. Every other error is returned. Callers only
+/// pass operations whose refusals are non-mutating: reads, or writes for which
+/// `NotLeader`/`Unavailable` prove the command was not dispatched (a possibly
+/// dispatched write is `Unknown`).
+async fn retry_across_transition<T, F, Fut, O, OFut>(
+    mut attempt: F,
+    mut observe: O,
     until: Instant,
-) -> Result<(), RuntimeError>
+) -> Result<T, RuntimeError>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<Vec<u8>, RuntimeError>>,
+    Fut: Future<Output = Result<T, RuntimeError>>,
+    O: FnMut() -> OFut,
+    OFut: Future<Output = Epoch>,
 {
     let mut last_error = RuntimeError::Deadline;
     loop {
         if Instant::now() >= until {
             return Err(last_error);
         }
-        match tokio::time::timeout_at(until, read()).await {
-            Ok(Ok(value)) => {
-                assert_eq!(value, expected, "successful linearizable read must match");
-                return Ok(());
+        let before = observe().await;
+        match tokio::time::timeout_at(until, attempt()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error @ RuntimeError::NotLeader { .. })) => {
+                eprintln!("retrying {error:?}; voters {before:?}");
+                last_error = error;
             }
-            Ok(Err(error @ (RuntimeError::NotLeader { .. } | RuntimeError::Unavailable))) => {
-                last_error = error
+            Ok(Err(RuntimeError::Unavailable)) => {
+                let after = observe().await;
+                if converged(&before) && before == after {
+                    eprintln!("Unavailable under a stable leader {before:?}; not retried");
+                    return Err(RuntimeError::Unavailable);
+                }
+                eprintln!("retrying Unavailable across a transition: {before:?} -> {after:?}");
+                last_error = RuntimeError::Unavailable;
             }
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(last_error),
         }
         tokio::time::sleep_until((Instant::now() + Duration::from_millis(5)).min(until)).await;
+    }
+}
+
+/// A successful response is checked immediately so retrying cannot hide a
+/// stale or wrong value.
+async fn assert_read_when_leader<F, Fut, O, OFut>(
+    read: F,
+    observe: O,
+    expected: &[u8],
+    until: Instant,
+) -> Result<(), RuntimeError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, RuntimeError>>,
+    O: FnMut() -> OFut,
+    OFut: Future<Output = Epoch>,
+{
+    let value = retry_across_transition(read, observe, until).await?;
+    assert_eq!(value, expected, "successful linearizable read must match");
+    Ok(())
+}
+
+fn stable() -> Epoch {
+    vec![Some((3, Some(1))); 3]
+}
+/// Replays observation samples; the last one repeats.
+fn epochs(samples: Vec<Epoch>) -> impl FnMut() -> std::future::Ready<Epoch> {
+    let mut samples = samples.into_iter().peekable();
+    let mut last = Vec::new();
+    move || {
+        if let Some(next) = samples.next() {
+            last = next;
+        }
+        std::future::ready(last.clone())
     }
 }
 
@@ -381,6 +439,7 @@ async fn read_fixture_retries_not_leader_then_checks_success() {
     .into_iter();
     assert_read_when_leader(
         || std::future::ready(responses.next().expect("unexpected extra read")),
+        epochs(vec![stable()]),
         &1u64.to_be_bytes(),
         Instant::now() + Duration::from_secs(5),
     )
@@ -399,6 +458,7 @@ async fn read_fixture_does_not_retry_wrong_successful_value() {
     .into_iter();
     let _ = assert_read_when_leader(
         || std::future::ready(responses.next().expect("unexpected extra read")),
+        epochs(vec![stable()]),
         &1u64.to_be_bytes(),
         Instant::now() + Duration::from_secs(5),
     )
@@ -407,6 +467,8 @@ async fn read_fixture_does_not_retry_wrong_successful_value() {
 
 #[tokio::test]
 async fn read_fixture_retries_unavailable_transition_refusal() {
+    // The leader changed during the refused attempt.
+    let moved = vec![Some((4, Some(2))); 3];
     let mut responses = [
         Err(RuntimeError::Unavailable),
         Ok(1u64.to_be_bytes().to_vec()),
@@ -414,12 +476,48 @@ async fn read_fixture_retries_unavailable_transition_refusal() {
     .into_iter();
     assert_read_when_leader(
         || std::future::ready(responses.next().expect("unexpected extra read")),
+        epochs(vec![stable(), moved]),
         &1u64.to_be_bytes(),
         Instant::now() + Duration::from_secs(5),
     )
     .await
     .unwrap();
     assert!(responses.next().is_none());
+    // Voters disagreed before the attempt: a transition was in progress.
+    let split = vec![Some((3, Some(1))), Some((4, None)), Some((4, None))];
+    let mut responses = [
+        Err(RuntimeError::Unavailable),
+        Ok(1u64.to_be_bytes().to_vec()),
+    ]
+    .into_iter();
+    assert_read_when_leader(
+        || std::future::ready(responses.next().expect("unexpected extra read")),
+        epochs(vec![split.clone(), split, stable()]),
+        &1u64.to_be_bytes(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn read_fixture_returns_unavailable_under_a_stable_leader() {
+    let mut responses = [
+        Err(RuntimeError::Unavailable),
+        Ok(1u64.to_be_bytes().to_vec()),
+    ]
+    .into_iter();
+    assert_eq!(
+        assert_read_when_leader(
+            || std::future::ready(responses.next().expect("unexpected extra read")),
+            epochs(vec![stable()]),
+            &1u64.to_be_bytes(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await,
+        Err(RuntimeError::Unavailable)
+    );
+    assert!(responses.next().unwrap().is_ok());
 }
 
 #[tokio::test]
@@ -432,6 +530,7 @@ async fn read_fixture_does_not_swallow_other_errors() {
     assert_eq!(
         assert_read_when_leader(
             || std::future::ready(responses.next().expect("unexpected extra read")),
+            epochs(vec![stable()]),
             &1u64.to_be_bytes(),
             Instant::now() + Duration::from_secs(5),
         )
@@ -439,6 +538,13 @@ async fn read_fixture_does_not_swallow_other_errors() {
         Err(RuntimeError::Application)
     );
     assert!(responses.next().unwrap().is_ok());
+}
+
+fn epoch(observations: &[Result<multiraft_net::LocalGroupStatus, RuntimeError>]) -> Epoch {
+    observations
+        .iter()
+        .map(|o| o.as_ref().ok().map(|s| (s.current_term, s.leader_hint)))
+        .collect()
 }
 
 async fn voter_observations(
@@ -493,8 +599,13 @@ async fn real_grpc_nonhosted_node_routes_single_write_and_linearizable_read() {
         );
         tokio::time::sleep_until((Instant::now() + Duration::from_millis(5)).min(until)).await;
     }
+    let observe = || {
+        let owners = &owners;
+        async move { epoch(&voter_observations(owners, until).await) }
+    };
     if let Err(error) = assert_read_when_leader(
         || h.read_linearizable(&k, &[], until),
+        observe,
         &0u64.to_be_bytes(),
         until,
     )
@@ -503,23 +614,16 @@ async fn real_grpc_nonhosted_node_routes_single_write_and_linearizable_read() {
         let observations = voter_observations(&owners, deadline()).await;
         panic!("initial quorum read failed: {error:?}; later voter observations: {observations:?}");
     }
-    // The same leadership transitions refuse a write before dispatch as
-    // `NotLeader` / `Unavailable` (a possibly dispatched write is `Unknown`,
-    // which fails here), so retrying keeps exactly one applied command.
-    let result = loop {
-        match h.propose(&k, b"one".to_vec(), until).await {
-            Ok(result) => break result,
-            Err(e @ (RuntimeError::NotLeader { .. } | RuntimeError::Unavailable)) => {
-                assert!(Instant::now() < until, "write never dispatched: {e:?}");
-                tokio::time::sleep_until((Instant::now() + Duration::from_millis(5)).min(until))
-                    .await;
-            }
-            Err(e) => panic!("write failed: {e:?}"),
-        }
-    };
+    // A transition refuses a write before dispatch as `NotLeader` /
+    // `Unavailable` (a possibly dispatched write is `Unknown`, which fails
+    // here), so retrying keeps exactly one applied command.
+    let result = retry_across_transition(|| h.propose(&k, b"one".to_vec(), until), observe, until)
+        .await
+        .unwrap_or_else(|e| panic!("write failed: {e:?}"));
     assert_eq!(result.effects, 1u64.to_be_bytes());
     if let Err(error) = assert_read_when_leader(
         || h.read_linearizable(&k, &[], until),
+        observe,
         &1u64.to_be_bytes(),
         until,
     )
@@ -654,21 +758,22 @@ async fn applied_read_remains_explicitly_local_when_quorum_read_fails() {
     }
     let h = owners[0].handle();
     let written = h.propose(&k, vec![1], deadline()).await.unwrap();
-    // Not used for selection below; kept so a missing hint after a committed
-    // write (the originally reported symptom) still fails loudly.
-    assert!(h
+    let hinted = h
         .leader_hint(SlotId(0), deadline())
         .await
         .unwrap()
-        .is_some());
-    // Keep a node that has provably applied the write. A leader hint is not
-    // such proof: leadership may move after the write to a voter that holds
-    // the entry but has not applied it yet.
+        .expect("a leader hint exists after a committed write");
+    // Keep the hinted leader when it has applied the write, so the ReadIndex on
+    // a leader that lost its quorum stays exercised. A hint is not proof of
+    // apply (leadership may have moved to a voter that holds the entry but has
+    // not applied it yet), so otherwise keep any voter that has applied it.
     let until = deadline();
+    let mut candidates: Vec<usize> = (0..owners.len()).collect();
+    candidates.sort_by_key(|&i| u64::try_from(i + 1).unwrap() != hinted);
     let keep = loop {
         let mut applied = None;
-        for (index, owner) in owners.iter().enumerate() {
-            let view = owner
+        for &index in &candidates {
+            let view = owners[index]
                 .handle()
                 .read_applied(SlotId(0), &[], until)
                 .await
@@ -687,6 +792,13 @@ async fn applied_read_remains_explicitly_local_when_quorum_read_fails() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
+    if keep + 1 != usize::try_from(hinted).unwrap() {
+        eprintln!(
+            "hinted leader {hinted} had not applied index {}; kept node {}",
+            written.index,
+            keep + 1
+        );
+    }
     let kept = owners.remove(keep);
     for owner in owners {
         assert!(owner.shutdown(deadline()).await.complete);
