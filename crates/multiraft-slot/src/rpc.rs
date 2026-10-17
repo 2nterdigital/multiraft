@@ -13,7 +13,8 @@ use tokio::time::Instant;
 
 const SERVICE: u32 = 0x534c4f54;
 const METHOD: u32 = 1;
-const VERSION: u32 = 1;
+// 2: 256-bucket route table and layout v2 digest.
+const VERSION: u32 = 2;
 // Reserve ample room for protobuf tags, IDs and transport framing.
 const MAX_ENVELOPE: usize = APPLICATION_RPC_OUTER_BYTES - 1024;
 #[derive(Serialize, Deserialize)]

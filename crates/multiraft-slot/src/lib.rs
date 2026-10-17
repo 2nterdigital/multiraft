@@ -1,18 +1,27 @@
 //! Fixed, durable slot routing for opaque application keys.
 //!
+//! Keys hash into 256 fixed buckets; a persisted table maps buckets to Raft
+//! slots ([`KeyRouter`]). Layouts are generated deterministically by [`placement`].
+//!
 //! Slot groups carry Raft replication order; applications define their own business sequence.
 //! Layout changes require new data. There is no online resharding in this format.
 
 pub mod config;
 pub mod error;
 pub mod manifest;
+pub mod placement;
+pub mod router;
 
 pub use config::{
-    ClusterLayout, GroupId, HashVersion, LayoutConfig, ManifestDigest, NodeAddress, NodeId,
-    SlotAssignment, SlotId, FORMAT_VERSION, MAX_KEY_LEN, MAX_NODES, MAX_SLOTS, MAX_VOTERS,
+    ClusterLayout, GroupId, LayoutConfig, ManifestDigest, NodeAddress, NodeId, RouteDigest,
+    RouteVersion, SlotAssignment, SlotId, FORMAT_VERSION, MAX_NODES, MAX_SLOTS, MAX_VOTERS,
 };
 pub use error::SlotError;
 pub use manifest::{SlotManifest, MANIFEST_FILE_NAME};
+pub use placement::{
+    contiguous_bucket_table, plan as plan_layout, PlacementInput, PlacementNode, REPLICATION_FACTOR,
+};
+pub use router::{HashBucketId, KeyRouter, BUCKET_COUNT, MAX_KEY_LEN};
 
 pub mod limits;
 pub mod rpc;

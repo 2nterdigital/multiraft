@@ -17,9 +17,21 @@ import uuid
 
 
 
-def slot_for(key, count=4):
-    raw = key.encode()
-    return int.from_bytes(hashlib.sha256(b'multiraft-slot/key/sha256-v1\0' + len(raw).to_bytes(8, 'big') + raw).digest()[:8], 'big') % count
+BUCKET_COUNT = 256
+
+
+def bucket_for(key):
+    """Independent SHA256 bucket computation (route version Sha256Bucket256V1)."""
+    raw = key.encode() if isinstance(key, str) else bytes(key)
+    digest = hashlib.sha256(b'multiraft-slot/key/sha256-v1\0' + len(raw).to_bytes(8, 'big') + raw).digest()
+    return int.from_bytes(digest[:8], 'big') % BUCKET_COUNT
+
+
+def slot_for(key, layout):
+    """Route through the bucket table read from the layout artifact; no embedded table."""
+    buckets = layout['buckets']
+    assert layout['bucket_count'] == BUCKET_COUNT and len(buckets) == BUCKET_COUNT, 'layout bucket table must have 256 entries'
+    return buckets[bucket_for(key)]
 
 
 def free_ports(count):
@@ -36,8 +48,10 @@ def free_ports(count):
 
 
 class Run:
-    def __init__(self, binary, output):
+    def __init__(self, binary, output, layout_tool=None, slot_count=4):
         self.binary = str(Path(binary).resolve())
+        self.layout_tool = str(Path(layout_tool).resolve() if layout_tool else Path(self.binary).with_name('slot-layout'))
+        self.slot_count = slot_count
         self.output = output.resolve()
         self.output.mkdir(parents=True, exist_ok=False)
         self.processes = {}
@@ -47,19 +61,41 @@ class Run:
         self.cleaning = False
         ports = free_ports(9)
         self.admin = dict(zip(range(1, 4), ports[6:]))
-        self.layout = dict(cluster_id='slot-acceptance-' + uuid.uuid4().hex, format_version=1,
-                           hash_version='Sha256V1', slot_count=4, group_id_base=100,
-                           nodes=[dict(node_id=i, raft=f'127.0.0.1:{ports[i-1]}', application_rpc=f'127.0.0.1:{ports[i+2]}') for i in range(1, 4)],
-                           slots=[dict(slot=s, voters=[1, 2, 3]) for s in range(4)])
+        self.placement = dict(cluster_id='slot-acceptance-' + uuid.uuid4().hex, slot_count=slot_count, group_id_base=100,
+                              nodes=[dict(node_id=i, raft=f'127.0.0.1:{ports[i-1]}', application_rpc=f'127.0.0.1:{ports[i+2]}', weight=1) for i in range(1, 4)])
         self.layout_path = self.output / 'layout.json'
-        self.layout_path.write_text(json.dumps(self.layout, indent=2))
         self.requests = (self.output / 'requests.jsonl').open('a', buffering=1)
-        self.keys = {}
-        for n in range(1000):
-            key = f'key-{n}'
-            self.keys.setdefault(slot_for(key), key)
-            if len(self.keys) == 4:
-                break
+        self._layout = None
+        self._keys = None
+
+    def ensure_layout(self):
+        """Generate the v2 artifact with the Rust placement tool on first use."""
+        if self._layout is None:
+            placement_path = self.output / 'placement-input.json'
+            placement_path.write_text(json.dumps(self.placement, indent=2))
+            generated = subprocess.run([self.layout_tool, '--input', str(placement_path), '--output', str(self.layout_path)],
+                                       check=True, capture_output=True, text=True)
+            self.layout_digests = json.loads(generated.stdout)
+            self._layout = json.loads(self.layout_path.read_text())
+            assert self._layout['format_version'] == 2 and self._layout['slot_count'] == self.slot_count, self._layout
+        return self._layout
+
+    @property
+    def layout(self):
+        return self.ensure_layout()
+
+    @property
+    def keys(self):
+        if self._keys is None:
+            keys = {}
+            for n in range(100_000):
+                key = f'key-{n}'
+                keys.setdefault(slot_for(key, self.layout), key)
+                if len(keys) == self.slot_count:
+                    break
+            assert len(keys) == self.slot_count, keys
+            self._keys = keys
+        return self._keys
 
     def record_signal(self, signum, _frame):
         # Signal handlers only publish intent. They never throw across ownership
@@ -193,6 +229,7 @@ class Run:
         print('PASS', name, flush=True)
 
     def normal(self):
+        self.ensure_layout()
         for node in (1, 2, 3):
             self.start(node)
         self.ready((1, 2, 3))
@@ -275,6 +312,7 @@ class Run:
         self.recovery(expected)
 
     def recovery(self, expected=None):
+        self.ensure_layout()
         if expected is None:
             for n in (1, 2, 3):
                 self.start(n)
@@ -331,9 +369,10 @@ class Run:
         self.passed('manifest_mismatch_fails_closed_original_directory_reopens')
 
     def fingerprint(self):
+        self.ensure_layout()
         # New data/cluster. Two A and one B have identical addresses but distinct digests.
         self.layout['cluster_id'] += '-fingerprint'
-        self.layout_path.write_text(json.dumps(self.layout))
+        self.layout_path.write_text(json.dumps(self.layout, indent=2))
         for n in (1, 2, 3):
             # Preserve normal-case data; no deletion or reuse with changed identity.
             (self.output / f'data-{n}').rename(self.output / f'normal-data-{n}')
@@ -375,7 +414,7 @@ class Run:
                     cleanup.append(dict(node=node, error=repr(exc)))
             if self.stop_signal is not None:
                 error = error or repr(InterruptedBySignal(self.stop_signal))
-            receipt = dict(passed=error is None and all('error' not in c for c in cleanup), error=error,
+            receipt = dict(layout_digests=getattr(self, 'layout_digests', None), passed=error is None and all('error' not in c for c in cleanup), error=error,
                            cases=self.cases, processes=self.records, cleanup=cleanup,
                            evidence_dir=str(self.output), scope='local real OS-process RF3 correctness, not capacity or production Admit/TiKV')
             (self.output / 'receipt.json').write_text(json.dumps(receipt, indent=2))
@@ -393,11 +432,13 @@ class InterruptedBySignal(BaseException):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', default='.tmp/slot-foundation/target/debug/multiraft-slot-demo')
+    parser.add_argument('--layout-tool', help='slot-layout generator; defaults to the sibling of --binary')
+    parser.add_argument('--slot-count', type=int, default=4)
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--case', choices=('all', 'normal', 'recovery', 'fingerprint'), default='all')
     args = parser.parse_args(argv)
     output = args.output_dir or Path('.tmp/slot-foundation') / ('acceptance-' + uuid.uuid4().hex)
-    run = Run(args.binary, output)
+    run = Run(args.binary, output, args.layout_tool, args.slot_count)
     error = None
     exit_code = 1
     signals = (signal.SIGINT, signal.SIGTERM)

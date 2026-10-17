@@ -1,0 +1,10 @@
+{
+  "cluster_id": "slot-demo-rf3-12",
+  "slot_count": 12,
+  "group_id_base": 100,
+  "nodes": [
+    {"node_id": 1, "raft": "127.0.0.1:7101", "application_rpc": "127.0.0.1:7201", "weight": 1},
+    {"node_id": 2, "raft": "127.0.0.1:7102", "application_rpc": "127.0.0.1:7202", "weight": 1},
+    {"node_id": 3, "raft": "127.0.0.1:7103", "application_rpc": "127.0.0.1:7203", "weight": 1}
+  ]
+}

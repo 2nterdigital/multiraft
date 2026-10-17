@@ -7,6 +7,8 @@ pub enum SlotError {
     Config(String),
     #[error("key length {actual} exceeds maximum {max}")]
     KeyTooLong { actual: usize, max: usize },
+    #[error("unknown hash bucket {0}")]
+    UnknownBucket(u32),
     #[error("unknown slot {0}")]
     UnknownSlot(u32),
     #[error("unknown group {0}")]

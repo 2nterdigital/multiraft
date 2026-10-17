@@ -207,12 +207,16 @@ impl SlotStateMachine for DemoFsm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use multiraft_slot::{HashVersion, LayoutConfig, NodeAddress, SlotAssignment, SlotId};
+    use multiraft_slot::{
+        contiguous_bucket_table, LayoutConfig, NodeAddress, RouteVersion, SlotAssignment, SlotId,
+        BUCKET_COUNT, FORMAT_VERSION,
+    };
     fn fsm() -> DemoFsm {
         let layout = ClusterLayout::new(LayoutConfig {
             cluster_id: "test".into(),
-            format_version: 1,
-            hash_version: HashVersion::Sha256V1,
+            format_version: FORMAT_VERSION,
+            route_version: RouteVersion::Sha256Bucket256V1,
+            bucket_count: BUCKET_COUNT,
             slot_count: 1,
             group_id_base: 100,
             nodes: vec![NodeAddress {
@@ -220,9 +224,12 @@ mod tests {
                 raft: "127.0.0.1:1".parse().unwrap(),
                 application_rpc: "127.0.0.1:2".parse().unwrap(),
             }],
+            buckets: contiguous_bucket_table(1).unwrap(),
             slots: vec![SlotAssignment {
                 slot: SlotId(0),
                 voters: vec![1],
+                preferred_initializer: 1,
+                soft_preferred_leader: 1,
             }],
         })
         .unwrap();

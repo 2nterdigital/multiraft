@@ -35,7 +35,8 @@ fn layout(nodes: usize, slots: u32, hosted: Vec<u64>) -> ClusterLayout {
     ClusterLayout::new(LayoutConfig {
         cluster_id: "runtime-test".into(),
         format_version: FORMAT_VERSION,
-        hash_version: HashVersion::Sha256V1,
+        route_version: RouteVersion::Sha256Bucket256V1,
+        bucket_count: BUCKET_COUNT,
         slot_count: slots,
         group_id_base: 100,
         nodes: (1..=nodes as u64)
@@ -45,10 +46,13 @@ fn layout(nodes: usize, slots: u32, hosted: Vec<u64>) -> ClusterLayout {
                 application_rpc: address(),
             })
             .collect(),
+        buckets: contiguous_bucket_table(slots).unwrap(),
         slots: (0..slots)
             .map(|s| SlotAssignment {
                 slot: SlotId(s),
                 voters: hosted.clone(),
+                preferred_initializer: hosted[0],
+                soft_preferred_leader: hosted[0],
             })
             .collect(),
     })
@@ -684,20 +688,31 @@ async fn rpc_layout_slot_and_size_validation_never_apply() {
     let (caller, rpc) = ApplicationRpcOwner::start(config, Arc::new(Reject), deadline())
         .await
         .unwrap();
-    for (slot, digest, command, expected) in [
+    // Protocol version 2 (layout v2); a version-1 peer is a layout mismatch.
+    for (version, slot, digest, command, expected) in [
         (
+            1,
+            SlotId(0),
+            layout.digest(),
+            vec![1],
+            RuntimeError::LayoutMismatch,
+        ),
+        (
+            2,
             SlotId(1),
             layout.digest(),
             vec![1],
             RuntimeError::InvalidRequest,
         ),
         (
+            2,
             SlotId(0),
             ManifestDigest([0; 32]),
             vec![1],
             RuntimeError::LayoutMismatch,
         ),
         (
+            2,
             SlotId(0),
             layout.digest(),
             vec![0; MAX_COMMAND_BYTES + 1],
@@ -707,7 +722,7 @@ async fn rpc_layout_slot_and_size_validation_never_apply() {
         let payload = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .serialize(&Request {
-                version: 1,
+                version,
                 cluster: layout.cluster_id().into(),
                 digest,
                 slot,
@@ -727,7 +742,7 @@ async fn rpc_layout_slot_and_size_validation_never_apply() {
             .with_fixint_encoding()
             .deserialize(&reply.payload)
             .unwrap();
-        assert_eq!(reply.version, 1);
+        assert_eq!(reply.version, 2);
         assert_eq!(reply.digest, layout.digest());
         assert!(matches!(reply.result, Err(ref e) if *e == expected));
     }

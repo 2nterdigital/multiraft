@@ -14,11 +14,19 @@ acceptance = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(acceptance)
 
 
+FIXTURE = Path(__file__).resolve().parent.parent / 'crates/multiraft-slot-demo/layouts/rf3-12slot.json'
+
+
 class RoutingTests(unittest.TestCase):
     def test_known_hash_vector_and_slot_coverage(self):
-        self.assertEqual(acceptance.slot_for(''), 0)
-        self.assertEqual(acceptance.slot_for('key-0'), 2)
-        self.assertEqual({acceptance.slot_for(f'key-{i}') for i in range(100)}, {0, 1, 2, 3})
+        # Buckets are computed here; the table is read from the committed artifact.
+        layout = json.loads(FIXTURE.read_text())
+        self.assertEqual(acceptance.bucket_for(''), 164)
+        self.assertEqual(acceptance.bucket_for('channel-a'), 79)
+        self.assertEqual(acceptance.slot_for('', layout), 7)
+        self.assertEqual(acceptance.slot_for('channel-a', layout), 3)
+        self.assertEqual(acceptance.slot_for('key-0', layout), 11)
+        self.assertEqual({acceptance.slot_for(f'key-{i}', layout) for i in range(1000)}, set(range(12)))
 
 
 class DisconnectTests(unittest.TestCase):

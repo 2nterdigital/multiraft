@@ -6,7 +6,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ClusterLayout, LayoutConfig, ManifestDigest, NodeId, SlotError};
+use crate::config::check_format_version;
+use crate::{ClusterLayout, LayoutConfig, ManifestDigest, NodeId, RouteDigest, SlotError};
 
 pub const MANIFEST_FILE_NAME: &str = "slot-manifest.json";
 const CREATION_FILE_NAME: &str = ".slot-manifest.creating";
@@ -24,7 +25,20 @@ pub struct SlotManifest {
 struct DiskManifest {
     layout: LayoutConfig,
     layout_digest: ManifestDigest,
+    route_digest: RouteDigest,
     local_node_id: NodeId,
+}
+
+/// Lenient view used only to reject other layout formats with a clear error
+/// before strict parsing.
+#[derive(Deserialize)]
+struct ManifestProbe {
+    layout: FormatProbe,
+}
+
+#[derive(Deserialize)]
+struct FormatProbe {
+    format_version: Option<u32>,
 }
 
 impl SlotManifest {
@@ -98,7 +112,8 @@ impl SlotManifest {
         }
         let disk = DiskManifest {
             layout: layout.config().clone(),
-            layout_digest: layout.digest(),
+            layout_digest: layout.layout_digest(),
+            route_digest: layout.route_digest(),
             local_node_id,
         };
         let bytes = serde_json::to_vec(&disk)
@@ -136,13 +151,23 @@ impl SlotManifest {
                 "manifest exceeds size limit".into(),
             ));
         }
+        let probe: ManifestProbe = serde_json::from_slice(&bytes)
+            .map_err(|error| SlotError::InvalidManifest(error.to_string()))?;
+        // Earlier formats are rejected (never converted or rewritten).
+        check_format_version(probe.layout.format_version)
+            .map_err(|error| SlotError::InvalidManifest(error.to_string()))?;
         let disk: DiskManifest = serde_json::from_slice(&bytes)
             .map_err(|error| SlotError::InvalidManifest(error.to_string()))?;
         let persisted = ClusterLayout::new(disk.layout)
             .map_err(|error| SlotError::InvalidManifest(error.to_string()))?;
-        if persisted.digest() != disk.layout_digest {
+        if persisted.layout_digest() != disk.layout_digest {
             return Err(SlotError::InvalidManifest(
-                "stored digest disagrees with layout".into(),
+                "stored layout digest disagrees with layout".into(),
+            ));
+        }
+        if persisted.route_digest() != disk.route_digest {
+            return Err(SlotError::InvalidManifest(
+                "stored route digest disagrees with layout".into(),
             ));
         }
         if &persisted != expected {
@@ -162,6 +187,9 @@ impl SlotManifest {
     }
     pub fn layout_digest(&self) -> ManifestDigest {
         self.layout.digest()
+    }
+    pub fn route_digest(&self) -> RouteDigest {
+        self.layout.route_digest()
     }
     pub fn local_node_id(&self) -> NodeId {
         self.local_node_id

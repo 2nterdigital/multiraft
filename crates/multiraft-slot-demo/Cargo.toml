@@ -3,6 +3,7 @@ name = "multiraft-slot-demo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "multiraft-slot-demo"
 
 [dependencies]
 anyhow.workspace = true

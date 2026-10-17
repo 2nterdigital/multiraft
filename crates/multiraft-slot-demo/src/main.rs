@@ -146,7 +146,7 @@ async fn status(State(app): State<App>) -> Json<Value> {
     let inflight = app.handle.inflight();
     let gate = app.gate.state.lock().expect("gate mutex");
     Json(
-        json!({"ok":true,"node_id":app.handle.node_id(),"digest":app.handle.layout().digest().0,"slots":slots,"inflight":{"global":inflight.global.requests,"slots":inflight.slots.iter().map(|s|s.requests).collect::<Vec<_>>()},"gate":{"entered":gate.entered,"released":gate.released,"command_id":gate.command_id}}),
+        json!({"ok":true,"node_id":app.handle.node_id(),"digest":app.handle.layout().digest().0,"route_digest":app.handle.layout().route_digest().0,"slots":slots,"inflight":{"global":inflight.global.requests,"slots":inflight.slots.iter().map(|s|s.requests).collect::<Vec<_>>()},"gate":{"entered":gate.entered,"released":gate.released,"command_id":gate.command_id}}),
     )
 }
 async fn compact(State(app): State<App>, Json(request): Json<Slot>) -> Json<Value> {
@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
         args.admin.ip().is_loopback(),
         "demo admin must bind loopback"
     );
-    let config: LayoutConfig = serde_json::from_slice(&std::fs::read(args.layout)?)?;
+    let config = LayoutConfig::from_json(&std::fs::read(args.layout)?)?;
     let layout = ClusterLayout::new(config)?;
     let mut config = SlotNodeConfig::new(layout.clone(), args.node_id, args.data_dir);
     config.limits.per_slot_requests = args.per_slot_requests;

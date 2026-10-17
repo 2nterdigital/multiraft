@@ -4,16 +4,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
 use multiraft_slot::{
-    ClusterLayout, HashVersion, LayoutConfig, NodeAddress, SlotAssignment, SlotError, SlotId,
-    SlotManifest, FORMAT_VERSION, MANIFEST_FILE_NAME, MAX_KEY_LEN, MAX_NODES, MAX_SLOTS,
-    MAX_VOTERS,
+    contiguous_bucket_table, ClusterLayout, LayoutConfig, NodeAddress, RouteVersion,
+    SlotAssignment, SlotError, SlotId, SlotManifest, BUCKET_COUNT, FORMAT_VERSION,
+    MANIFEST_FILE_NAME, MAX_KEY_LEN, MAX_NODES, MAX_SLOTS, MAX_VOTERS,
 };
 
 fn config(count: u32) -> LayoutConfig {
     LayoutConfig {
         cluster_id: "test-cluster".into(),
         format_version: FORMAT_VERSION,
-        hash_version: HashVersion::Sha256V1,
+        route_version: RouteVersion::Sha256Bucket256V1,
+        bucket_count: BUCKET_COUNT,
         slot_count: count,
         group_id_base: 100,
         nodes: vec![
@@ -28,11 +29,14 @@ fn config(count: u32) -> LayoutConfig {
                 application_rpc: "127.0.0.1:3001".parse().unwrap(),
             },
         ],
+        buckets: contiguous_bucket_table(count).unwrap(),
         slots: (0..count)
             .rev()
             .map(|index| SlotAssignment {
                 slot: SlotId(index),
                 voters: vec![2, 1],
+                preferred_initializer: 1,
+                soft_preferred_leader: 2,
             })
             .collect(),
     }
@@ -77,16 +81,17 @@ fn normalization_produces_identical_layout_digest_and_routes() {
     assert_eq!(
         layout.digest().0,
         [
-            36, 168, 99, 39, 42, 54, 34, 224, 87, 112, 164, 205, 171, 176, 181, 248, 56, 18, 255,
-            201, 81, 25, 245, 91, 130, 73, 51, 111, 168, 1, 143, 104
+            131, 109, 43, 135, 110, 13, 254, 96, 101, 143, 188, 239, 13, 82, 134, 25, 115, 60, 17,
+            63, 43, 23, 126, 208, 29, 17, 89, 225, 170, 120, 0, 32
         ]
     );
     assert_eq!(layout.nodes()[0].node_id, 1);
     for (key, expected) in [
-        (b"".as_slice(), 11),
-        (b"channel-a".as_slice(), 16),
-        (b"channel-b".as_slice(), 9),
-        (b"\x00\xff\x80".as_slice(), 13),
+        // 17-slot contiguous table: slot 0 owns 16 buckets, the rest 15.
+        (b"".as_slice(), 10),
+        (b"channel-a".as_slice(), 5),
+        (b"channel-b".as_slice(), 12),
+        (b"\x00\xff\x80".as_slice(), 16),
     ] {
         assert_eq!(layout.slot_for_key(key).unwrap(), SlotId(expected));
         assert_eq!(
@@ -114,7 +119,8 @@ fn malformed_layouts_are_rejected_before_routing() {
         assert!(ClusterLayout::new(value).is_err());
     };
     rejects(|c| c.cluster_id.clear());
-    rejects(|c| c.format_version = 2);
+    rejects(|c| c.format_version = 1);
+    rejects(|c| c.format_version = 3);
     rejects(|c| c.slot_count = 0);
     rejects(|c| c.slot_count = MAX_SLOTS + 1);
     rejects(|c| c.group_id_base = u64::MAX);
@@ -155,13 +161,19 @@ fn restart_matches_identity_and_changed_layout_or_local_node_fails() {
         SlotManifest::open_or_create(&dir.0, &layout, 2),
         Err(SlotError::ManifestMismatch(_))
     ));
-    for mutation in [0, 1, 2, 3] {
+    for mutation in 0..7 {
         let mut changed = config(2);
         match mutation {
             0 => changed.cluster_id.push('x'),
             1 => changed.group_id_base += 1,
             2 => changed.nodes[0].application_rpc.set_port(9000),
-            _ => changed.slots[0].voters = vec![1],
+            3 => {
+                changed.slots[0].voters = vec![1];
+                changed.slots[0].soft_preferred_leader = 1;
+            }
+            4 => changed.slots[0].preferred_initializer = 2,
+            5 => changed.slots[1].soft_preferred_leader = 1,
+            _ => changed.buckets.swap(0, 255),
         }
         let changed = ClusterLayout::new(changed).unwrap();
         assert_ne!(changed.digest(), layout.digest());
