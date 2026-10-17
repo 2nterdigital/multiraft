@@ -114,11 +114,13 @@ impl SlotNodeConfig {
     ///   or an unknown marker is an error, as in the native opener.
     /// - Native snapshot catalog (`snapshots/`): `Persisted` iff a validated
     ///   active snapshot exists. Unrecognized namespaces are errors.
-    /// - Node-wide, exactly like the native opener (`open_node_log`): every
-    ///   `group-<id>/` FileLog root and `snapshots/<id>/` namespace in
-    ///   `data_dir` is checked, including ids this node does not vote in.
-    ///   Unrecognized or malformed namespaces, and persisted FileLog or
-    ///   snapshot history without a RocksDB log basis, are errors
+    /// - Node-wide, with the same refusal set as the native opener
+    ///   (`open_node_log`): every id with a `group-<id>/` FileLog root or a
+    ///   `snapshots/<id>/` namespace in `data_dir` is checked, including ids
+    ///   this node does not vote in. A malformed FileLog namespace, a
+    ///   malformed snapshot namespace of an id whose FileLog is pristine (the
+    ///   native check short-circuits on a persisted FileLog), and persisted
+    ///   FileLog or snapshot history without a RocksDB log basis are errors
     ///   ([`ProbeError::Storage`] with `slot: None`), because the native
     ///   runtime refuses to start on such a directory.
     ///
@@ -226,9 +228,12 @@ fn in_group(group: u64) -> impl FnOnce(io::Error) -> io::Error {
     move |error| io::Error::new(error.kind(), format!("group {group}: {error}"))
 }
 
-/// Node-wide refusal of `open_node_log`, read-only: every scanned id (voter
-/// or not) must have a recognized FileLog and snapshot namespace, and any
-/// persisted FileLog/snapshot history needs a RocksDB log basis.
+/// Node-wide refusal of `open_node_log`, read-only and with the same refusal
+/// set: for every scanned id (voter or not) the FileLog namespace must be
+/// recognized; only when it is pristine is the snapshot namespace inspected
+/// (and must be recognized); persisted history of either kind needs a RocksDB
+/// log basis. Voter groups additionally get the per-group classification
+/// below, which, like native `local_provenance`, always inspects snapshots.
 fn check_history(
     root: &Path,
     db: Option<&RocksLogDb<TypeConfig>>,
@@ -236,12 +241,16 @@ fn check_history(
     max_snapshot_bytes: usize,
 ) -> io::Result<()> {
     for group in history_ids(root)? {
+        // Same short-circuit as `open_node_log`: the snapshot namespace is only
+        // inspected when the legacy FileLog is pristine.
         let legacy = FileLogStoreOf::startup_provenance(root.join(format!("group-{group}")))
             .map_err(in_group(group))?;
-        let snapshots = catalog
-            .probe_provenance(group, max_snapshot_bytes)
-            .map_err(in_group(group))?;
-        if legacy == StartupProvenance::Pristine && snapshots == StartupProvenance::Pristine {
+        let persisted = legacy == StartupProvenance::Persisted
+            || catalog
+                .probe_provenance(group, max_snapshot_bytes)
+                .map_err(in_group(group))?
+                == StartupProvenance::Persisted;
+        if !persisted {
             continue;
         }
         let basis = match db {

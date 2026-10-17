@@ -564,66 +564,155 @@ fn assert_node_wide_refusal(config: &SlotNodeConfig, case: &str) {
     );
 }
 
+/// Native start on `dir` (node 1, alone): `Err(cause)` when refused.
+fn native_start(layout: &ClusterLayout, dir: &Path) -> Result<(), String> {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        match try_start(layout, 1, dir, grace(100)).await {
+            Ok(owner) => {
+                let report = owner
+                    .shutdown(Instant::now() + Duration::from_secs(30))
+                    .await;
+                assert!(report.complete, "{report:?}");
+                Ok(())
+            }
+            Err(RuntimeError::StartupFailed { cause, .. }) => Err(cause),
+            Err(other) => panic!("unexpected native refusal before log selection: {other}"),
+        }
+    })
+}
+fn assert_both_refuse(layout: &ClusterLayout, dir: &Path, case: &str, cause: &str) {
+    assert_node_wide_refusal(&config(layout, 1, dir, SlotStartupPlan::default()), case);
+    match native_start(layout, dir) {
+        Err(native) => assert!(native.contains(cause), "{case}: {native}"),
+        Ok(()) => panic!("{case}: native start accepted a directory the probe refused"),
+    }
+}
+/// A directory a previous start created: manifest present (without it the
+/// manifest layer refuses any existing data before the log is selected).
+fn started_dir(layout: &ClusterLayout) -> PathBuf {
+    let dir = directory();
+    SlotManifest::open_or_create(&dir, layout, 1).unwrap();
+    dir
+}
+/// RocksDB log engine plus marker; `written` groups get a stored vote, which
+/// sets their `ever_written` basis.
+fn rocks(dir: &Path, written: &[u64]) {
+    use openraft::storage::RaftLogStorage;
+    let db =
+        multiraft_store::RocksLogDb::<multiraft_core::TypeConfig>::open(dir.join("raft-rocksdb"))
+            .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for &group in written {
+        let mut store = db.group(group).unwrap();
+        runtime
+            .block_on(store.save_vote(&multiraft_core::typ::Vote::new(4, 1)))
+            .unwrap();
+        assert_eq!(
+            db.startup_provenance(group).unwrap(),
+            StartupProvenance::Persisted
+        );
+    }
+    drop(db);
+    std::fs::write(dir.join("raft-log-backend"), b"rocksdb-v1\n").unwrap();
+}
+/// A valid, active native snapshot for `group`.
+fn persisted_snapshot(dir: &Path, group: u64) {
+    use openraft::{
+        alias::{LeaderIdOf, LogIdOf, SnapshotMetaOf, StoredMembershipOf},
+        vote::RaftLeaderIdExt,
+        BasicNode, Membership,
+    };
+    type C = multiraft_core::TypeConfig;
+    let members = std::collections::BTreeSet::from([1, 2, 3]);
+    let nodes: BTreeMap<_, _> = members
+        .iter()
+        .map(|id| (*id, BasicNode::new("n")))
+        .collect();
+    let meta = SnapshotMetaOf::<C> {
+        last_log_id: Some(LogIdOf::<C>::new(LeaderIdOf::<C>::new_committed(2, 1), 5)),
+        last_membership: StoredMembershipOf::<C>::new(
+            Some(LogIdOf::<C>::new(LeaderIdOf::<C>::new_committed(1, 1), 1)),
+            Membership::new(vec![members], nodes).unwrap(),
+        ),
+        snapshot_id: "persisted".into(),
+    };
+    let catalog = multiraft_store::SnapshotCatalog::new(dir.join("snapshots"), 1);
+    catalog
+        .publish_native(group, &meta, b"image", 1024)
+        .unwrap();
+    assert_eq!(
+        catalog.probe_provenance(group, 1024).unwrap(),
+        StartupProvenance::Persisted
+    );
+}
+
+const NO_BASIS: &str = "persisted FileLog or snapshot history";
+
 #[test]
 fn probe_refuses_history_the_native_opener_refuses_including_non_voter_groups() {
     let layout = layout();
     let voter_group = layout.group_for_slot(SlotId(0)).unwrap();
     let non_voter = 999;
     assert!(layout.slot_for_group(non_voter).is_err());
-    let rocks = |dir: &Path| {
-        std::fs::create_dir_all(dir).unwrap();
-        drop(
-            multiraft_store::RocksLogDb::<multiraft_core::TypeConfig>::open(
-                dir.join("raft-rocksdb"),
-            )
-            .unwrap(),
-        );
-        std::fs::write(dir.join("raft-log-backend"), b"rocksdb-v1\n").unwrap();
-    };
     for (case, with_rocks, group) in [
         ("voter FileLog vote, no RocksDB", false, voter_group),
         ("voter FileLog vote, RocksDB pristine", true, voter_group),
         ("non-voter FileLog vote, no RocksDB", false, non_voter),
         ("non-voter FileLog vote, RocksDB pristine", true, non_voter),
     ] {
-        let dir = directory();
-        // A directory a previous start created: manifest present.
-        SlotManifest::open_or_create(&dir, &layout, 1).unwrap();
+        let dir = started_dir(&layout);
         if with_rocks {
-            rocks(&dir);
+            rocks(&dir, &[]);
         }
         legacy_vote(&dir, group);
-        assert_node_wide_refusal(&config(&layout, 1, &dir, SlotStartupPlan::default()), case);
-        // The native runtime refuses the same directory.
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let started = runtime.block_on(try_start(&layout, 1, &dir, SlotStartupPlan::default()));
-        match started {
-            Err(RuntimeError::StartupFailed { cause, .. }) => assert!(
-                cause.contains("persisted FileLog or snapshot history"),
-                "{case}: {cause}"
-            ),
-            Err(other) => panic!("{case}: unexpected native refusal {other}"),
-            Ok(_) => panic!("{case}: native start accepted refused history"),
-        }
+        assert_both_refuse(&layout, &dir, case, NO_BASIS);
     }
-    // Malformed non-voter namespaces fail closed too.
-    let dir = directory();
+    for (case, with_rocks) in [
+        ("non-voter valid snapshot, no RocksDB", false),
+        ("non-voter valid snapshot, RocksDB pristine", true),
+    ] {
+        let dir = started_dir(&layout);
+        if with_rocks {
+            rocks(&dir, &[]);
+        }
+        persisted_snapshot(&dir, non_voter);
+        assert_both_refuse(&layout, &dir, case, NO_BASIS);
+    }
+    // Malformed non-voter namespaces fail closed in both.
+    let dir = started_dir(&layout);
     std::fs::create_dir_all(dir.join(format!("group-{non_voter}"))).unwrap();
     std::fs::write(dir.join(format!("group-{non_voter}/mystery")), b"?").unwrap();
-    assert_node_wide_refusal(
-        &config(&layout, 1, &dir, SlotStartupPlan::default()),
-        "malformed non-voter FileLog",
-    );
-    let dir = directory();
+    assert_both_refuse(&layout, &dir, "malformed non-voter FileLog", "namespace");
+    let dir = started_dir(&layout);
     std::fs::create_dir_all(dir.join(format!("snapshots/{non_voter}"))).unwrap();
     std::fs::write(dir.join(format!("snapshots/{non_voter}/mystery")), b"?").unwrap();
-    assert_node_wide_refusal(
-        &config(&layout, 1, &dir, SlotStartupPlan::default()),
+    assert_both_refuse(
+        &layout,
+        &dir,
         "malformed non-voter snapshot namespace",
+        "namespace",
     );
-    // Recognized empty non-voter history is not a refusal.
-    let dir = directory();
+}
+
+#[test]
+fn probe_accepts_exactly_what_the_native_opener_accepts() {
+    let layout = layout();
+    let non_voter = 999;
+    // Native short-circuits on a persisted FileLog and never inspects the
+    // snapshot namespace; with a RocksDB basis the directory starts.
+    let dir = started_dir(&layout);
+    rocks(&dir, &[non_voter]);
+    legacy_vote(&dir, non_voter);
+    std::fs::create_dir_all(dir.join(format!("snapshots/{non_voter}"))).unwrap();
+    std::fs::write(dir.join(format!("snapshots/{non_voter}/mystery")), b"?").unwrap();
+    let probed = probe_untouched(&config(&layout, 1, &dir, SlotStartupPlan::default()));
+    assert!(all(&probed, StartupProvenance::Pristine), "{probed:?}");
+    native_start(&layout, &dir).expect("native accepts persisted FileLog with a RocksDB basis");
+    // Recognized empty non-voter history is accepted by both.
+    let dir = started_dir(&layout);
     std::fs::create_dir_all(dir.join(format!("group-{non_voter}"))).unwrap();
     let probed = probe_untouched(&config(&layout, 1, &dir, SlotStartupPlan::default()));
     assert!(all(&probed, StartupProvenance::Pristine));
+    native_start(&layout, &dir).expect("native accepts empty history");
 }
