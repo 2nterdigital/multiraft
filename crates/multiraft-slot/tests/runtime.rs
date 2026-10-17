@@ -64,6 +64,16 @@ fn key(layout: &ClusterLayout, slot: u32) -> Vec<u8> {
         .find(|k| layout.slot_for_key(k).unwrap() == SlotId(slot))
         .unwrap()
 }
+/// `SlotNodeOwner::start` proves local recovery only, never an elected
+/// leader. Tests whose short write budget must cover dispatch wait for this
+/// observable precondition first instead of racing the first election.
+async fn await_leader(handle: &SlotHandle<Fsm>, slot: SlotId) {
+    let hint = handle.leader_hint(slot, deadline()).await.unwrap();
+    assert!(
+        hint.is_some(),
+        "{slot:?} elected no leader within the deadline"
+    );
+}
 #[derive(Default)]
 struct Gate {
     entered: AtomicBool,
@@ -169,6 +179,8 @@ async fn timeout_and_drop_hold_slot_budget_until_native_completion_other_slot_pr
     let applied = Arc::new(AtomicU64::new(0));
     let owner = start(layout, 1, directory(), gate.clone(), applied.clone(), 1).await;
     let h = owner.handle();
+    // The 500 ms write below must dispatch; startup does not elect a leader.
+    await_leader(&h, SlotId(0)).await;
     let writer = h.clone();
     let key0 = k0.clone();
     let call = tokio::spawn(async move {
@@ -319,8 +331,13 @@ async fn validation_rejects_before_apply_and_manifest_mismatch_before_native_ope
     ));
 }
 
-// This fixture permits election rejection only for read-only attempts. A successful
-// response is checked immediately so retrying cannot hide a stale/wrong value.
+// This fixture permits election-transition refusals only for read-only attempts.
+// Besides `NotLeader`, a routed linearizable read across a leadership change is
+// refused as `Unavailable`: voters still hint the old leader, so the read goes to
+// a dead peer (transport `NotDispatched`) or to a deposed leader whose ReadIndex
+// cannot confirm a quorum (`QuorumUnavailable`). Both are non-mutating and never
+// outcome-unknown. Every other error is returned. A successful response is
+// checked immediately so retrying cannot hide a stale/wrong value.
 async fn assert_read_when_leader<F, Fut>(
     mut read: F,
     expected: &[u8],
@@ -340,7 +357,9 @@ where
                 assert_eq!(value, expected, "successful linearizable read must match");
                 return Ok(());
             }
-            Ok(Err(error @ RuntimeError::NotLeader { .. })) => last_error = error,
+            Ok(Err(error @ (RuntimeError::NotLeader { .. } | RuntimeError::Unavailable))) => {
+                last_error = error
+            }
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(last_error),
         }
@@ -382,9 +401,26 @@ async fn read_fixture_does_not_retry_wrong_successful_value() {
 }
 
 #[tokio::test]
-async fn read_fixture_does_not_swallow_other_errors() {
+async fn read_fixture_retries_unavailable_transition_refusal() {
     let mut responses = [
         Err(RuntimeError::Unavailable),
+        Ok(1u64.to_be_bytes().to_vec()),
+    ]
+    .into_iter();
+    assert_read_when_leader(
+        || std::future::ready(responses.next().expect("unexpected extra read")),
+        &1u64.to_be_bytes(),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert!(responses.next().is_none());
+}
+
+#[tokio::test]
+async fn read_fixture_does_not_swallow_other_errors() {
+    let mut responses = [
+        Err(RuntimeError::Application),
         Ok(1u64.to_be_bytes().to_vec()),
     ]
     .into_iter();
@@ -395,7 +431,7 @@ async fn read_fixture_does_not_swallow_other_errors() {
             Instant::now() + Duration::from_secs(5),
         )
         .await,
-        Err(RuntimeError::Unavailable)
+        Err(RuntimeError::Application)
     );
     assert!(responses.next().unwrap().is_ok());
 }
@@ -462,7 +498,20 @@ async fn real_grpc_nonhosted_node_routes_single_write_and_linearizable_read() {
         let observations = voter_observations(&owners, deadline()).await;
         panic!("initial quorum read failed: {error:?}; later voter observations: {observations:?}");
     }
-    let result = h.propose(&k, b"one".to_vec(), until).await.unwrap();
+    // The same leadership transitions refuse a write before dispatch as
+    // `NotLeader` / `Unavailable` (a possibly dispatched write is `Unknown`,
+    // which fails here), so retrying keeps exactly one applied command.
+    let result = loop {
+        match h.propose(&k, b"one".to_vec(), until).await {
+            Ok(result) => break result,
+            Err(e @ (RuntimeError::NotLeader { .. } | RuntimeError::Unavailable)) => {
+                assert!(Instant::now() < until, "write never dispatched: {e:?}");
+                tokio::time::sleep_until((Instant::now() + Duration::from_millis(5)).min(until))
+                    .await;
+            }
+            Err(e) => panic!("write failed: {e:?}"),
+        }
+    };
     assert_eq!(result.effects, 1u64.to_be_bytes());
     if let Err(error) = assert_read_when_leader(
         || h.read_linearizable(&k, &[], until),
@@ -542,6 +591,8 @@ async fn remote_unknown_is_not_retried_and_destination_retains_admission() {
     .await;
     let h = router.handle();
     let remote = destination.handle();
+    // The 500 ms write below must dispatch; startup does not elect a leader.
+    await_leader(&h, SlotId(0)).await;
     let writer = h.clone();
     let key0 = k.clone();
     let call = tokio::spawn(async move {
@@ -597,13 +648,38 @@ async fn applied_read_remains_explicitly_local_when_quorum_read_fails() {
         );
     }
     let h = owners[0].handle();
-    h.propose(&k, vec![1], deadline()).await.unwrap();
-    let leader = h.leader_hint(SlotId(0), deadline()).await.unwrap().unwrap();
-    let leader_owner = owners.remove((leader - 1) as usize);
+    let written = h.propose(&k, vec![1], deadline()).await.unwrap();
+    // Keep a node that has provably applied the write. A leader hint is not
+    // such proof: leadership may move after the write to a voter that holds
+    // the entry but has not applied it yet.
+    let until = deadline();
+    let keep = loop {
+        let mut applied = None;
+        for (index, owner) in owners.iter().enumerate() {
+            let view = owner
+                .handle()
+                .read_applied(SlotId(0), &[], until)
+                .await
+                .unwrap();
+            if view.applied.is_some_and(|id| id.index >= written.index) {
+                applied = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = applied {
+            break index;
+        }
+        assert!(
+            Instant::now() < until,
+            "no voter applied the committed write"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let kept = owners.remove(keep);
     for owner in owners {
         assert!(owner.shutdown(deadline()).await.complete);
     }
-    let h = leader_owner.handle();
+    let h = kept.handle();
     assert_eq!(
         h.read_applied(SlotId(0), &[], deadline())
             .await
@@ -619,7 +695,7 @@ async fn applied_read_remains_explicitly_local_when_quorum_read_fails() {
         !failure.outcome_unknown(),
         "read must not be a write-unknown: {failure:?}"
     );
-    assert!(leader_owner.shutdown(deadline()).await.complete);
+    assert!(kept.shutdown(deadline()).await.complete);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
