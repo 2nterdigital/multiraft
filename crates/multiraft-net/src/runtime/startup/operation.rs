@@ -180,9 +180,11 @@ impl<S: StateMachine> RuntimeShared<S> {
         self.check_budget(&progress, index)?;
         let deadline = progress.lock().unwrap().groups[index].deadline.unwrap();
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if pristine && forbidden {
+        if pristine && forbidden && self.node.startup_voter() {
             // No durable-local "empty basis is done" shortcut: an empty rejoining
             // voter must catch up from an existing leader within the budget.
+            // A Standby is not in membership until a leader adds it, so it keeps
+            // the existing wait (and is never guarded).
             self.bounded(
                 index,
                 &progress,
