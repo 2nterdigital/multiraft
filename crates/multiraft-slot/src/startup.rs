@@ -8,7 +8,12 @@ use crate::{NodeId, SlotId, SlotNodeConfig};
 use multiraft_core::{StartupProvenance, TypeConfig};
 use multiraft_net::InitializePolicy;
 use multiraft_store::{FileLogStoreOf, RocksLogDb, SnapshotCatalog};
-use std::{collections::BTreeMap, io, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    path::Path,
+    time::Duration,
+};
 
 /// Accepted [`SlotStartupPlan::bootstrap_grace`] range (the native admission bounds).
 pub const BOOTSTRAP_GRACE_RANGE: std::ops::RangeInclusive<Duration> =
@@ -109,8 +114,13 @@ impl SlotNodeConfig {
     ///   or an unknown marker is an error, as in the native opener.
     /// - Native snapshot catalog (`snapshots/`): `Persisted` iff a validated
     ///   active snapshot exists. Unrecognized namespaces are errors.
-    /// - A RocksDB-pristine group with persisted legacy FileLog or snapshot
-    ///   history is an error (the native runtime refuses to start it).
+    /// - Node-wide, exactly like the native opener (`open_node_log`): every
+    ///   `group-<id>/` FileLog root and `snapshots/<id>/` namespace in
+    ///   `data_dir` is checked, including ids this node does not vote in.
+    ///   Unrecognized or malformed namespaces, and persisted FileLog or
+    ///   snapshot history without a RocksDB log basis, are errors
+    ///   ([`ProbeError::Storage`] with `slot: None`), because the native
+    ///   runtime refuses to start on such a directory.
     ///
     /// `slot-manifest.json` is neither read nor written: a crash after the
     /// manifest was created but before any Raft state was stored leaves a
@@ -185,6 +195,69 @@ fn open_log(root: &Path) -> io::Result<Option<RocksLogDb<TypeConfig>>> {
     Ok(None)
 }
 
+/// Every group id with a legacy FileLog root (`group-<id>`) or a snapshot
+/// namespace (`snapshots/<id>`), as `open_node_log` collects them.
+fn history_ids(root: &Path) -> io::Result<BTreeSet<u64>> {
+    let mut ids = BTreeSet::new();
+    let mut scan = |dir: &Path, prefix: &str| -> io::Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            if let Some(id) = entry?
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix(prefix))
+                .and_then(|id| id.parse::<u64>().ok())
+            {
+                ids.insert(id);
+            }
+        }
+        Ok(())
+    };
+    scan(root, "group-")?;
+    scan(&root.join("snapshots"), "")?;
+    Ok(ids)
+}
+
+fn in_group(group: u64) -> impl FnOnce(io::Error) -> io::Error {
+    move |error| io::Error::new(error.kind(), format!("group {group}: {error}"))
+}
+
+/// Node-wide refusal of `open_node_log`, read-only: every scanned id (voter
+/// or not) must have a recognized FileLog and snapshot namespace, and any
+/// persisted FileLog/snapshot history needs a RocksDB log basis.
+fn check_history(
+    root: &Path,
+    db: Option<&RocksLogDb<TypeConfig>>,
+    catalog: &SnapshotCatalog,
+    max_snapshot_bytes: usize,
+) -> io::Result<()> {
+    for group in history_ids(root)? {
+        let legacy = FileLogStoreOf::startup_provenance(root.join(format!("group-{group}")))
+            .map_err(in_group(group))?;
+        let snapshots = catalog
+            .probe_provenance(group, max_snapshot_bytes)
+            .map_err(in_group(group))?;
+        if legacy == StartupProvenance::Pristine && snapshots == StartupProvenance::Pristine {
+            continue;
+        }
+        let basis = match db {
+            Some(db) => db.startup_provenance(group).map_err(in_group(group))?,
+            None => StartupProvenance::Pristine,
+        };
+        if basis == StartupProvenance::Pristine {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("group {group}: persisted FileLog or snapshot history without a RocksDB log basis; explicit migration or recovery required"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn probe(
     root: &Path,
     max_snapshot_bytes: usize,
@@ -192,6 +265,7 @@ fn probe(
 ) -> Result<BTreeMap<SlotId, StartupProvenance>, ProbeError> {
     let db = open_log(root).map_err(storage(None))?;
     let catalog = SnapshotCatalog::new(root.join("snapshots"), 1);
+    check_history(root, db.as_ref(), &catalog, max_snapshot_bytes).map_err(storage(None))?;
     let mut out = BTreeMap::new();
     for &(slot, group) in groups {
         let classify = || -> io::Result<StartupProvenance> {

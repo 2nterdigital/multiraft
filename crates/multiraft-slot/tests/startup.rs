@@ -536,3 +536,94 @@ async fn failed_startup_reports_the_native_cause_and_releases_the_node() {
     let probed = probe_untouched(&config(&layout, 1, &dir, SlotStartupPlan::default()));
     assert!(all(&probed, StartupProvenance::Pristine), "{probed:?}");
 }
+
+/// A legacy FileLog root whose hard state holds a vote (persisted history).
+fn legacy_vote(dir: &Path, group: u64) {
+    let root = dir.join(format!("group-{group}"));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("hard_state.json"),
+        br#"{"last_purged_log_id":null,"committed":null,"vote":{"leader_id":{"term":4,"node_id":1},"committed":false}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        multiraft_store::FileLogStoreOf::startup_provenance(&root).unwrap(),
+        StartupProvenance::Persisted
+    );
+}
+fn assert_node_wide_refusal(config: &SlotNodeConfig, case: &str) {
+    let before = tree(&config.data_dir);
+    match config.probe_local_state() {
+        Err(ProbeError::Storage { slot: None, .. }) => {}
+        other => panic!("{case}: expected a node-wide refusal, got {other:?}"),
+    }
+    assert_eq!(
+        before,
+        tree(&config.data_dir),
+        "{case}: probe modified state"
+    );
+}
+
+#[test]
+fn probe_refuses_history_the_native_opener_refuses_including_non_voter_groups() {
+    let layout = layout();
+    let voter_group = layout.group_for_slot(SlotId(0)).unwrap();
+    let non_voter = 999;
+    assert!(layout.slot_for_group(non_voter).is_err());
+    let rocks = |dir: &Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        drop(
+            multiraft_store::RocksLogDb::<multiraft_core::TypeConfig>::open(
+                dir.join("raft-rocksdb"),
+            )
+            .unwrap(),
+        );
+        std::fs::write(dir.join("raft-log-backend"), b"rocksdb-v1\n").unwrap();
+    };
+    for (case, with_rocks, group) in [
+        ("voter FileLog vote, no RocksDB", false, voter_group),
+        ("voter FileLog vote, RocksDB pristine", true, voter_group),
+        ("non-voter FileLog vote, no RocksDB", false, non_voter),
+        ("non-voter FileLog vote, RocksDB pristine", true, non_voter),
+    ] {
+        let dir = directory();
+        // A directory a previous start created: manifest present.
+        SlotManifest::open_or_create(&dir, &layout, 1).unwrap();
+        if with_rocks {
+            rocks(&dir);
+        }
+        legacy_vote(&dir, group);
+        assert_node_wide_refusal(&config(&layout, 1, &dir, SlotStartupPlan::default()), case);
+        // The native runtime refuses the same directory.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let started = runtime.block_on(try_start(&layout, 1, &dir, SlotStartupPlan::default()));
+        match started {
+            Err(RuntimeError::StartupFailed { cause, .. }) => assert!(
+                cause.contains("persisted FileLog or snapshot history"),
+                "{case}: {cause}"
+            ),
+            Err(other) => panic!("{case}: unexpected native refusal {other}"),
+            Ok(_) => panic!("{case}: native start accepted refused history"),
+        }
+    }
+    // Malformed non-voter namespaces fail closed too.
+    let dir = directory();
+    std::fs::create_dir_all(dir.join(format!("group-{non_voter}"))).unwrap();
+    std::fs::write(dir.join(format!("group-{non_voter}/mystery")), b"?").unwrap();
+    assert_node_wide_refusal(
+        &config(&layout, 1, &dir, SlotStartupPlan::default()),
+        "malformed non-voter FileLog",
+    );
+    let dir = directory();
+    std::fs::create_dir_all(dir.join(format!("snapshots/{non_voter}"))).unwrap();
+    std::fs::write(dir.join(format!("snapshots/{non_voter}/mystery")), b"?").unwrap();
+    assert_node_wide_refusal(
+        &config(&layout, 1, &dir, SlotStartupPlan::default()),
+        "malformed non-voter snapshot namespace",
+    );
+    // Recognized empty non-voter history is not a refusal.
+    let dir = directory();
+    std::fs::create_dir_all(dir.join(format!("group-{non_voter}"))).unwrap();
+    let probed = probe_untouched(&config(&layout, 1, &dir, SlotStartupPlan::default()));
+    assert!(all(&probed, StartupProvenance::Pristine));
+}
