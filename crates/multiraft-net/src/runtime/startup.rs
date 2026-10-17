@@ -12,9 +12,10 @@ pub struct StartupGroup {
     pub group: GroupConfig,
     pub preferred_initializer: Option<NodeId>,
     /// `Allowed` (default) keeps native pristine initialization and grace
-    /// fallback. `Forbidden` skips both: a pristine Group waits until it has
-    /// applied the first observed leader commit (bounded by the batch
-    /// `recovery_timeout`) and arms the inbound rejoin vote guard meanwhile.
+    /// fallback. `Forbidden` skips both: a pristine voter Group arms the rejoin
+    /// guard (drops inbound votes, disables local elections) and is reported
+    /// Ready only after the guard is released, i.e. applied covers the per-term
+    /// leader-commit anchor, within the batch `recovery_timeout`.
     pub initialize: InitializePolicy,
 }
 

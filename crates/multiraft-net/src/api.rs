@@ -42,6 +42,7 @@ pub async fn append<S: StateMachine>(raft: &Raft<S>, req: &[u8], inbound: Inboun
     inbound.guard.observe_append(
         inbound.node_id,
         inbound.group_id,
+        req.vote.leader_id().term,
         req.leader_commit.as_ref(),
     );
     let res = raft.append_entries(req).await;

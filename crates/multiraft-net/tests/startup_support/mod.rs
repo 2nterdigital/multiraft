@@ -59,6 +59,7 @@ impl Drop for Release {
 pub struct Bytes {
     pub value: Vec<u8>,
     lease: PathBuf,
+    restore_gate: Option<Gate>,
 }
 impl Drop for Bytes {
     fn drop(&mut self) {
@@ -89,6 +90,9 @@ impl StateMachine for Bytes {
         Ok(self.value.clone())
     }
     fn restore(&mut self, _: GroupId, data: &[u8]) -> Result<(), Self::Error> {
+        if let Some(gate) = &self.restore_gate {
+            gate.block();
+        }
         self.value = data.to_vec();
         Ok(())
     }
@@ -102,6 +106,8 @@ pub struct Factory {
     pub reject: Option<GroupId>,
     pub panic: Option<GroupId>,
     pub reject_validation: Option<GroupId>,
+    /// Blocks the first snapshot restore of this Group until released.
+    pub restore: Option<(GroupId, Gate)>,
 }
 impl Factory {
     pub fn new(root: &Path) -> Self {
@@ -113,6 +119,7 @@ impl Factory {
             reject: None,
             panic: None,
             reject_validation: None,
+            restore: None,
         }
     }
 }
@@ -129,6 +136,11 @@ impl StateMachineFactory<Bytes> for Factory {
         let fsm = Bytes {
             value: vec![],
             lease,
+            restore_gate: self
+                .restore
+                .as_ref()
+                .filter(|(id, _)| *id == context.group_id())
+                .map(|(_, gate)| gate.clone()),
         };
         if let Some((id, gate)) = &self.construct {
             if *id == context.group_id() {

@@ -171,7 +171,12 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
             RaftReply::Vote(raft.vote(req).await)
         }
         RaftCall::Append(req) => {
-            guard.observe_append(node_id, group_id, req.leader_commit.as_ref());
+            guard.observe_append(
+                node_id,
+                group_id,
+                req.vote.leader_id().term,
+                req.leader_commit.as_ref(),
+            );
             RaftReply::Append(raft.append_entries(req).await)
         }
         RaftCall::Snapshot { vote, meta, data } => {

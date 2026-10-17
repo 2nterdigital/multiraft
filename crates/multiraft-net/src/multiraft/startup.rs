@@ -11,8 +11,9 @@ use openraft::vote::RaftLeaderId;
 /// preferred initializer immediately, others after the grace fallback).
 /// `Forbidden` never initializes: the Group may only be caught up by an existing
 /// leader (log or snapshot). A Forbidden-started **pristine** voter also arms the
-/// inbound rejoin vote guard until it has applied the highest observed leader
-/// commit. Persisted local state never initializes and never arms the guard.
+/// rejoin guard (drops inbound votes, disables local elections) until it has
+/// applied the per-term leader-commit anchor. Persisted local state never
+/// initializes and never arms the guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InitializePolicy {
     #[default]
@@ -100,14 +101,12 @@ impl<S: StateMachine> MultiRaft<S> {
         }
     }
 
-    /// Forbidden pristine recovery: wait until applied covers the first observed
-    /// leader commit. Native `wait_for_recovery` on an empty log pins its target to
-    /// the first `cluster_committed`, which only AppendEntries `leader_commit`
-    /// sets; then applied must also cover the guard anchor as read at that point
-    /// (maximum observed leader commit or snapshot lower bound). Release is then
-    /// attempted once against the current anchor; if a newer commit raised it,
-    /// the guard releases lazily on a later vote check. Startup never chases a
-    /// moving commit, so its budget stays bounded.
+    /// Forbidden pristine recovery. Native `wait_for_recovery` on an empty log
+    /// pins its target to the first `cluster_committed`, which only AppendEntries
+    /// `leader_commit` sets; afterwards this waits until the rejoin guard is
+    /// released (applied covers the per-term anchor, which moves only on a leader
+    /// term change), all within `timeout`. Ready is therefore never reported
+    /// while the guard is armed; on timeout startup fails.
     pub(crate) async fn wait_for_rejoin_recovery(
         &self,
         group: GroupId,
@@ -122,43 +121,32 @@ impl<S: StateMachine> MultiRaft<S> {
                 .ok_or(MultiRaftError::UnknownGroup(group))?;
             (app.raft.clone(), app.rejoin_guard.clone())
         };
-        if guard.is_armed() {
-            let remaining = timeout.saturating_sub(started.elapsed());
-            let anchor = guard.anchor();
-            let result = raft
-                .wait(Some(remaining))
-                .applied_index_at_least(anchor, "rejoin guard anchor applied")
-                .await;
-            if let Err(source) = result {
-                self.ensure_recovery_running(group)?;
-                let failure = match &source {
-                    openraft::metrics::WaitError::Timeout(..) => {
-                        multiraft_core::RecoveryFailure::Deadline
-                    }
-                    openraft::metrics::WaitError::ShuttingDown => {
-                        multiraft_core::RecoveryFailure::Closed
-                    }
-                };
-                return Err(multiraft_core::RecoveryError::new(
-                    group,
-                    multiraft_core::RecoveryStage::Await,
-                    failure,
-                    Some(source.into()),
-                )
-                .into());
-            }
-            let applied = raft
-                .metrics()
-                .borrow_watched()
-                .last_applied
-                .as_ref()
-                .map(|id| id.index);
-            guard.try_release(self.node_id, group, applied);
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let mut released = guard.released();
+        // The Group watcher drives release; check here too in case it is absent.
+        guard.try_release_raft(group, &raft);
+        let waited = tokio::time::timeout(remaining, released.wait_for(|done| *done)).await;
+        if !matches!(waited, Ok(Ok(_))) {
+            self.ensure_recovery_running(group)?;
+            let failure = if waited.is_err() {
+                multiraft_core::RecoveryFailure::Deadline
+            } else {
+                multiraft_core::RecoveryFailure::Closed
+            };
+            tracing::warn!(target: "multiraft::recovery", operation = "owned_recovery", phase = "error",
+                node_id = self.node_id, group_id = group, recovery_basis = "rejoin_guard_release",
+                anchor_index = ?guard.anchor(), "rejoin guard not released within the startup budget");
+            return Err(multiraft_core::RecoveryError::new(
+                group,
+                multiraft_core::RecoveryStage::Await,
+                failure,
+                None,
+            )
+            .into());
         }
         tracing::info!(target: "multiraft::recovery", operation = "owned_recovery", phase = "complete",
-            node_id = self.node_id, group_id = group, recovery_basis = "first_leader_commit",
-            rejoin_guard_armed = guard.is_armed(), anchor_index = ?guard.anchor(),
-            "forbidden pristine Group caught up from an existing leader");
+            node_id = self.node_id, group_id = group, recovery_basis = "rejoin_guard_release",
+            anchor_index = ?guard.anchor(), "forbidden pristine Group caught up; rejoin guard released");
         Ok(())
     }
     pub(crate) async fn startup_eligible(&self, group: GroupId) -> Result<bool, MultiRaftError> {

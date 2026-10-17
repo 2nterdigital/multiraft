@@ -22,11 +22,12 @@ impl<S: StateMachine> MultiRaft<S> {
     /// `Allowed` is exactly [`Self::create_group`]. `Forbidden` spawns the local
     /// raft and never calls `initialize` on either transport; the Group can only
     /// be caught up by an existing leader. When the local storage is pristine
-    /// (voter role), the inbound rejoin vote guard is armed before the Group is
-    /// published and drops vote requests until the highest observed leader commit
-    /// is applied. Await [`Self::wait_for_recovery`] before serving: on an empty
-    /// log it completes only after the first observed leader commit is applied
-    /// (the guard itself releases once applied covers the highest one).
+    /// (voter role), the rejoin guard is armed before the Group is published: it
+    /// drops inbound vote requests and disables local elections until applied
+    /// covers the per-term anchor (see [`crate::RejoinGuard`]); a Group-owned
+    /// watcher releases it as soon as that holds. Await
+    /// [`Self::wait_for_recovery`] before serving: on an empty log it completes
+    /// only after the first observed leader commit is applied.
     /// An already-registered Group is left unchanged (its guard is not re-armed).
     pub async fn create_group_with_policy(
         &self,
@@ -81,6 +82,13 @@ impl<S: StateMachine> MultiRaft<S> {
         }
 
         Ok(())
+    }
+
+    /// Whether the local native Raft of `group` holds any initialized state
+    /// (membership or log). A Forbidden Group stays uninitialized until a leader
+    /// replicates to it.
+    pub async fn is_initialized(&self, group: u64) -> Result<bool, MultiRaftError> {
+        self.startup_eligible(group).await.map(|eligible| !eligible)
     }
 
     /// Leader-only: add a Standby as an openraft Learner (`add_learner`, blocking).
