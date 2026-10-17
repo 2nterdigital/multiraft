@@ -67,12 +67,17 @@ fn key(layout: &ClusterLayout, slot: u32) -> Vec<u8> {
 /// `SlotNodeOwner::start` proves local recovery only, never an elected
 /// leader. Tests whose short write budget must cover dispatch wait for this
 /// observable precondition first instead of racing the first election.
+/// A router handle's remote probe gives up after its own 1 s allowance, so poll
+/// until a leader is observed or the overall deadline passes.
 async fn await_leader(handle: &SlotHandle<Fsm>, slot: SlotId) {
-    let hint = handle.leader_hint(slot, deadline()).await.unwrap();
-    assert!(
-        hint.is_some(),
-        "{slot:?} elected no leader within the deadline"
-    );
+    let until = deadline();
+    while handle.leader_hint(slot, until).await.unwrap().is_none() {
+        assert!(
+            Instant::now() < until,
+            "{slot:?} elected no leader within the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 #[derive(Default)]
 struct Gate {
@@ -649,6 +654,13 @@ async fn applied_read_remains_explicitly_local_when_quorum_read_fails() {
     }
     let h = owners[0].handle();
     let written = h.propose(&k, vec![1], deadline()).await.unwrap();
+    // Not used for selection below; kept so a missing hint after a committed
+    // write (the originally reported symptom) still fails loudly.
+    assert!(h
+        .leader_hint(SlotId(0), deadline())
+        .await
+        .unwrap()
+        .is_some());
     // Keep a node that has provably applied the write. A leader hint is not
     // such proof: leadership may move after the write to a voter that holds
     // the entry but has not applied it yet.
