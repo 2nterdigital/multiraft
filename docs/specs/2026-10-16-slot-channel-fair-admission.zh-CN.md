@@ -10,7 +10,9 @@
 历史 430-pass 与 A–F 结果保持原有范围，不能证明本调度器有效。
 不同 Slot 的一个冷请求获得进展，也不能作为 Channel 公平性证据。
 
-当前执行以 [Admit 优先实施计划](../plans/2026-10-17-slot-admit-first-implementation.zh-CN.md) 的 T0–T7 为最高优先级，覆盖旧 G0–G6/H1 的公平先于 Admit 顺序：M1 先真实 Admit，M2 接通 claims/TiKV 与隔离新空间的 HTTP/WS、delivery/history，T5 再补必要公平。下述身份、预算、Unknown/deadline/ownership、预留与完整生命周期合同持续有效；M1/M2 先有必要硬上界和 read/control reserve。T6 生产隔离、observer 与 snapshot 增长门槛及 T7 迁移验收仍须在生产前完成。完整 DRR、客户端 NODELAY 与 #173 复测均不是 M1/M2 前置；保留已有必要配置。
+当前执行以 [Admit 优先实施计划](../plans/2026-10-17-slot-admit-first-implementation.zh-CN.md) 的 T0–T7 为最高优先级，覆盖旧 G0–G6/H1 的公平先于 Admit 顺序：M1 先真实 Admit，M2 接通 claims/TiKV 与隔离新空间的 HTTP/WS、delivery/history，T5 再补必要公平。下述身份、预算、Unknown/deadline/ownership、预留与完整生命周期合同持续有效；M1/M2 先有必要硬上界和 read/control reserve。T6 生产隔离、observer 与 snapshot 增长门槛及 T7 新业务空间初始化/隔离与新系统上线前验收仍须在生产前完成。完整 DRR、客户端 NODELAY 与 #173 复测均不是 M1/M2 前置；保留已有必要配置。
+
+**2026-10-17 范围覆盖（用户已明确）：** 新架构只接纳独立新业务空间的数据，不兼容旧系统历史数据；旧数据兼容、导入、backfill、双读/双写、旧→新迁移及该迁移的反向迁移保障均取消，不再是 T7 或生产前置。旧数据及历史证据保留，不删除旧数据，不 reset 共享 TiKV。新空间须证明真实 keyspace/prefix、完整 key 与 ID 所有权以及读写隔离；仅新 SlotEpoch 或空 RocksDB 目录不能证明 freshness。具体隔离机制留待设计，本条不选 D1 方案、不批准 PR #177 实验室运行。M3 保留必要公平、Slot 故障隔离、observer、snapshot 增长及新数据长期容量正确性验收。新系统自产 log/snapshot 恢复、固定结果/seq/Unknown、claims/flush 与持久交接合同继续有效。旧数据及历史证据原样保留；新架构不提供读取或展示旧业务数据的兼容入口。源码依赖及业务 wire/auth 合同不变（本次仅调整数据兼容范围）；不能把旧 cache 权威直接降为本地 KV，整体 cache 退役仍仅为建议。
 
 ## 1. 范围与固定约束
 
@@ -18,7 +20,7 @@
 保持每 node 一个 RocksDB，使用 default column family 和 group 命名空间。
 本阶段不引入每 Slot DB、生产 Admit、resharding 或 write retry。
 Slot 故障隔离与性能公平是不同门槛，不能互相证明。
-历史 observer 风险、生产 Admit/TiKV 迁移与容量门槛继续保留。
+历史 observer 风险、生产 Admit/TiKV 接入与新数据长期容量正确性门槛继续保留。
 公平只覆盖按有界选择已接纳且 eligible 的请求（选用 DRR 时依据估算成本），不承诺 wall-clock 硬上界。
 冷新 key 的 SLO 还要求受保护的入口容量与明确的负载域。
 
@@ -231,7 +233,9 @@ success latency 与 all-terminal latency、refusal、Unknown 分开报告。
 某 group 或 shared storage 争用，才进入隔离评审。
 先考虑合法固定 layout 内的整 Slot leader placement/容量。
 当前无公开 migration-control Interface，使用前须实现并验证。
-未来 versioned Channel override/dedicated group 须另立完整迁移设计。
+未来 versioned Channel override/dedicated group 须另立完整迁移设计，不是首交付前置。
+以下约束仅针对新架构已接纳的数据；“旧 writer/collector”指搬移前的新系统 owner，
+不要求迁入旧单组 cache 历史数据。
 迁移永久 dedup result、seq/head/pending、flush/stop、persisted progress、
 claims 与未决 Unknown，不能只迁移近期 payload。
 freeze/fence 旧 writer 与 collector；checkpoint + tail 与对账收敛后，
@@ -241,7 +245,7 @@ freeze/fence 旧 writer 与 collector；checkpoint + tail 与对账收敛后，
 独占 group 不能提高 single Channel ordered execution 上界。
 shared-DB 瓶颈可跨 Slot；未来少量 storage 分组或物理 I/O 隔离
 须另行设计验证，本阶段保持每 node 一个 DB。
-旧 G6 真实 Admit/TiKV 工作已拆至 T1–T4，不再等待 G5 公平证据；历史 observer、生产 Slot 局部隔离与 snapshot 增长归 T6，完整迁移归 T7，仍是生产前门槛。M2 仅使用隔离新命名空间。
+旧 G6 真实 Admit/TiKV 工作已拆至 T1–T4，不再等待 G5 公平证据；历史 observer、生产 Slot 局部隔离与 snapshot 增长归 T6，新业务空间初始化/隔离与上线前验收归 T7，仍是生产前门槛。M2 仅使用隔离新命名空间。
 
 ## 9. 参考范围
 

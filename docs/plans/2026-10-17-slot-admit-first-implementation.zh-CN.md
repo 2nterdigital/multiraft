@@ -4,6 +4,12 @@
 **日期：** 2026-10-17
 **状态：** 仅执行计划；本次未实施、构建、运行新测试、SSH 或负载实验。
 
+**用户明确确认的范围更新 — 2026-10-17：** 本次架构从全新 state 目录及实际隔离的新业务数据空间启动。不兼容或接续旧 CacheKV/WAL/snapshot/RocksDB 格式，以及旧 TiKV 消息 head、command result、pending/flush、Presence、读位置等存量。旧 reader、双读/双写、legacy import/backfill、迁移工具、snapshot converter，以及以旧 backend 接续新数据均不在交付范围。旧状态迁移工程从本次交付删除，不后延为必选 backlog。这替代原迁移硬前置，不豁免新接纳数据的正确性。
+
+已有数据原样保留，不清空共享 TiKV，不复用旧目录/identity；旧格式或错误 namespace 必须 fail closed，拒绝不支持格式无需开发旧 decoder。空 RocksDB 或新的 `namespace_epoch` 只是标签，不证明新业务空间；T0 冻结实际 keyspace/prefix 或完整 owned-ID 隔离及访问边界，覆盖所用全部用户、群、消息、command dedup、读位置、Presence、persisted progress 键，旧 writers 不能写新空间。仅 TiKV head 不存在不充分。具体隔离机制仍由执行者设计冻结，本范围决定不批准 D1 方案。
+
+新系统接纳写入后，如需停止则停服修复并以新格式恢复，不能用旧 backend 接续新数据，也不能以 rollback 删除新成功。相同新 generation 的 snapshot/log 重启、固定 dedup/seq、Unknown、flush/timeouts 与长期恢复容量仍是硬门槛。旧数据兼容豁免不自动改变 HTTP/WS、鉴权及业务协议。未来 H1 若搬迁新系统自己的数据，仍须另行设计 fence 全状态协议，不属于本次交付，固定 layout 不变。本次仅确认文档范围，不授权整 cache 退役代码、D1/D5 实验或生产切换。
+
 ## 1. 已采纳方向与替代顺序
 
 固定 Slot + Atomic Admit 是已采纳的长期主线。
@@ -22,7 +28,7 @@
 | --- | --- | --- | --- |
 | M1 | T0–T2 | 纯业务 FSM，真实三个 OS 进程 RF3、多 Slot 准入 | 不接生产 TiKV，不切旧数据 |
 | M2 | T3–T4 | 真实 HTTP/WS、TiKV 事务与持久化证明、history/audience/delivery 闭环 | 新隔离业务 namespace；披露保守整节点故障行为 |
-| M3 | T5–T7 | 必要公平/热点证据、Slot 故障隔离、observer 收敛、迁移演练与目标验收 | 就绪证据；生产切换仍是单独动作 |
+| M3 | T5–T7 | 必要公平/热点证据、Slot 故障隔离、observer 收敛、新 namespace 初始化/隔离、新系统恢复与目标验收 | 就绪证据；生产切换仍是单独动作 |
 
 首轮交接：先交 M1 报告，依赖通过后直接继续 M2。
 不要在阶段之间重新征求已采纳架构的批准。
@@ -90,9 +96,10 @@ Slot 仅承担通用命令/查询传输与持久化宿主。
 | 停止受影响准入 | Stop 命令 | 每 Slot 确认状态；未记录结果明确报告 |
 | Flush 记账/屏障 | Flush 命令与屏障查询 | 已 apply 的 authority 与关闭顺序 |
 | Head/pending/read-point | 线性 authority 查询 | 读者使用所选 backend；local watermark 不是线性屏障 |
-| 其他 legacy cache namespace | 现有 cache API | 继续现有合同 |
+| 保留的 legacy 对照 backend | 独立旧空间的现有 cache API | 不为新 namespace 读写或 fallback |
 
 冻结 canonical Channel 编码、命令 identity/fingerprint、消息/结果字段、版本与 verdict codes。
+复用业务 DTO/协议语义及旧 codec 来源参考，不等于支持旧 on-disk decoder 或隐藏迁移路径。
 ech0 main 来源映射：`crates/business/src/send/admission.rs` 包含 SendCommand/Outcome；T0 核实完整 crate 前缀路径。
 `record.rs` 四类状态：head {head, stopped}；command identity→intent/msgid/seq；pending→msgid/command/sender/content；flush Idle/InFlight(holder)/Stopped(holder)。
 现 revision 在 cache-entry metadata，新 FSM 必须保存显式等价 version。
@@ -103,7 +110,7 @@ Backend 用显式启动/campaign 配置，保留受控 legacy 对照。
 永久结果容量满时拒绝新命令，不能丢失此前成功结果。
 T0 记录新 head/pending + group-version 读集及全部 invalidation/version writers，证明现有资格短 stale 语义未被放宽。
 如必须同一视图，则接入相应 replicated version/control 并同步更新其 writers；不能留下隐含 split view。
-写明初始化证明与 ownership epoch；曾 accepted 的 Channel 不能从落后 TiKV head 导入。
+按上述确认范围记录全新空间初始化证明和 ownership epoch；不导入旧状态或以滞后 TiKV head bootstrap。
 
 ## 4. T1 — 确定性业务 FSM
 
@@ -147,8 +154,8 @@ Apply 内无网络、时钟、随机数或外部 I/O。
 编码 command/query 与每次 apply effects 均不超过 128 KiB。
 大 scan 有界分页，声明总 budget 与稳定语义；不能无限快照/查询响应。
 Authority 决策用线性读，明确区分本地 progress/watermark 检查。
-Fresh Channel 必须证明无 accepted state，并有适用 ownership fence。
-已有 Channel 不能从异步持久化 TiKV head 初始化。
+新 Channel 需要实际新空间隔离证明与相应 ownership fence；空 RocksDB、epoch 标签或 TiKV head 不存在都不充分。
+新 generation 已有 Channel 由完整新 snapshot/log 恢复，不能从异步持久化 TiKV head 或旧数据启动。
 实现同步 StateMachine apply/snapshot/restore、SlotStateMachine query 与具名 Factory.validate_recovered。
 NativeDurable freeze_bounded 默认 Unsupported；必须边构造边限额，不能分配后才量大小。
 现每 group 全量 native snapshot cap 可配置 1–64 MiB；永久 dedup 增长与该上限冲突。
@@ -169,7 +176,7 @@ T1/T2 即实施 count/byte/inflight 硬上限，复杂公平队列可后做。
 同/不同节点并发同 Channel；同 Slot/跨 Slot 不同 Channel，验证各自连续业务 seq。
 用真实进程覆盖 leader 丢失、重启、落后副本恢复与丢响应 identity 场景。
 Mock/unit 是补充，不能替代三进程 RF3 门槛。
-M1 报告列通过项、未解决失败及明确缺席的生产 TiKV/旧数据迁移。
+M1 报告列通过项、未解决失败及M1 不包含的生产 TiKV，以及当前范围明确排除的旧数据迁移。
 M1 正确性通过后继续 T3，不要求完整 DRR 或性能认证。
 
 ## 6. T3 — 真实 TiKV 交接与持久化证明
@@ -181,6 +188,7 @@ M1 正确性通过后继续 T3，不要求完整 DRR 或性能认证。
 | 输出 | 真实 TiKV 事务→确认 persisted proof→条件 authority cleanup |
 | 验收 | 保持跨 Channel 原子事务；精确 claim、crash/Unknown/stop/cleanup 门槛通过 |
 
+每个 TiKV 键使用 T0 冻结的隔离业务空间；这里的实时 persistence/Claim 交接针对新数据，不是旧系统迁移。
 保持跨 Channel 消息行与 persisted heads 在同一 TiKV 事务。
 不能静默按 Slot 拆事务。
 现 `collector.rs` 批次 claim 是原子的；改为逐 Slot claim 是 coordinator 合同变更。
@@ -217,21 +225,21 @@ SENDACK 等 committed + applied admission，不等 TiKV 或 RECV acknowledgment�
 Webhook 只在首次 acceptance，Replay 不再发送。
 所有 head/pending 消费者，包括 history、SYNC、join/read-point，都路由新 authority。
 History/SYNC accepted head + pending、group join accepted head 一并切换；group-version 读取与资格来源协调。
-其他 cache namespace 保持原 authority，不要求整体迁移泛 cache。
+legacy backend 可在独立旧空间保留作对照；新空间 authority 读写不能 fallback 到它。本范围更新不授权整 cache 退役代码。
 不能用旧 head/pending cache 读来决定新 Slot 状态。
 关闭先 fence ingress，在 persistence/delivery 依赖仍活着时 drain/join owned 业务 tasks，再保持 Slot 活着 flush writer，最后 join Slot/RPC/DB owners。
 报告未决工作/Unknown，不能强制假成功 flush 来结束关闭。
 M2 用新隔离业务 namespace/test data 与真实 TiKV 独立 oracle。
 不包含生产旧 namespace、部署或旧数据重写。
-Sandbox 可保守整节点故障/回滚，但必须记录，不证明生产 Slot 隔离。
+Sandbox 可保守整节点 startup cleanup/故障，但必须记录，不证明生产 Slot 隔离，也不允许丢弃新接纳数据。
 
-## 8. T5–T7 — 公平、可靠性与迁移就绪
+## 8. T5–T7 — 公平、可靠性与新空间就绪
 
 | 步骤 | 依赖与归属模块 | 输出与验收 |
 | --- | --- | --- |
 | T5 必要公平 | T4 真实 flow；Slot runtime/RPC/limits 与独立 load harness | 有界 RR、local/remote canonical-key 一致；hot/cold、字节倾斜、churn 与下层 reserve |
 | T6 隔离/可靠性 | T1 后可由独立通用底座 owner 开始 | Slot quarantine/recovery 与 observer 调查；共享 DB/manifest fatal 保持 node 级 |
-| T7 迁移/证据 | T4 状态合同 + T5/T6 门槛 | 全状态 fence 迁移演练与冻结目标验收；ready 不等于 deployed |
+| T7 新空间/证据 | T0 隔离合同 + T4 新状态合同 + T5/T6 门槛 | 新 namespace 初始化/隔离、错误旧 namespace 拒绝、新系统恢复与冻结目标验收；ready 不等于 deployed |
 
 T5 先限 active Channel 数/字节并做有界 RR，无需先完整 DRR。
 本地与远端目的入口验证相同 canonical key/cost/Slot identity。
@@ -248,11 +256,10 @@ M3 必须实施/测试永久 dedup 的长期恢复容量方案，如流式/分�
 不能只增 cap、假称已支持 streaming，或压缩删除唯一 authority 状态。
 未定位 observer assertion 分证调查，不能 suppress 换取通过。
 单 Slot 故障可 quarantine 并保持健康 Slot 服务；共享 DB/manifest 故障保持 node 级。
-T7 全量导出/导入 dedup/head/pending/flushstop/persisted progress/claims/Unknown，snapshot + tail 对账。
-切换前以 ownership epoch fence 旧 SEND、collector 与 read boundaries。
-不得直接改 Slot 数/hash、双跑 writer 或 error fallback 当迁移。
-新写前可 abort；新写后 rollback 必须新 epoch 下反向迁移。
-生产部署/切换是演练后另行授权动作。
+T7 验证新空间初始化、与旧读写方的完整 key/identity 隔离、旧格式/错误 namespace 拒绝，以及包含 dedup/head/pending/flushstop/persisted progress/claims/Unknown 的新系统完整 snapshot/log 恢复。
+不要求旧状态导出/导入或 fence 迁移演练。首次新接纳写入前可 abort；之后只能停服修复并以新格式恢复，不丢失新成功。
+固定 Slot 数/hash 不变；未来 H1 搬迁新 generation 数据须另设计 fence 全状态协议，不属于本次交付。
+生产部署/切换是这些门槛之后另行授权动作。
 目标运行前冻结吞吐、冷 tail、拒绝/Unknown 与资源阈值。
 区分监控故障与产品故障，保留原失败与历史收据。
 
@@ -282,7 +289,8 @@ T0 → T1 → T2 → T3 → T4 是实施关键路径。
 共享 ech0 `/Volumes/Space/2nterdigital/ech0-1delivery` 在文档合并后观察为 main；读取实际 branch/HEAD，不要 switch/reset/merge。
 选择如 `codex/admit-fsm` 的无冲突分支，exact dependency revision，单 manifest/lock/runtime integration owner。
 隔离旧锁定 OpenRaft 0.9.25（manifest semver 0.9.21）与新 alpha.30/fork `ea46d0e571f7497f1f549e125254dfcb2ff45e2e`，先完成 §2 源码/依赖前置检查，再进入 T0。
-实现确定性真实 Admit 与全部 authority 变更、真实三进程 RF3/多 Slot，再接新隔离 namespace 的真实 HTTP/WS + TiKV + delivery/read 闭环。
+实现确定性真实 Admit 与全部 authority 变更、真实三进程 RF3/多 Slot，再接全新 state 目录及实际隔离新业务空间的真实 HTTP/WS + TiKV + delivery/read 闭环。
+遵上述用户明确确认的 2026-10-17 范围：不兼容旧数据、不 import/backfill/migration/converter 或 legacy fallback；证明完整 key/identity/访问隔离，保留旧数据及全部新 generation 正确性/恢复/容量门槛。T7 是新空间初始化/隔离/恢复/目标验收，不是旧状态迁移。
 完整 DRR、client/#173 优化与性能 SLO 认证不是 M1/M2 正确性的前置。
 禁止 NULL/Unknown 回退 legacy、自动恢复未知写、writer 双写、生产旧数据重写或 online cutover。
 遵 T0–T4 合同与范围门槛，保留失败，报告精确源码/commands/counts/ignored/oracle/cleanup 证据。

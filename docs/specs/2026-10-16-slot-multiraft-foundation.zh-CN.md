@@ -5,11 +5,13 @@
 **日期：** 2026-10-16
 **状态：** 首验证版完成：76ce0dd 最终 workspace、新三进程 RF3 全部场景和 legacy 回归通过；历史 observer 风险保留为生产接入前事项。见[证据台账](../evidence/2026-10-16-slot-foundation.zh-CN.md)。
 
-本轮交付通过新通用 Slot API 服务多个固定 Slot 的三进程 RF3 可运行底座，使用 RocksDB 共识日志和具有快照/恢复能力的最小确定性测试 FSM。生产 ech0 Admit/TiKV 接入、旧数据迁移、在线 reshard 和容量认证留待后续。[可行性评估](./2026-10-16-slot-multiraft-feasibility.zh-CN.md)保留固定源码事实；[实施计划](../plans/2026-10-16-slot-multiraft-foundation.zh-CN.md)规定实施与证据门槛。
+本轮交付通过新通用 Slot API 服务多个固定 Slot 的三进程 RF3 可运行底座，使用 RocksDB 共识日志和具有快照/恢复能力的最小确定性测试 FSM。生产 ech0 Admit/TiKV 接入、在线 reshard 和容量认证留待后续；旧数据兼容/迁移不在当前确认范围。[可行性评估](./2026-10-16-slot-multiraft-feasibility.zh-CN.md)保留固定源码事实；[实施计划](../plans/2026-10-16-slot-multiraft-foundation.zh-CN.md)规定实施与证据门槛。
 
 保留的详细 [Channel 公平准入设计](./2026-10-16-slot-channel-fair-admission.zh-CN.md)与[实施计划](../plans/2026-10-16-slot-channel-fair-admission.zh-CN.md)尚未实现、尚未验证，保持固定 layout 与每 node 一个 RocksDB。历史 430-pass/A–F 证据及不同 Slot 冷请求的一次进展不能证明 Channel 公平性。
 
-当前执行以 [Admit 优先实施计划](../plans/2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级：先 T0–T2 真实 Admit（M1），再 T3–T4 claims/TiKV 与 HTTP/WS、delivery/history 隔离新空间（M2），再 T5 必要公平、T6 生产隔离/observer/snapshot 增长与 T7 迁移验收（M3）。下述生产门槛保留；M2 不认证生产就绪。旧公平计划 G6 的“先公平后 Admit”依赖已覆盖；原硬上界、身份、Unknown/deadline/ownership 与 read/control reserve 不后移。
+当前执行以 [Admit 优先实施计划](../plans/2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级：先 T0–T2 真实 Admit（M1），再 T3–T4 claims/TiKV 与 HTTP/WS、delivery/history 隔离新空间（M2），再 T5 必要公平、T6 生产隔离/observer/snapshot 增长与 T7 新空间初始化/隔离/恢复与目标验收（M3）。下述生产门槛保留；M2 不认证生产就绪。旧公平计划 G6 的“先公平后 Admit”依赖已覆盖；原硬上界、身份、Unknown/deadline/ownership 与 read/control reserve 不后移。
+
+**用户明确确认的范围更新 — 2026-10-17：** 使用全新 state 目录及实际隔离的新业务空间。旧数据兼容、旧 reader/decoder、双读/双写、import/backfill、迁移/converter 和反向迁移从交付删除，不是后延的必选前置。旧数据与共享 TiKV 原样保留，旧格式/错误 namespace 拒绝；空 RocksDB、epoch 标签或 TiKV head 不存在不证明隔离。[确认边界与 T0–T7 门槛](../plans/2026-10-17-slot-admit-first-implementation.zh-CN.md)要求完整 key/identity/访问隔离并阻止旧 writer、新写后新格式恢复、新 generation 全部正确性/容量门槛、HTTP/WS/鉴权协议保留，以及未来 H1 转移单独设计。不授权 cache 退役代码、D1/D5 实验或生产切换。
 
 ## 1. 基线与兼容性
 
@@ -17,7 +19,7 @@
 
 保留 C 的公开 FSM factory、owned runtime、精确 applied effects、绝对 deadline、dispatch 分类、每次独立原生 ReadIndex，以及异步 recovery proof/readiness gate。C/M/R 的历史检查只证明各自记录的源码，不证明整合树。
 
-采用独立新 data 目录，旧数据原样保留。新 Slot API 不承诺自动兼容旧 API、FileLog WAL、ech0 OpenRaft 0.9 数据或旧 snapshot。存在 RocksDB marker 但 DB 丢失时 fail closed，不能静默新建空历史。不支持的后端切换须另有迁移过程。
+采用独立新 data 目录，旧数据原样保留。新 Slot API 不承诺自动兼容旧 API、FileLog WAL、ech0 OpenRaft 0.9 数据或旧 snapshot。存在 RocksDB marker 但 DB 丢失时 fail closed，不能静默新建空历史。旧格式拒绝即可，不开发旧 decoder；新 generation 数据的 backend 变更须另设计恢复/转移，不属于本次交付。
 
 ## 2. 职责
 
@@ -28,7 +30,7 @@
 | RocksDB 日志后端 | 按组命名空间的 node-local 共识日志与 metadata、耐久 callback 所有权和 DB 生命周期 |
 | 测试 FSM | 确定性测试命令/结果、重复处理、查询及完整 snapshot/restore，用于底座验证 |
 | 未来 ech0 Admit FSM | 原子 dedup/seq/accepted head/pending/result，以及 flush 进度和 stop 状态 |
-| 未来 ech0 adapter / TiKV | 资格输入、长期消息事务 storage、投递、collector 与业务迁移合同 |
+| 未来 ech0 adapter / TiKV | 资格输入、长期消息事务 storage、投递、collector 与新空间初始化/恢复合同 |
 
 RocksDB 不是全部业务 FSM 状态库。复制 FSM 权威由 committed log + 已验证 snapshot 和 applied 位置恢复。effects 是响应，不是另一份耐久事实库。TiKV 继续承担长期消息事务 storage。
 
@@ -111,7 +113,7 @@ node 和 Slot 两级限制请求数量及 bytes，包括等待 dispatch/完成�
 
 未来有序 Admit 必须原子查询既有固定成功 dedup 结果，检查确定性准入输入、分配连续业务 seq 并更新 accepted head、pending 和 result。Raft index 不是业务 seq。保留 flush/stop、exact holder/revision、Unknown 与 fail-stop 合同。外部资格在 proposal 前读取，保留现有已接受 stale 语义；确定性 apply 不执行 TiKV/网络/时钟/随机 I/O。
 
-须在 fence 停旧 admission 与 collector 后，全量迁移 accepted head、pending、results、flush 及匹配 persisted progress。一次读取可能滞后的 TiKV head 不能初始化已有 Channel。不能偷改为只迁 head，也不能在按 Slot 分组 collector 时放宽跨 Channel TiKV 事务语义。
+按上述确认范围仅初始化实际隔离的新业务空间，不要求旧状态 export/import 或 fence 迁移。新 generation 的 snapshot/log 须保留完整 accepted head、pending、results、flush、claims 及匹配 persisted progress；滞后 TiKV head 不能初始化或恢复新 generation 已有 Channel。按 Slot 分组 collector 仍保留跨 Channel TiKV 事务语义，Claim/Flush 持久化交接不可省略。
 
 当前 command results 永久保留。本轮不授权 dedup TTL/GC、只存最高 seq、新拒绝结果保留政策或其他长期 dedup 变化。显式相同 ID 重试可取回原结果；Unknown 不授权自动重试。runtime 过载仍可能在到达 FSM 前拒绝。
 

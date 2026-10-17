@@ -10,7 +10,9 @@ The [old implementation plan](../plans/2026-10-16-slot-channel-fair-admission.md
 Historical 430-pass and A–F results retain their original scope; they do not validate this scheduler.
 One cold request progressing in a different Slot is not evidence of Channel fairness.
 
-The [Admit-first implementation plan](../plans/2026-10-17-slot-admit-first-implementation.md) T0–T7 order has highest execution priority and overrides the old G0–G6/H1 fairness-before-Admit order: M1 delivers real Admit, M2 connects claims/TiKV and HTTP/WS, delivery/history in isolated new namespaces, and T5 adds necessary fairness. Identity, budgets, Unknown/deadline/ownership, reserves and the complete lifecycle below remain binding; M1/M2 already require necessary hard bounds and read/control reserves. T6 production isolation, observer and snapshot-growth gates and T7 migration acceptance still precede production use. Full DRR, client NODELAY and #173 reruns are not M1/M2 prerequisites; retain existing necessary configuration.
+The [Admit-first implementation plan](../plans/2026-10-17-slot-admit-first-implementation.md) T0–T7 order has highest execution priority and overrides the old G0–G6/H1 fairness-before-Admit order: M1 delivers real Admit, M2 connects claims/TiKV and HTTP/WS, delivery/history in isolated new namespaces, and T5 adds necessary fairness. Identity, budgets, Unknown/deadline/ownership, reserves and the complete lifecycle below remain binding; M1/M2 already require necessary hard bounds and read/control reserves. T6 production isolation, observer and snapshot-growth gates and T7 fresh business namespace initialization/isolation and new-system prelaunch acceptance still precede production use. Full DRR, client NODELAY and #173 reruns are not M1/M2 prerequisites; retain existing necessary configuration.
+
+**2026-10-17 scope override (explicit user decision):** The new architecture admits only data in isolated fresh business namespaces and does not support old-system historical data. Legacy compatibility/import/backfill/dual reads/dual writes, old-to-new migration and its reverse-migration guarantees are removed from scope and are no longer T7 or production prerequisites. Preserve old data and historical evidence; do not delete old data or reset shared TiKV. Prove real keyspace/prefix isolation, complete key and ID ownership, and read/write isolation; a new SlotEpoch or empty RocksDB directory alone does not establish freshness. The concrete isolation mechanism remains to be designed; this scope change neither selects D1 nor approves PR #177 laboratory execution. M3 retains necessary fairness, Slot fault isolation, observer, snapshot growth and long-term new-data capacity/correctness acceptance. Recovery of the new system's own logs/snapshots, fixed results/seq/Unknown, claims/flush and durable handoff remain required. Preserve old data and historical evidence unchanged; the new architecture provides no compatibility entry point for reading or displaying old business data. Source dependencies and business wire/auth contracts remain unchanged (this change adjusts only data compatibility scope); old cache authority cannot be reduced directly to local KV, and retiring the whole cache remains a recommendation.
 
 ## 1. Scope and fixed constraints
 
@@ -18,7 +20,7 @@ Keep fixed `slot_count`, hash bytes/version, manifest identity and Slot-to-Group
 Keep one RocksDB database per node, using the default column family and group namespaces.
 Do not introduce a database per Slot, production Admit, resharding or write retries here.
 Slot fault containment and performance fairness are separate gates; neither proves the other.
-Historical observer risk, production Admit/TiKV migration and capacity gates remain open.
+Historical observer risk, production Admit/TiKV integration and long-term new-data capacity/correctness gates remain open.
 Fairness covers admitted, eligible requests by bounded selections (estimated cost if DRR is selected), not wall-clock bounds.
 A cold new-key SLO additionally requires protected ingress capacity and a declared load domain.
 
@@ -232,7 +234,9 @@ Consider isolation only when cold SLO/completion targets still fail and measurem
 contention in a group or shared storage after fair admission and capacity tuning.
 First consider whole-Slot leader placement/capacity within the legal fixed layout.
 There is no current public migration-control Interface; implement and verify one before use.
-Later versioned Channel overrides/dedicated groups require a separate complete migration design.
+Later versioned Channel overrides/dedicated groups require a separate complete migration design, outside first delivery.
+The following applies only to already-admitted new-architecture data: old writers/collectors
+mean the pre-move new-system owner, not historical single-group cache data to import.
 Move permanent dedup results, sequence/head/pending state, flush/stop state, persisted progress,
 claims and unresolved Unknown outcomes, not merely recent payloads.
 Freeze/fence old writers and collectors; checkpoint plus tail and reconciliation must converge
@@ -242,7 +246,7 @@ Never temporarily change the hash or silently reinterpret the existing manifest.
 A dedicated group cannot raise a single Channel's ordered execution upper bound.
 Shared-DB bottlenecks can cross Slots; future small storage groups or physical I/O isolation
 need separate design and validation, while keeping this phase's one-DB-per-node constraint.
-Old G6 real Admit/TiKV work is split into T1–T4 without waiting for G5 fairness evidence; historical observer, production Slot-local isolation and snapshot growth move to T6, full migration to T7, and remain preproduction gates. M2 uses isolated new namespaces only.
+Old G6 real Admit/TiKV work is split into T1–T4 without waiting for G5 fairness evidence; historical observer, production Slot-local isolation and snapshot growth move to T6, fresh business namespace initialization/isolation and prelaunch acceptance to T7, and remain preproduction gates. M2 uses isolated new namespaces only.
 
 ## 9. Reference scope
 

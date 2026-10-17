@@ -5,11 +5,13 @@
 **Date:** 2026-10-16
 **Status:** First verification version completed: final workspace checks, new three-process RF3 all-case acceptance and legacy regression passed at 76ce0dd. Historical observer risk remains open before production integration. See the [evidence ledger](../evidence/2026-10-16-slot-foundation.md).
 
-The delivery is a runnable three-process RF3 foundation serving multiple fixed Slots through a new generic Slot API. It uses RocksDB consensus logs and a minimal deterministic test FSM with snapshots and recovery. Production ech0 Admit/TiKV integration, old-data migration, online resharding and capacity certification are later work. The [feasibility assessment](./2026-10-16-slot-multiraft-feasibility.md) retains fixed-source facts; the [plan](../plans/2026-10-16-slot-multiraft-foundation.md) defines implementation and evidence gates.
+The delivery is a runnable three-process RF3 foundation serving multiple fixed Slots through a new generic Slot API. It uses RocksDB consensus logs and a minimal deterministic test FSM with snapshots and recovery. Production ech0 Admit/TiKV integration, online resharding and capacity certification are later work; old-data compatibility/migration is outside the confirmed current scope. The [feasibility assessment](./2026-10-16-slot-multiraft-feasibility.md) retains fixed-source facts; the [plan](../plans/2026-10-16-slot-multiraft-foundation.md) defines implementation and evidence gates.
 
 The retained detailed [Channel fair admission design](./2026-10-16-slot-channel-fair-admission.md) and [implementation plan](../plans/2026-10-16-slot-channel-fair-admission.md) are not implemented or verified. They preserve the fixed layout and one RocksDB per node. Historical 430-pass/A–F evidence and a different-Slot cold request progressing do not prove Channel fairness.
 
-The [Admit-first implementation plan](../plans/2026-10-17-slot-admit-first-implementation.md) has highest execution priority: T0–T2 real Admit (M1), then T3–T4 claims/TiKV and HTTP/WS, delivery/history in isolated new namespaces (M2), then T5 necessary fairness, T6 production isolation/observer/snapshot growth and T7 migration acceptance (M3). Production gates below remain; M2 does not certify production readiness. The old fair plan G6 fairness-before-Admit dependency is overridden; hard bounds, identity, Unknown/deadline/ownership and read/control reserves are not deferred.
+The [Admit-first implementation plan](../plans/2026-10-17-slot-admit-first-implementation.md) has highest execution priority: T0–T2 real Admit (M1), then T3–T4 claims/TiKV and HTTP/WS, delivery/history in isolated new namespaces (M2), then T5 necessary fairness, T6 production isolation/observer/snapshot growth and T7 fresh-space initialization/isolation/recovery and target acceptance (M3). Production gates below remain; M2 does not certify production readiness. The old fair plan G6 fairness-before-Admit dependency is overridden; hard bounds, identity, Unknown/deadline/ownership and read/control reserves are not deferred.
+
+**User-confirmed scope update — 2026-10-17:** Use fresh state directories and an actually isolated new business space. Old-data compatibility, old readers/decoders, dual reads/writes, import/backfill, migration/converter and reverse migration are removed from this delivery, not deferred prerequisites. Preserve old data and shared TiKV; reject old formats/wrong namespaces. Empty RocksDB, an epoch label or absent TiKV head does not prove isolation. The [confirmed boundaries and T0–T7 gates](../plans/2026-10-17-slot-admit-first-implementation.md) require complete key/identity/access isolation from old writers, new-format recovery after new writes, all new-generation correctness/capacity gates, unchanged HTTP/WS/auth protocols and separately scoped future H1 transfer. No cache-retirement code, D1/D5 experiment or production cutover is authorized.
 
 ## 1. Baseline and compatibility
 
@@ -17,7 +19,7 @@ Start from C `28e668b676c803838eb64a04ba160fb10ad88316`. Review and integrate ne
 
 Preserve C's public FSM factory, owned runtime, exact applied effects, absolute deadlines, dispatch classification, native per-call ReadIndex and asynchronous recovery proof/readiness gates. C/M/R historical checks are evidence only for their recorded source, not the combined tree.
 
-Use independent new data directories. Retain existing data untouched. The new Slot API has no automatic compatibility promise with old APIs, FileLog WAL, ech0 OpenRaft 0.9 data, or old snapshots. A RocksDB marker with missing database must fail closed rather than silently recreate an empty history. Unsupported backend changes require a separate migration procedure.
+Use independent new data directories. Retain existing data untouched. The new Slot API has no automatic compatibility promise with old APIs, FileLog WAL, ech0 OpenRaft 0.9 data, or old snapshots. A RocksDB marker with missing database must fail closed rather than silently recreate an empty history. Old formats are rejected without an old decoder; changing backends for new-generation data requires a separate recovery/transfer design outside this delivery.
 
 ## 2. Responsibilities
 
@@ -28,7 +30,7 @@ Use independent new data directories. Retain existing data untouched. The new Sl
 | RocksDB log backend | Node-local consensus entries and metadata in group namespaces; durable callback ownership and database lifetime |
 | Test FSM | Deterministic test command/result state, duplicate handling, query and complete snapshot/restore for foundation verification |
 | Future ech0 Admit FSM | Atomic dedup/seq/accepted head/pending/result, flush progress and stop state |
-| Future ech0 adapter / TiKV | Eligibility inputs, transactional long-term message storage, delivery, collector and application migration contracts |
+| Future ech0 adapter / TiKV | Eligibility inputs, transactional long-term message storage, delivery, collector and fresh-space initialization/recovery contracts |
 
 RocksDB is not the database for all business FSM state. Replicated FSM authority is reconstructed from committed log plus validated snapshot and applied position. Effects are responses, not an alternative durable state store. TiKV remains long-term message transaction storage.
 
@@ -111,7 +113,7 @@ Fixed Slot count still entails per-group Raft tasks, heartbeats, log and snapsho
 
 A future ordered Admit command must atomically consult fixed successful dedup results, check deterministic admission inputs, allocate continuous business seq and update accepted head, pending and result. Raft index is not business seq. Preserve flush/stop, exact holder/revision, Unknown and fail-stop contracts. External eligibility reads happen before proposal with the existing accepted stale semantics; deterministic apply performs no TiKV/network/time/random I/O.
 
-Full accepted head, pending, results, flush and matching persisted progress must migrate under a fence that stops old admission and collector work. Reading a possibly lagging TiKV head once is not initialization of an existing Channel. Do not silently narrow migration to head only or relax cross-Channel TiKV transaction semantics when grouping collector work by Slot.
+Initialize only an actually isolated fresh business space under the confirmed scope above; no old-state export/import or fenced migration is required. In the new generation, snapshots/logs must retain full accepted head, pending, results, flush, claims and matching persisted progress. A lagging TiKV head cannot initialize or recover an existing new-generation Channel. Preserve cross-Channel TiKV transaction semantics when grouping collector work by Slot; Claim/Flush persistence handoff is still required.
 
 Current command results are retained permanently. This delivery authorizes no dedup TTL/GC, highest-seq-only replacement, new rejection retention policy or other change to long-term dedup semantics. Explicit same-ID retry can recover the original result; Unknown is not permission for automatic retry. Admission runtime overload may still reject before the FSM is reachable.
 

@@ -9,9 +9,11 @@
 A–F 完成、workspace 430 passed、七项验收、原失败和未定位 observer 风险仍按[台账](../evidence/2026-10-16-slot-foundation.zh-CN.md)保留为历史事实。
 固定 Slot、持久化 hash/layout 和每 node 一个 RocksDB 保持为基线；本文不宣称已实现、性能通过或生产就绪。
 
+**2026-10-17 范围覆盖（用户已明确）：** 新架构只接纳独立新业务空间的数据，不兼容旧系统历史数据；旧数据兼容、导入、backfill、双读/双写、旧→新迁移及该迁移的反向迁移保障均取消，不再是 T7 或生产前置。旧数据及历史证据保留，不删除旧数据，不 reset 共享 TiKV。新空间须证明真实 keyspace/prefix、完整 key 与 ID 所有权以及读写隔离；仅新 SlotEpoch 或空 RocksDB 目录不能证明 freshness。具体隔离机制留待设计，本条不选 D1 方案、不批准 PR #177 实验室运行。M3 保留必要公平、Slot 故障隔离、observer、snapshot 增长及新数据长期容量正确性验收。新系统自产 log/snapshot 恢复、固定结果/seq/Unknown、claims/flush 与持久交接合同继续有效。旧数据及历史证据原样保留；新架构不提供读取或展示旧业务数据的兼容入口。源码依赖及业务 wire/auth 合同不变（本次仅调整数据兼容范围）；不能把旧 cache 权威直接降为本地 KV，整体 cache 退役仍仅为建议。
+
 ## 当前执行优先级与旧任务映射
 
-当前执行顺序以 [Admit 优先实施计划](./2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级：T0 合同来源冻结；T1 真实业务 FSM 与 T2 Slot RF3 adapter 构成 M1；T3 跨 Slot claims/TiKV 交接与 T4 HTTP/WS、delivery/history 的隔离新数据空间构成 M2；T5 必要的 Channel 有界公平与热冷验收、T6 生产故障隔离/observer/snapshot 增长、T7 迁移演练与目标验收构成 M3。M2 仅为隔离新命名空间验证，T6 仍是生产接入前门槛；此顺序不自动授权部署。完整 DRR、客户端 NODELAY 和 #173 复测均不是 M1/M2 前置，保留已有必要配置。
+当前执行顺序以 [Admit 优先实施计划](./2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级：T0 合同来源冻结；T1 真实业务 FSM 与 T2 Slot RF3 adapter 构成 M1；T3 跨 Slot claims/TiKV 交接与 T4 HTTP/WS、delivery/history 的隔离新数据空间构成 M2；T5 必要的 Channel 有界公平与热冷验收、T6 生产故障隔离/observer/snapshot 增长、T7 新业务空间初始化/隔离与新系统上线前验收构成 M3。M2 仅为隔离新命名空间验证，T6 仍是生产接入前门槛；此顺序不自动授权部署。完整 DRR、客户端 NODELAY 和 #173 复测均不是 M1/M2 前置，保留已有必要配置。
 
 G0–G6/H1 保留为详细包 ID，旧“公平证据先于真实 Admit”顺序已被覆盖；下述 G1–G5 的调度依赖仅适用于 T5 选用该详细包时。原身份、预算、Unknown、deadline、ownership 与各层 read/control reserve 约束持续有效，M1/M2 就须具备必要硬上界和完整生命周期。
 
@@ -20,8 +22,8 @@ G0–G6/H1 保留为详细包 ID，旧“公平证据先于真实 Admit”顺序
 | G0 | T0 冻结业务合同来源；调度 profile 在 T5 冻结 |
 | G1–G3 | 必要身份/预算/生命周期约束随 T1–T4 先落实；完整调度包在 T5 需要时按 G1 → G2 → G3 内部依赖实现 |
 | G4–G5 | T5 公平模型、热冷验收与可比报告；不阻塞 M1/M2 |
-| G6 | 真实 Admit、adapter、claims/TiKV 和业务链路拆至 T1–T4；生产隔离/observer/snapshot 增长归 T6，迁移归 T7；不再依赖 G5 才启动真实业务接入 |
-| H1 | T5 验收后按证据决定必要热点隔离，若需迁移仍遵守 T6/T7 生产门槛 |
+| G6 | 真实 Admit、adapter、claims/TiKV 和业务链路拆至 T1–T4；生产隔离/observer/snapshot 增长归 T6，新业务空间初始化/隔离与上线前验收归 T7；不再依赖 G5 才启动真实业务接入 |
+| H1 | T5 验收后按证据决定必要热点隔离；新系统已接纳数据的未来搬移须另行设计状态/fence/epoch 与安全回滚，不是首交付前置 |
 
 ## 1. 交付合同与集成顺序
 
@@ -112,13 +114,13 @@ G4 generator/accounting 可在 G0 后独立且分文件并行；candidate 负载
 每收据绑定 source/tree、binary/harness SHA、layout/hash、profile、limits、硬件/durability、进程身份与自有清理证据；保留失败及新数据。
 旧 different-Slot 单次进展断言不证明 same-Slot 公平、持续 cold SLO 或共享 DB 隔离。
 
-## 8. G6 — 后续 Admit 与生产接入
+## 8. G6 — 新业务空间 Admit 与生产接入
 
-- **目标：** 设计确定性 Admit，再通过全权威状态迁移接入生产 admission、persistence、delivery。
-- **当前依赖覆盖：** 真实 Admit/persistence/delivery 按 T1–T4 启动，不依赖公平证据；M2 仅使用隔离新命名空间。生产接入前仍须 T6 不压制断言地关闭 observer notification 风险、证明 Slot-local quarantine/recovery 与 snapshot 增长有界；DB/身份失败仍 node-wide，并须 T7 完整迁移验收。
-- **预计拥有：** 后续业务 Admit adapter/FSM、migration/collector 接入模块；具体仓库/文件在独立生产计划确定。
-- **完成标准：** 原子 dedup/seq/head/pending/result + flush/stop、永久成功结果重放、persisted progress/claims/Unknown 与既有跨 Channel TiKV 事务合同，经 restart 与 fenced migration 保留；不从滞后 TiKV head 初始化已有 Channel。
-- **状态 / 回滚：** Planned，未实现，未运行。fence 旧 admission/collector；checkpoint + tail 和校验先于切换；新写发生后回滚须状态迁移和新 epoch。
+- **目标：** 设计确定性 Admit，在隔离新业务空间接通生产 admission、persistence、delivery 和新数据完整生命周期。
+- **当前依赖覆盖：** 真实 Admit/persistence/delivery 按 T1–T4 启动，不依赖公平证据；M2 仅使用隔离新命名空间。生产接入前仍须 T6 不压制断言地关闭 observer notification 风险、证明 Slot-local quarantine/recovery 与 snapshot 增长有界；DB/身份失败仍 node-wide。T7 验证新业务空间初始化、完整 key/ID 所有权、真实存储读写隔离及新系统上线前验收，不要求旧历史数据导入或全迁。
+- **预计拥有：** 后续业务 Admit adapter/FSM、collector 与新空间初始化/隔离接入模块；具体仓库/文件在独立生产计划确定。
+- **完成标准：** 原子 dedup/seq/head/pending/result + flush/stop、永久成功结果重放、persisted progress/claims/Unknown 与既有跨 Channel TiKV 事务合同，在新数据生命周期及自产 log/snapshot restart/recovery 中保留。新 Channel 从经验证的新空间初始化；已有新系统 Channel 必须从自身持久权威状态恢复，不能从滞后 TiKV head 重建 seq。
+- **状态 / 回滚：** Planned，未实现，未运行。停新 intake，分类 queued，drain/报告 owned claims/flush 和未决 Unknown；保留新系统持久状态与自产 log/snapshot，恢复遵守自身 ownership/fence/epoch 合同。停止上线不授权清除旧数据或把新数据写回旧系统；无需旧→新反向迁移方案。
 
 RocksDB 保持本地共识 log/metadata，TiKV 为长期消息事务 storage；异步 delivery/TiKV 为接纳后并行路径，SENDACK 保持 committed + applied 接纳。
 observer 调查不阻塞 T0–T4 的隔离验证，但必须在 T6 关闭后才进入生产；G6 旧“生产 wiring”门槛不适用于 M2 的隔离新命名空间。
@@ -128,6 +130,6 @@ observer 调查不阻塞 T0–T4 的隔离验证，但必须在 T6 关闭后才�
 - **目标 / 依赖：** 健康、同硬件 baseline 与 fair candidate 仍违反冻结 profile 时，先归因 group-hot 执行或 node-wide DB/I/O 饱和，再选择隔离。
 - **预计拥有：** 未来决策/规范/实施计划；本轮无 routing/storage 代码。
 - **选项：** 调整整个 Slot 的 leader/放置（当前无公开操作，后续须明确实现验证），或 versioned routing override/dedicated group。单 hot Channel 仍受自身有序执行上限约束，不保证提升吞吐。
-- **迁移门槛：** 全量迁移 dedup/seq/head/pending/flush/stop、persisted progress/claims/Unknown；fence 旧 writer/collector；完整 checkpoint + tail + 校验后切 routing epoch。新写后回滚须 reverse migration 和新 epoch，不是改 hash 或双写。
+- **未来新系统数据搬移门槛（另行设计，非首交付）：** 此处旧 writer/collector 指搬移前的新系统 owner，不是旧单组 cache 历史数据。若搬移新架构已接纳的数据，须全量迁移 dedup/seq/head/pending/flush/stop、persisted progress/claims/Unknown；fence 旧 writer/collector；完整 checkpoint + tail + 校验后切 routing epoch。新写后回滚须 reverse migration 和新 epoch，不是改 hash 或双写。
 - **Storage 边界：** dedicated group 不解决 shared-DB 竞争；少量 storage group 或物理隔离须另行评审，当前保持每 node 一个 DB。
 - **状态 / 回滚：** Planned，仅设计评审，未实现，未运行。不接受无证隔离结论；另行验证迁移前保持固定 layout。

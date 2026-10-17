@@ -4,6 +4,12 @@
 **Date:** 2026-10-17
 **Status:** Execution plan only; no implementation, build, new test, SSH or load run in this delivery.
 
+**User-confirmed scope update — 2026-10-17:** Start this architecture with fresh state directories and an actually isolated new business data space. Old CacheKV/WAL/snapshots/RocksDB formats and old TiKV message heads, command results, pending/flush, Presence and read positions are not continued or made compatible. Old readers, dual reads/writes, legacy imports/backfills, migration tools, snapshot converters and returning new data to the old backend are outside this deliverable. Old-state migration engineering is removed from this delivery, not deferred as a mandatory backlog item. This replaces the former migration prerequisite, not correctness obligations for newly accepted data.
+
+Retain existing data unchanged; do not clear shared TiKV or reuse old directories/identities. Old formats or a wrong namespace fail closed; rejecting unsupported formats requires no old decoder. Empty RocksDB or a new `namespace_epoch` is only a label, not proof of a new business space; freeze actual keyspace/prefix or complete owned-ID isolation and access boundaries at T0, covering every used user, group, message, command-dedup, read-position, Presence and persisted-progress key. Old writers must be unable to write the new space. Absence of a TiKV head alone is insufficient. The concrete isolation mechanism remains an executor design gate; this scope decision approves no D1 mechanism.
+
+After the new system accepts writes, stop service and repair/recover using the new format if needed; do not resume new data on the old backend or discard new successes as rollback. Same-generation snapshot/log restart, fixed dedup/seq, Unknown, flush/timeouts and long-term recovery capacity remain hard gates. HTTP/WS and authentication/business protocols remain unchanged by the old-data exemption. Future H1 movement of the new system's own data still needs a separately designed fenced full-state protocol; it is outside current delivery and does not change fixed layout. This documentation scope acceptance authorizes no wholesale cache-retirement implementation, D1/D5 experiment or production cutover.
+
 ## 1. Adopted direction and replacement order
 
 Fixed Slot + Atomic Admit is the adopted long-term direction.
@@ -22,7 +28,7 @@ Ready for a milestone means its scoped gates passed; it does not authorize deplo
 | --- | --- | --- | --- |
 | M1 | T0–T2 | Pure business FSM and real three-OS-process RF3 multi-Slot admission | No production TiKV or old-data cutover |
 | M2 | T3–T4 | Real HTTP/WS, TiKV transactions/persisted proof, history/audience/delivery loop | New isolated business namespace; conservative whole-node fault behavior disclosed |
-| M3 | T5–T7 | Necessary fairness/hot-load evidence, Slot fault isolation, observer closure, migration rehearsal and target acceptance | Readiness evidence; production cutover remains a separate action |
+| M3 | T5–T7 | Necessary fairness/hot-load evidence, Slot fault isolation, observer closure, fresh-namespace initialization/isolation, new-system recovery and target acceptance | Readiness evidence; production cutover remains a separate action |
 
 First handoff: deliver an M1 report, then continue directly to M2 when its dependencies pass.
 Do not stop to reconfirm the already adopted architecture between these stages.
@@ -90,9 +96,10 @@ Freeze the following operation mapping against actual source before implementati
 | Stop affected admission | Stop command(s) | Per-Slot confirmed state; unrecorded outcomes explicitly reported |
 | Flush bookkeeping / barrier | Flush commands and barrier query | Applied authoritative state and shutdown ordering |
 | Head/pending/read-point lookup | Linear authority query | Readers use the selected backend; local watermark is not a linear barrier |
-| Existing legacy cache namespaces | Existing cache API | Continue their current contracts |
+| Retained legacy comparison backend | Existing cache API in its separate old space | No reads/writes or fallback for the fresh namespace |
 
 Freeze canonical Channel encoding, command identity, fingerprint, message/result fields, versioning and verdict codes.
+Reuse of business DTOs/protocol semantics and old codec source references is not an old on-disk decoder or hidden migration path.
 Source map at ech0 main: `crates/business/src/send/admission.rs` owns SendCommand/Outcome; resolve actual crate-prefixed paths at T0.
 State families in `record.rs`: head {head, stopped}; command identity → intent/msgid/seq; pending → msgid/command/sender/content; flush Idle/InFlight(holder)/Stopped(holder).
 Cache-entry metadata carries revision today; the new FSM must store an explicit equivalent version.
@@ -103,7 +110,7 @@ Define limits for Channels, retained result metadata, pending payload bytes, com
 If permanent result retention fills capacity, reject new commands without losing prior successful results.
 T0 records the new head/pending + group-version read set and every invalidation/version writer; prove existing qualification short-stale semantics are not widened.
 If one shared view is required, integrate the corresponding replicated version/control and its writers in this scope; do not leave an implicit split view.
-Document initialization proof and ownership epoch; no lagging TiKV-head import for previously admitted Channels.
+Document fresh-space initialization proof and ownership epoch using the confirmed scope above; no old-state import or lagging TiKV-head bootstrap.
 
 ## 4. T1 — Deterministic business FSM
 
@@ -147,8 +154,8 @@ Use the existing abstraction rather than inventing a second Slot runtime.
 Keep encoded command/query and per-apply effects at or below 128 KiB.
 Paginate large scans with a declared total budget and stable semantics; no unbounded snapshot/query response.
 Use linear reads for authority decisions; distinguish local progress/watermark inspection explicitly.
-A fresh Channel requires proof of no accepted state plus the applicable ownership fence.
-Existing Channels cannot start from an asynchronously persisted TiKV head.
+A fresh Channel requires actual fresh-space isolation proof plus the applicable ownership fence; empty RocksDB, an epoch label or an absent TiKV head alone is insufficient.
+Existing Channels in the new generation recover from the complete new snapshot/log basis, never an asynchronously persisted TiKV head or old data.
 Implement synchronous StateMachine apply/snapshot/restore, SlotStateMachine query and named Factory.validate_recovered.
 NativeDurable freeze_bounded defaults to Unsupported: implement construction-time bounds, not an allocation followed by a size check.
 Existing per-group full native snapshot cap is configurable 1–64 MiB; permanent dedup growth conflicts with that ceiling.
@@ -170,7 +177,7 @@ Exercise concurrent same-Channel ingress on the same and different nodes.
 Exercise different Channels in one Slot and across Slots; verify independent contiguous business seq.
 Run leader loss, process restart, lagging replica recovery and lost-response identity cases using real processes.
 Mocks/unit tests supplement this gate; they cannot replace the three-process RF3 gate.
-M1 report lists what passed, unresolved failures and the deliberately absent production TiKV/old-data migration.
+M1 report lists what passed, unresolved failures and production TiKV not covered by M1 and old-data migration excluded from current scope.
 Continue to T3 after M1 correctness passes; full DRR and performance certification are not prerequisites.
 
 ## 6. T3 — Real TiKV handoff and persisted proof
@@ -182,6 +189,7 @@ Continue to T3 after M1 correctness passes; full DRR and performance certificati
 | Output | Real TiKV transaction → confirmed persisted proof → conditional authoritative cleanup |
 | Acceptance | Existing cross-Channel atomic transaction maintained; exact claims, crash/Unknown/stop/cleanup gates pass |
 
+Use the T0-frozen isolated business space for every TiKV key; this live persistence/Claim handoff concerns new data, not old-system migration.
 Preserve message rows and persisted heads across Channels in the same TiKV transaction.
 Do not silently split a transaction by Slot.
 Existing `collector.rs` batch claims are atomic; changing to per-Slot claims is a coordinator contract change.
@@ -219,21 +227,21 @@ SENDACK waits for committed + applied admission, not TiKV persistence or RECV ac
 Webhook runs only for first acceptance; replay does not emit another webhook.
 Route every head/pending consumer, including history, SYNC and join/read-point operations, to the new authority.
 Route history/SYNC accepted head + pending and group-join accepted head; coordinate group-version reads with the qualification source.
-Other cache namespaces retain their authority; this does not require migrating the entire generic cache.
+Legacy backend comparison may remain in its separate old space; fresh-space authority readers/writers never fall back to it. This scope update does not authorize whole-cache retirement code.
 Do not let old head/pending cache reads determine decisions about new Slot state.
 Shutdown fences ingress, drains/joins owned business tasks while persistence/delivery dependencies remain live, flushes the writer while Slot is live, then joins Slot/RPC/DB owners.
 Report unresolved work/Unknown; never force a successful flush result to finish shutdown.
 M2 uses a new isolated business namespace/test data and a real TiKV independent oracle.
 No production old namespace, deployment or old-data rewrite belongs to this gate.
-Conservative node-level failure/rollback is acceptable in the sandbox if recorded; it does not certify production Slot isolation.
+Conservative node-level startup cleanup/failure is acceptable in the sandbox if recorded; it does not certify production Slot isolation or authorize discarding new accepted data.
 
-## 8. T5–T7 — Fairness, reliability and migration readiness
+## 8. T5–T7 — Fairness, reliability and fresh-space readiness
 
 | Task | Dependencies and owned modules | Output and acceptance |
 | --- | --- | --- |
 | T5 Necessary fairness | T4 real flow; Slot runtime/RPC/limits and separately owned load harness | Bounded RR and local/remote canonical-key parity; hot/cold, byte skew, churn and lower-layer reserves demonstrated |
 | T6 Isolation/reliability | May start after T1 with a separate generic foundation owner | Slot fault quarantine/recovery and observer investigation; shared DB/manifest fatal remains node-wide |
-| T7 Migration/evidence | T4 state contracts + T5/T6 gates | Full-state fenced migration rehearsal and frozen target acceptance; ready is not deployed |
+| T7 Fresh-space/evidence | T0 isolation contract + T4 new-state contracts + T5/T6 gates | Fresh-namespace initialization/isolation, wrong-old-namespace rejection, new-system recovery and frozen target acceptance; ready is not deployed |
 
 T5 first enforces active-Channel count/bytes and bounded RR; it need not implement full DRR first.
 Both local and remote destination ingress validate the same canonical key/cost/Slot identity.
@@ -250,11 +258,10 @@ M3 must implement/test a long-term recovery-capacity solution for permanent dedu
 Do not merely increase the cap, pretend streaming already exists or compress away unique authority state.
 Investigate the unresolved observer assertion with separate evidence; do not suppress it to pass tests.
 A fault scoped to one Slot may quarantine it while healthy Slots serve; shared DB/manifest faults remain node-wide.
-T7 exports/imports dedup, head, pending, flush/stop, persisted progress, claims and Unknown with snapshot + tail reconciliation.
-Fence old SEND, collector and read boundaries with an ownership epoch before cutover.
-Never migrate by changing Slot count/hash directly, dual-running writers or falling back on an error.
-Before new writes, abort is possible; after new writes, rollback requires reverse migration under a new epoch.
-Actual production deployment/cutover is a separate authorized action after the rehearsal.
+T7 validates fresh-space initialization, complete key/identity isolation from old readers/writers, rejection of old formats/wrong namespaces, and the new system's complete snapshot/log recovery including dedup, head, pending, flush/stop, persisted progress, claims and Unknown.
+No old-state export/import or fenced migration rehearsal is required. Before any new accepted write, startup may abort; afterwards only stop/repair/new-format recovery is allowed, without loss of new successes.
+Fixed Slot count/hash remain unchanged. Future H1 moving new-generation data requires its own fenced full-state design, outside this delivery.
+Actual production deployment/cutover is a separate authorized action after these gates.
 Freeze target throughput, cold tail, rejection/Unknown and resource thresholds before target runs.
 Separate monitoring failures from product failures; retain original failures and historical receipts.
 
@@ -284,7 +291,8 @@ Freeze ech0 main `1606f85fc787604057f2ff7829df291c9ddc857b` (code baseline remai
 The shared ech0 checkout at `/Volumes/Space/2nterdigital/ech0-1delivery` was observed on main after the documentation merge; read its actual branch/HEAD and do not switch/reset/merge it.
 Use a collision-free branch such as `codex/admit-fsm`, exact dependency revisions and one manifest/lock/runtime integration owner.
 Keep old locked OpenRaft 0.9.25 (manifest semver 0.9.21) and new alpha.30/fork `ea46d0e571f7497f1f549e125254dfcb2ff45e2e` isolated; complete the §2 source/dependency preliminaries before T0.
-Build real deterministic Admit + all authority mutations, real three-process RF3/multi-Slot admission, then real HTTP/WS + TiKV + delivery/read loop in a new isolated namespace.
+Build real deterministic Admit + all authority mutations, real three-process RF3/multi-Slot admission, then real HTTP/WS + TiKV + delivery/read loop in fresh state directories and an actually isolated new business space.
+Apply the user-confirmed 2026-10-17 scope above: no old-data compatibility, import/backfill/migration/converter or legacy fallback; prove complete key/identity/access isolation, preserve old data and all new-generation correctness/recovery/capacity gates. T7 is fresh-space initialization/isolation/recovery/target acceptance, not old-state migration.
 Full DRR, client/#173 optimization and performance SLO certification are not prerequisites for M1/M2 correctness.
 No NULL/Unknown fallback to legacy, automatic unknown-write recovery, writer dual-write, production old-data rewrite or online cutover.
 Follow T0–T4 contracts and scoped gates; retain failures and report exact source/commands/counts/ignored/oracle/cleanup evidence.

@@ -9,6 +9,8 @@
 
 当前后续执行以 [Admit 优先实施计划](./2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级，覆盖旧公平先于真实 Admit 的顺序；详见第 7 节。A–F 与历史证据保持原范围。
 
+**用户明确确认的范围更新 — 2026-10-17：** 使用全新 state 目录及实际隔离的新业务空间。旧数据兼容、旧 reader/decoder、双读/双写、import/backfill、迁移/converter 和反向迁移从交付删除，不是后延的必选前置。旧数据与共享 TiKV 原样保留，旧格式/错误 namespace 拒绝；空 RocksDB、epoch 标签或 TiKV head 不存在不证明隔离。[确认边界与 T0–T7 门槛](./2026-10-17-slot-admit-first-implementation.zh-CN.md)要求完整 key/identity/访问隔离并阻止旧 writer、新写后新格式恢复、新 generation 全部正确性/容量门槛、HTTP/WS/鉴权协议保留，以及未来 H1 转移单独设计。不授权 cache 退役代码、D1/D5 实验或生产切换。
+
 ## 1. 固定范围
 
 以 C `28e668b676c803838eb64a04ba160fb10ad88316` 为工作基线，吸收 M `44baed14b3717b6b6f5f7327790cc97299889e19` 必要改进，移植 R `d6a5dbbb6d2f1c68e9e8bddbbfca18f562c1185c` RocksDB 日志。交付新 Slot API、独立新 data 目录和可运行三进程 RF3 多 Slot 测试应用。旧数据保留，不承诺 API/WAL 自动兼容。
@@ -69,12 +71,12 @@ Slot 局部 runtime 故障隔离是生产接入前独立门槛。共享 DB 或 m
 
 ## 6. 后续边界
 
-生产接入先要求关闭证据台账记录的未定位 observer 间歇性风险，并可证明 Slot 局部隔离，以及保留原子 dedup/seq/head/pending/result + flush/stop 的确定性 Admit 设计。fence 旧 admission/collector 后全量迁移权威状态及 persisted progress，不能从滞后 TiKV head 启动已有 Channel。永久 command result 保留和跨 Channel TiKV 事务语义不能偷改。
+生产接入先要求关闭证据台账记录的未定位 observer 间歇性风险，并可证明 Slot 局部隔离，以及保留原子 dedup/seq/head/pending/result + flush/stop 的确定性 Admit 设计。按上述确认新空间范围初始化并证明隔离、拒绝旧格式/错误 namespace，以新 snapshot/log 恢复完整新 generation 权威状态/progress，不要求旧状态迁移；不能从滞后 TiKV head 启动新 generation 已有 Channel。永久 command result 保留和跨 Channel TiKV 事务语义不能偷改。
 
 RocksDB 继续只承担本地共识 log/metadata；TiKV 继续承担长期消息事务 storage。异步投递与异步 TiKV 是接纳后并行路径；SENDACK 是 committed + applied 接纳，不是 TiKV 或 RECV 确认。这些合同约束下一阶段，本底座不实现该阶段。
 
 ## 7. 可执行后续顺序
 
-当前执行顺序以 [Admit 优先实施计划](./2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级：T0 合同来源冻结；T1 真实业务 FSM 与 T2 Slot RF3 adapter 构成 M1；T3 跨 Slot claims/TiKV 交接与 T4 HTTP/WS、delivery/history 的隔离新数据空间构成 M2；T5 必要的 Channel 有界公平与热冷验收、T6 生产故障隔离/observer/snapshot 增长、T7 迁移演练与目标验收构成 M3。M2 仅为隔离新命名空间验证，T6 仍是生产接入前门槛；此顺序不自动授权部署。完整 DRR、客户端 NODELAY 和 #173 复测均不是 M1/M2 前置，保留已有必要配置。
+当前执行顺序以 [Admit 优先实施计划](./2026-10-17-slot-admit-first-implementation.zh-CN.md) 为最高优先级：T0 合同来源冻结；T1 真实业务 FSM 与 T2 Slot RF3 adapter 构成 M1；T3 跨 Slot claims/TiKV 交接与 T4 HTTP/WS、delivery/history 的隔离新数据空间构成 M2；T5 必要的 Channel 有界公平与热冷验收、T6 生产故障隔离/observer/snapshot 增长、T7 新空间初始化/隔离、新系统恢复与目标验收构成 M3。M2 仅为隔离新命名空间验证，T6 仍是生产接入前门槛；此顺序不自动授权部署。完整 DRR、客户端 NODELAY 和 #173 复测均不是 M1/M2 前置，保留已有必要配置。
 
-旧 [Channel 公平准入计划](./2026-10-16-slot-channel-fair-admission.zh-CN.md)的 G0–G6/H1 ID 保留供引用，其“先公平后 Admit”依赖已由新计划覆盖。G1–G3 仅在 T5 需要该详细实现包时按旧内部依赖推进；G6 的真实 Admit/persistence/delivery 工作提前拆至 T1–T4，不等待 G5 公平证据。故障隔离与 observer 关闭归 T6，完整迁移归 T7；H1 仍是有证据时才考虑的后续热点隔离。M1/M2 先保留硬上界、身份校验、deadline/Unknown/ownership 与 read/control reserve，公平后移不取消这些合同。A–F 与历史证据保持原范围。
+旧 [Channel 公平准入计划](./2026-10-16-slot-channel-fair-admission.zh-CN.md)的 G0–G6/H1 ID 保留供引用，其“先公平后 Admit”依赖已由新计划覆盖。G1–G3 仅在 T5 需要该详细实现包时按旧内部依赖推进；G6 的真实 Admit/persistence/delivery 工作提前拆至 T1–T4，不等待 G5 公平证据。故障隔离与 observer 关闭归 T6；T7 验证新空间初始化/隔离、错误旧 namespace 拒绝、新系统恢复与冻结目标。旧全状态迁移从交付删除；H1 仍为单独后续热点隔离决策，搬迁新 generation 数据须另设计 fence 全状态协议。M1/M2 先保留硬上界、身份校验、deadline/Unknown/ownership 与 read/control reserve，公平后移不取消这些合同。A–F 与历史证据保持原范围。
