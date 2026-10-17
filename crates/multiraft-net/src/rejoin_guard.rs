@@ -6,12 +6,16 @@
 //! wiped voter once acknowledged. While armed, inbound `Vote` requests are dropped
 //! (handled like packet loss: no reply, never a grant).
 //!
-//! Anchor: the `leader_commit` of the first AppendEntries received after startup.
-//! An InstallSnapshot raises it to at least the snapshot's last log index. Before
-//! any leader message the anchor is unset and every vote is dropped. The guard
-//! releases, permanently, once Raft metrics report `applied >= anchor`.
+//! Anchor: the maximum `leader_commit` over every AppendEntries received while
+//! the guard is armed; an InstallSnapshot raises it to at least the snapshot's
+//! last log index. Taking the maximum (not only the first message) means an
+//! early message from a deposed leader with a lower commit cannot lower the
+//! target. Before any leader message the anchor is unset and every vote is
+//! dropped. The guard releases, permanently, once Raft metrics report
+//! `applied >= anchor` as read at check time. When a vote is actually needed
+//! (no live leader) the anchor stops moving, so release stays reachable.
 //!
-//! The state is three atomics per Group; release is evaluated lazily when a vote
+//! The state is two atomics per Group; release is evaluated lazily when a vote
 //! arrives (or when owned startup recovery completes), with no background task.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -55,29 +59,16 @@ impl RejoinGuard {
         decode(self.anchor.load(Ordering::Acquire))
     }
 
-    /// Record the first observed AppendEntries `leader_commit` (set once).
+    /// Raise the anchor to an AppendEntries `leader_commit` (monotonic maximum).
     pub(crate) fn observe_append(
         &self,
         node: NodeId,
         group: GroupId,
         leader_commit: Option<&LogId>,
     ) {
-        if !self.is_armed() {
-            return;
-        }
         // A leader without a commit carries no recovery target; keep dropping.
-        let Some(commit) = leader_commit else {
-            return;
-        };
-        let encoded = commit.index.saturating_add(1);
-        if self
-            .anchor
-            .compare_exchange(UNSET, encoded, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            tracing::debug!(target: "multiraft::rejoin_guard", node_id = node, group_id = group,
-                phase = "anchor", source = "append_entries", anchor_index = commit.index,
-                "rejoin vote guard anchored on first observed leader commit");
+        if let Some(commit) = leader_commit {
+            self.raise(node, group, commit.index, "append_entries");
         }
     }
 
@@ -88,22 +79,31 @@ impl RejoinGuard {
         group: GroupId,
         last_log_id: Option<&LogId>,
     ) {
-        if !self.is_armed() {
-            return;
-        }
-        let Some(last) = last_log_id else {
-            return;
-        };
-        let encoded = last.index.saturating_add(1);
-        let previous = self.anchor.fetch_max(encoded, Ordering::AcqRel);
-        if previous < encoded {
-            tracing::debug!(target: "multiraft::rejoin_guard", node_id = node, group_id = group,
-                phase = "anchor", source = "install_snapshot", anchor_index = last.index,
-                previous_index = decode(previous), "rejoin vote guard anchor raised by snapshot");
+        if let Some(last) = last_log_id {
+            self.raise(node, group, last.index, "install_snapshot");
         }
     }
 
-    /// Release the guard when `applied >= anchor`; returns whether it is released.
+    /// Monotonic raise; logs only when the anchor actually increases.
+    fn raise(&self, node: NodeId, group: GroupId, index: u64, source: &'static str) {
+        if !self.is_armed() {
+            return;
+        }
+        let encoded = index.saturating_add(1);
+        // Cheap pre-check keeps the steady-state heartbeat a single load.
+        if self.anchor.load(Ordering::Acquire) >= encoded {
+            return;
+        }
+        let previous = self.anchor.fetch_max(encoded, Ordering::AcqRel);
+        if previous < encoded {
+            tracing::debug!(target: "multiraft::rejoin_guard", node_id = node, group_id = group,
+                phase = "anchor", source, anchor_index = index,
+                previous_index = decode(previous), "rejoin vote guard anchor raised");
+        }
+    }
+
+    /// Release the guard when `applied >= anchor` (anchor read now); returns
+    /// whether it is released. Release is permanent.
     pub(crate) fn try_release(&self, node: NodeId, group: GroupId, applied: Option<u64>) -> bool {
         if !self.is_armed() {
             return true;
@@ -172,12 +172,7 @@ mod tests {
         guard.observe_append(1, 7, None);
         assert!(!guard.try_release(1, 7, Some(100)), "no commit carried");
         guard.observe_append(1, 7, Some(&log(10)));
-        guard.observe_append(1, 7, Some(&log(20)));
-        assert_eq!(
-            guard.anchor(),
-            Some(10),
-            "first leader commit is the anchor"
-        );
+        assert_eq!(guard.anchor(), Some(10));
         assert!(!guard.try_release(1, 7, None));
         assert!(!guard.try_release(1, 7, Some(9)));
         assert!(guard.try_release(1, 7, Some(10)));
@@ -191,13 +186,39 @@ mod tests {
         guard.observe_snapshot(1, 7, Some(&log(30)));
         assert_eq!(guard.anchor(), Some(30));
         guard.observe_append(1, 7, Some(&log(12)));
-        assert_eq!(guard.anchor(), Some(30), "append never lowers a set anchor");
+        assert_eq!(guard.anchor(), Some(30), "a lower commit never lowers it");
         guard.observe_snapshot(1, 7, Some(&log(25)));
         assert_eq!(guard.anchor(), Some(30));
         guard.observe_snapshot(1, 7, Some(&log(40)));
         assert_eq!(guard.anchor(), Some(40));
         assert!(!guard.try_release(1, 7, Some(39)));
         assert!(guard.try_release(1, 7, Some(40)));
+    }
+
+    #[test]
+    fn later_higher_leader_commit_raises_anchor_and_blocks_release() {
+        let guard = RejoinGuard::armed();
+        // e.g. a deposed leader's stale commit arrives first
+        guard.observe_append(1, 7, Some(&log(10)));
+        assert_eq!(guard.anchor(), Some(10));
+        // the current leader's higher commit raises the target
+        guard.observe_append(1, 7, Some(&log(25)));
+        assert_eq!(guard.anchor(), Some(25));
+        assert!(
+            !guard.try_release(1, 7, Some(10)),
+            "applied at the stale commit must not release"
+        );
+        assert!(!guard.try_release(1, 7, Some(24)));
+        // a lower commit afterwards never lowers the anchor
+        guard.observe_append(1, 7, Some(&log(12)));
+        assert_eq!(guard.anchor(), Some(25));
+        assert!(!guard.try_release(1, 7, Some(24)));
+        assert!(guard.try_release(1, 7, Some(25)));
+        // once released, later commits are ignored and it stays released
+        guard.observe_append(1, 7, Some(&log(99)));
+        assert_eq!(guard.anchor(), Some(25));
+        assert!(!guard.is_armed());
+        assert!(guard.try_release(1, 7, Some(0)));
     }
 
     #[test]

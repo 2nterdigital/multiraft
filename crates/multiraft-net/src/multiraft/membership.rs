@@ -23,9 +23,10 @@ impl<S: StateMachine> MultiRaft<S> {
     /// raft and never calls `initialize` on either transport; the Group can only
     /// be caught up by an existing leader. When the local storage is pristine
     /// (voter role), the inbound rejoin vote guard is armed before the Group is
-    /// published and drops vote requests until the first observed leader commit
+    /// published and drops vote requests until the highest observed leader commit
     /// is applied. Await [`Self::wait_for_recovery`] before serving: on an empty
-    /// log it completes only after that first leader commit has been applied.
+    /// log it completes only after the first observed leader commit is applied
+    /// (the guard itself releases once applied covers the highest one).
     /// An already-registered Group is left unchanged (its guard is not re-armed).
     pub async fn create_group_with_policy(
         &self,

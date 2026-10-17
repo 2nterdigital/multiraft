@@ -11,7 +11,7 @@ use openraft::vote::RaftLeaderId;
 /// preferred initializer immediately, others after the grace fallback).
 /// `Forbidden` never initializes: the Group may only be caught up by an existing
 /// leader (log or snapshot). A Forbidden-started **pristine** voter also arms the
-/// inbound rejoin vote guard until it has applied the first observed leader
+/// inbound rejoin vote guard until it has applied the highest observed leader
 /// commit. Persisted local state never initializes and never arms the guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InitializePolicy {
@@ -103,8 +103,11 @@ impl<S: StateMachine> MultiRaft<S> {
     /// Forbidden pristine recovery: wait until applied covers the first observed
     /// leader commit. Native `wait_for_recovery` on an empty log pins its target to
     /// the first `cluster_committed`, which only AppendEntries `leader_commit`
-    /// sets; the guard anchor (same message, or a snapshot lower bound) must be
-    /// covered too. On success the guard is released.
+    /// sets; then applied must also cover the guard anchor as read at that point
+    /// (maximum observed leader commit or snapshot lower bound). Release is then
+    /// attempted once against the current anchor; if a newer commit raised it,
+    /// the guard releases lazily on a later vote check. Startup never chases a
+    /// moving commit, so its budget stays bounded.
     pub(crate) async fn wait_for_rejoin_recovery(
         &self,
         group: GroupId,
