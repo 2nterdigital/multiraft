@@ -12,7 +12,9 @@ use multiraft_core::StartupProvenance;
 use openraft::alias::{LogIdOf, VoteOf};
 use openraft::entry::RaftEntry;
 use openraft::RaftTypeConfig;
-use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    Direction, InfoLogger, IteratorMode, LogLevel, Options, WriteBatch, WriteOptions, DB,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 mod storage;
@@ -121,6 +123,43 @@ where
     /// Open or create the engine. Unknown or missing schema on a nonempty DB is an error.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::open_with_sync_all(path, false)
+    }
+
+    /// Open an existing engine strictly for inspection, e.g. a pre-start
+    /// [`Self::startup_provenance`] probe. Nothing under `path` is created,
+    /// locked or written: RocksDB opens read-only (the WAL is replayed in
+    /// memory) and its info log is discarded instead of writing `LOG` files.
+    /// A missing database is an error. Mutating methods ([`Self::group`]) fail.
+    /// The engine must not be concurrently written by another owner.
+    pub fn open_read_only(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        // The binding creates the directory before opening; refuse first.
+        if !path.join("CURRENT").is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "RocksDB Raft log database not found",
+            ));
+        }
+        let mut options = Options::default();
+        options.set_info_logger(InfoLogger::new_callback_logger(LogLevel::Header, |_, _| {}));
+        let db = DB::open_for_read_only(&options, path, false).map_err(db_error)?;
+        match db.get(SCHEMA_KEY).map_err(db_error)? {
+            Some(value) if value == SCHEMA => {}
+            Some(_) => return Err(invalid("unknown rocks log schema")),
+            None => {
+                if let Some(row) = db.iterator(IteratorMode::Start).next() {
+                    row.map_err(db_error)?;
+                    return Err(invalid("missing rocks log schema in nonempty engine"));
+                }
+            }
+        }
+        Ok(Self {
+            engine: Arc::new(Engine {
+                db,
+                gates: Mutex::new(HashMap::new()),
+            }),
+            config: PhantomData,
+        })
     }
 
     /// Select fsync (`true`) instead of fdatasync for synchronous WAL writes.

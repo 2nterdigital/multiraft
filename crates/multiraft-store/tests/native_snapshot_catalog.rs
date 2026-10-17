@@ -564,3 +564,93 @@ fn concurrent_same_content_discard_cannot_remove_published_generation() {
         assert_eq!(generation_count(dir.path()), 1);
     }
 }
+
+fn tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                stack.push(entry.path());
+                out.push((entry.path(), 0, Vec::new()));
+            } else {
+                out.push((
+                    entry.path(),
+                    meta.len(),
+                    std::fs::read(entry.path()).unwrap(),
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn probe_provenance_matches_startup_classification_without_cleanup() {
+    use multiraft_core::StartupProvenance;
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = SnapshotCatalog::new(dir.path(), 1);
+    assert_eq!(
+        catalog.probe_provenance(42, 1024).unwrap(),
+        StartupProvenance::Pristine
+    );
+    assert!(!dir.path().join("42").exists());
+    catalog.publish_native(42, &meta(19), b"old", 1024).unwrap();
+    // An inert candidate is exactly what startup cleanup would delete.
+    // Leave an unowned inert candidate (as after a crash): keep a copy of a
+    // staged generation, drop the stage (which deletes it), restore the copy.
+    let active = std::fs::read_dir(dir.path().join("42/native-v1"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect::<BTreeSet<_>>();
+    let staged = catalog.stage_native(42, &meta(25), b"new", 1024).unwrap();
+    let generation = std::fs::read_dir(dir.path().join("42/native-v1"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| !active.contains(p.file_name().unwrap()))
+        .unwrap();
+    let copy = dir.path().join("copy");
+    std::fs::create_dir(&copy).unwrap();
+    for file in ["data.bin", "native-meta.json"] {
+        std::fs::copy(generation.join(file), copy.join(file)).unwrap();
+    }
+    drop(staged);
+    assert!(!generation.exists());
+    std::fs::create_dir(&generation).unwrap();
+    for file in ["data.bin", "native-meta.json"] {
+        std::fs::rename(copy.join(file), generation.join(file)).unwrap();
+    }
+    std::fs::remove_dir(&copy).unwrap();
+    let before = tree(dir.path());
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("42/native-v1"))
+            .unwrap()
+            .count(),
+        3,
+        "active.json, the active generation and one inert candidate: {before:?}"
+    );
+    let probe = SnapshotCatalog::new(dir.path(), 1);
+    assert_eq!(
+        probe.probe_provenance(42, 1024).unwrap(),
+        StartupProvenance::Persisted
+    );
+    assert_eq!(
+        probe.probe_provenance(7, 1024).unwrap(),
+        StartupProvenance::Pristine
+    );
+    assert_eq!(before, tree(dir.path()), "probe must not mutate");
+    assert_eq!(
+        SnapshotCatalog::new(dir.path(), 1)
+            .startup_provenance(42, 1024)
+            .unwrap(),
+        StartupProvenance::Persisted
+    );
+    assert_ne!(before, tree(dir.path()), "startup classification cleans up");
+    // Unknown namespaces fail closed in both variants.
+    std::fs::create_dir(dir.path().join("9")).unwrap();
+    std::fs::write(dir.path().join("9").join("mystery"), b"unknown").unwrap();
+    assert!(probe.probe_provenance(9, 1024).is_err());
+}

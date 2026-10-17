@@ -274,3 +274,105 @@ async fn snapshot_purge_can_advance_past_tail_then_accept_only_contiguous_suffix
         2
     );
 }
+
+/// Every path, its type, length, mtime and bytes; equal before/after means untouched.
+fn tree(
+    root: &std::path::Path,
+) -> Vec<(
+    std::path::PathBuf,
+    bool,
+    u64,
+    std::time::SystemTime,
+    Vec<u8>,
+)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = entry.metadata().unwrap();
+            let path = entry.path();
+            let bytes = if meta.is_dir() {
+                stack.push(path.clone());
+                Vec::new()
+            } else {
+                std::fs::read(&path).unwrap()
+            };
+            out.push((
+                path,
+                meta.is_dir(),
+                meta.len(),
+                meta.modified().unwrap(),
+                bytes,
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn read_only_open_classifies_like_read_write_without_touching_files() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("raft-rocksdb");
+    assert!(RocksLogDb::<TypeConfig>::open_read_only(&path).is_err());
+    assert!(!path.exists(), "read-only open must not create a database");
+    {
+        let db = RocksLogDb::<TypeConfig>::open(&path).unwrap();
+        let mut written = db.group(1).unwrap();
+        db.group(2).unwrap();
+        written.blocking_append(entries(1, 0..3)).await.unwrap();
+    }
+    let before = tree(root.path());
+    let db = RocksLogDb::<TypeConfig>::open_read_only(&path).unwrap();
+    assert_eq!(
+        db.startup_provenance(1).unwrap(),
+        StartupProvenance::Persisted
+    );
+    assert_eq!(
+        db.startup_provenance(2).unwrap(),
+        StartupProvenance::Pristine
+    );
+    assert_eq!(
+        db.startup_provenance(3).unwrap(),
+        StartupProvenance::Pristine
+    );
+    assert!(
+        db.group(3).is_err(),
+        "read-only engine cannot create a namespace"
+    );
+    drop(db);
+    assert_eq!(before, tree(root.path()));
+    // The read-write classification agrees.
+    let db = RocksLogDb::<TypeConfig>::open(&path).unwrap();
+    assert_eq!(
+        db.startup_provenance(1).unwrap(),
+        StartupProvenance::Persisted
+    );
+    assert_eq!(
+        db.startup_provenance(2).unwrap(),
+        StartupProvenance::Pristine
+    );
+}
+
+#[test]
+fn read_only_open_rejects_unknown_or_missing_schema() {
+    let root = tempfile::tempdir().unwrap();
+    mutate(root.path(), |db| db.put(b"schema", b"other").unwrap());
+    assert_eq!(
+        RocksLogDb::<TypeConfig>::open_read_only(root.path())
+            .err()
+            .unwrap()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+    let root = tempfile::tempdir().unwrap();
+    mutate(root.path(), |db| db.put(b"unrelated", b"row").unwrap());
+    assert_eq!(
+        RocksLogDb::<TypeConfig>::open_read_only(root.path())
+            .err()
+            .unwrap()
+            .kind(),
+        ErrorKind::InvalidData
+    );
+}
