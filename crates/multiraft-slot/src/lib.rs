@@ -27,11 +27,17 @@ pub mod limits;
 pub mod rpc;
 pub mod runtime;
 pub mod runtime_error;
+pub mod startup;
 pub mod status;
 pub use limits::{
     Inflight, InflightStatus, SlotLimits, MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES,
 };
+pub use multiraft_core::StartupProvenance;
 pub use multiraft_net::{AppliedView, ObservedLogId};
+pub use multiraft_net::{
+    GroupStartupReport, InitializeDisposition, InitializePolicy, StartupPhase, StartupReport,
+};
 pub use runtime::{SlotApplied, SlotHandle, SlotNodeConfig, SlotNodeOwner, SlotStateMachine};
 pub use runtime_error::{MaintenanceFailure, RuntimeError};
+pub use startup::{ProbeError, SlotStartupPlan, BOOTSTRAP_GRACE_RANGE, MAX_RECOVERY_TIMEOUT};
 pub use status::{ShutdownReport, SlotStatus};

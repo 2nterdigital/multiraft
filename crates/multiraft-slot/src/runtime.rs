@@ -1,6 +1,7 @@
 //! Owned fixed-slot runtime. Handles retain no idle native or listener resources.
 use crate::limits::{Budget, MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES};
-use crate::runtime_error::native;
+use crate::runtime_error::{native, startup_failure};
+use crate::startup::{local_voter_slots, SlotStartupPlan};
 use crate::{
     ClusterLayout, InflightStatus, NodeId, RuntimeError, ShutdownReport, SlotId, SlotLimits,
     SlotManifest, SlotStatus,
@@ -10,7 +11,8 @@ use multiraft_core::{ClusterConfig, LogStorageBackend, NodeRole, SnapshotMode};
 use multiraft_fsm::StateMachine;
 use multiraft_net::{
     application_rpc::{ApplicationRpcConfig, ApplicationRpcHandle, ApplicationRpcOwner},
-    GroupConfig, NodeOwner, RuntimeConfig, RuntimeHandle, StateMachineFactory,
+    GroupConfig, NodeOwner, RuntimeConfig, RuntimeHandle, StartupBatch, StartupGroup,
+    StartupReport, StateMachineFactory,
 };
 use std::{
     path::PathBuf,
@@ -26,6 +28,9 @@ use tokio::{
     time::Instant,
 };
 
+/// Bound for confirming native release after a failed startup.
+const CLEANUP: Duration = Duration::from_secs(60);
+
 /// Application-owned query semantics. Callbacks must be bounded and nonblocking.
 /// Applications validate that command/query payload identity agrees with the routing key.
 pub trait SlotStateMachine: StateMachine {
@@ -40,6 +45,10 @@ pub struct SlotNodeConfig {
     /// fields are checked against the verified manifest before opening the node.
     pub native: ClusterConfig,
     pub limits: SlotLimits,
+    /// Per-slot initialize policy, bootstrap grace and recovery budget for the
+    /// native preference startup. The default allows initialization on every
+    /// slot with a 1000 ms grace; see [`SlotStartupPlan`].
+    pub startup: SlotStartupPlan,
 }
 impl SlotNodeConfig {
     pub fn new(layout: ClusterLayout, node_id: NodeId, data_dir: impl Into<PathBuf>) -> Self {
@@ -58,13 +67,20 @@ impl SlotNodeConfig {
             data_dir,
             native,
             limits: SlotLimits::default(),
+            startup: SlotStartupPlan::default(),
         }
     }
-    fn validate(&self) -> Result<(), RuntimeError> {
+    pub(crate) fn validate(&self) -> Result<(), RuntimeError> {
         self.limits.validate()?;
         self.layout
             .node(self.node_id)
             .map_err(|_| RuntimeError::InvalidConfig)?;
+        if !self
+            .startup
+            .validate(&local_voter_slots(&self.layout, self.node_id))
+        {
+            return Err(RuntimeError::InvalidConfig);
+        }
         let c = &self.native;
         let peers: Vec<_> = self
             .layout
@@ -113,6 +129,7 @@ impl std::fmt::Debug for SlotApplied {
 
 pub struct SlotNodeOwner<S: SlotStateMachine> {
     shared: Arc<Shared<S>>,
+    startup: StartupReport,
 }
 pub struct SlotHandle<S: SlotStateMachine> {
     shared: Weak<Shared<S>>,
@@ -150,6 +167,21 @@ pub(crate) struct Shared<S: SlotStateMachine> {
     runtime: tokio::runtime::Handle,
 }
 impl<S: SlotStateMachine> SlotNodeOwner<S> {
+    /// Verify or create the slot manifest, start the native node, bring up all
+    /// local voter slots with one native `start_groups_with_preference` batch
+    /// (see [`SlotStartupPlan`]), then start the application RPC listener.
+    ///
+    /// Returns after local recovery of every voter slot, which is neither
+    /// quorum nor leader readiness. The batch's per-group budget is the plan's
+    /// `recovery_timeout` clamped to the time left before `deadline`, counted
+    /// from each group's native registration.
+    ///
+    /// # Errors
+    ///
+    /// Any group failing or timing out fails the whole start with
+    /// [`RuntimeError::StartupFailed`] carrying the native cause; everything
+    /// already started (groups, listener, database) is released first. No
+    /// retry or fallback beyond the native grace is attempted.
     pub async fn start(
         config: SlotNodeConfig,
         factory: impl StateMachineFactory<S>,
@@ -163,25 +195,74 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             SlotManifest::open_or_create(&config.data_dir, &config.layout, config.node_id)
                 .map_err(|_| RuntimeError::ManifestMismatch)?;
         let layout = manifest.layout().clone();
-        let groups = layout
+        let mut groups = Vec::new();
+        for assignment in layout
             .config()
             .slots
             .iter()
             .filter(|a| a.voters.contains(&config.node_id))
-            .map(|a| GroupConfig {
-                group_id: layout.group_for_slot(a.slot).expect("validated slot"),
-                voters: a.voters.clone(),
-            })
-            .collect();
+        {
+            let group = GroupConfig {
+                group_id: layout
+                    .group_for_slot(assignment.slot)
+                    .map_err(|_| RuntimeError::InvalidConfig)?,
+                voters: assignment.voters.clone(),
+            };
+            groups.push(
+                StartupGroup::new(group, Some(assignment.preferred_initializer))
+                    .with_initialize(config.startup.policy(assignment.slot)),
+            );
+        }
         let mut cluster = config.native;
         // Source the native compatibility domain from the disk-verified layout.
         cluster.raft_transport_fingerprint = Some(manifest.layout_digest().0);
-        let mut runtime = RuntimeConfig::new(cluster, groups);
+        // Groups are declared by the batch below, never by the owner itself.
+        let mut runtime = RuntimeConfig::new(cluster, Vec::new());
         // The Slot budget is the public limit, native admission remains independently bounded.
         runtime.max_inflight = config.limits.global_requests;
         let native_owner = NodeOwner::start(runtime, factory, deadline)
             .await
             .map_err(|e| native(e, false))?;
+        let startup = if groups.is_empty() {
+            // A router-only node hosts no voter slot and has nothing to recover.
+            StartupReport {
+                input_digest: Some(manifest.layout_digest().0),
+                node_id: config.node_id,
+                configuration_verified: false,
+                groups: Vec::new(),
+            }
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let recovery_timeout = config.startup.recovery_timeout.min(remaining);
+            if recovery_timeout.is_zero() {
+                let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(RuntimeError::Deadline);
+            }
+            let batch = StartupBatch {
+                // Opaque native correlation; the layout digest identifies the cohort input.
+                input_digest: Some(manifest.layout_digest().0),
+                groups,
+                grace: config.startup.bootstrap_grace,
+                recovery_timeout,
+            };
+            // On failure the native batch already fenced and released the owner;
+            // shutting it down here only confirms that release before returning.
+            match native_owner
+                .handle()
+                .start_groups_with_preference(batch)
+                .await
+            {
+                Ok(report) => report,
+                Err(failure) => {
+                    let error = startup_failure(&layout, &failure);
+                    let cleanup = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                    tracing::warn!(target: "multiraft_slot::startup", node_id = config.node_id,
+                        error = %failure, cleanup_confirmed = cleanup.is_ok(),
+                        "slot native preference startup failed; owner released");
+                    return Err(error);
+                }
+            }
+        };
         let shared = Arc::new(Shared {
             native: native_owner.handle(),
             budget: Budget::new(config.limits, layout.slot_count()),
@@ -221,9 +302,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         let (rpc_owner, rpc_handle) = match result {
             Ok(rpc) => rpc,
             Err(_) => {
-                let _ = native_owner
-                    .shutdown(Instant::now() + Duration::from_secs(60))
-                    .await;
+                let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
                 return Err(RuntimeError::Unavailable);
             }
         };
@@ -232,7 +311,12 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             native: native_owner,
             rpc: rpc_owner,
         });
-        Ok(Self { shared })
+        Ok(Self { shared, startup })
+    }
+    /// Local native startup facts of every voter slot: provenance, initialize
+    /// disposition, fallback and phase. Neither quorum nor leader readiness.
+    pub fn startup_report(&self) -> &StartupReport {
+        &self.startup
     }
     pub fn handle(&self) -> SlotHandle<S> {
         SlotHandle {

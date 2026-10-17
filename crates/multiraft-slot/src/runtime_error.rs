@@ -1,4 +1,5 @@
 //! Bounded errors shared by local callers and the versioned application protocol.
+use crate::{ClusterLayout, SlotId};
 use serde::{Deserialize, Serialize};
 
 /// Stable, bounded native maintenance rejection facts.
@@ -45,6 +46,20 @@ pub enum RuntimeError {
     Maintenance(MaintenanceFailure),
     #[error("slot task panicked; runtime fenced")]
     TaskPanicked,
+    /// Native preference startup failed and the partially started node was
+    /// released. Local-only: `SlotNodeOwner::start` returns it; it is never
+    /// produced by an application RPC. `cause` is the bounded native failure
+    /// text including its source chain.
+    #[error("slot startup failed: slot={slot:?} phase={phase} outcome_unknown={outcome_unknown}: {cause}")]
+    StartupFailed {
+        /// Slot whose group failed, when the native report names one.
+        slot: Option<SlotId>,
+        /// Native startup phase code, e.g. `native_wait`.
+        phase: String,
+        /// Whether initialization or peer-visible effects may have happened.
+        outcome_unknown: bool,
+        cause: String,
+    },
 }
 impl RuntimeError {
     pub fn outcome_unknown(&self) -> bool {
@@ -86,5 +101,42 @@ pub(crate) fn native(error: multiraft_net::RuntimeError, write: bool) -> Runtime
         }
         _ if write => RuntimeError::Unknown,
         _ => RuntimeError::Unavailable,
+    }
+}
+
+/// Bound on [`RuntimeError::StartupFailed::cause`].
+const MAX_CAUSE_BYTES: usize = 2048;
+
+pub(crate) fn startup_failure(
+    layout: &ClusterLayout,
+    failure: &multiraft_net::StartupFailure,
+) -> RuntimeError {
+    use multiraft_net::StartupRejection as R;
+    match failure.rejection {
+        Some(R::InvalidInput) => return RuntimeError::InvalidConfig,
+        Some(R::Closed) => return RuntimeError::Closed,
+        Some(R::Busy | R::OwnerNotEmpty) | None => {}
+    }
+    let mut cause = failure.to_string();
+    let mut source = std::error::Error::source(&failure.source);
+    while let Some(error) = source {
+        cause.push_str(": ");
+        cause.push_str(&error.to_string());
+        source = error.source();
+    }
+    if cause.len() > MAX_CAUSE_BYTES {
+        let mut end = MAX_CAUSE_BYTES;
+        while !cause.is_char_boundary(end) {
+            end -= 1;
+        }
+        cause.truncate(end);
+    }
+    RuntimeError::StartupFailed {
+        slot: failure
+            .group_id
+            .and_then(|group| layout.slot_for_group(group).ok()),
+        phase: failure.phase.code().to_owned(),
+        outcome_unknown: failure.outcome_unknown,
+        cause,
     }
 }
