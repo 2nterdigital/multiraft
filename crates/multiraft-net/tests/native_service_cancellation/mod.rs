@@ -75,6 +75,7 @@ async fn cancelled_service_waiter_does_not_admit_another_native_install() {
             group_id: 7,
             raft: raft.clone(),
             state_machine: sm.clone(),
+            rejoin_guard: Default::default(),
         },
     )])));
     let service = Arc::new(RaftServiceImpl {

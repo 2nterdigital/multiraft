@@ -23,6 +23,7 @@ use openraft::error::Infallible;
 use openraft::Config;
 
 use crate::network::NetworkFactory;
+use crate::rejoin_guard::RejoinGuard;
 use crate::router::NodeMessage;
 use crate::router::NodeRx;
 use crate::router::NodeTx;
@@ -79,6 +80,7 @@ impl<S: StateMachine> Node<S> {
             group_id,
             raft,
             state_machine,
+            rejoin_guard: Arc::new(RejoinGuard::disarmed()),
         };
         self.groups.lock().unwrap().insert(group_id, app);
     }
@@ -143,10 +145,15 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
         response_tx,
     } = msg;
 
-    let (raft, state_machine) = {
+    let (node_id, raft, state_machine, guard) = {
         let g = groups.lock().unwrap();
         match g.get(&group_id) {
-            Some(app) => (app.raft.clone(), app.state_machine.clone()),
+            Some(app) => (
+                app.node_id,
+                app.raft.clone(),
+                app.state_machine.clone(),
+                app.rejoin_guard.clone(),
+            ),
             None => {
                 let _ = response_tx.send(RaftReply::MissingGroup);
                 return;
@@ -155,8 +162,18 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
     };
 
     let reply = match call {
-        RaftCall::Vote(req) => RaftReply::Vote(raft.vote(req).await),
-        RaftCall::Append(req) => RaftReply::Append(raft.append_entries(req).await),
+        RaftCall::Vote(req) => {
+            if !guard.admit_vote(group_id, &raft) {
+                // Packet loss: drop the reply channel; the sender sees Unreachable.
+                drop(response_tx);
+                return;
+            }
+            RaftReply::Vote(raft.vote(req).await)
+        }
+        RaftCall::Append(req) => {
+            guard.observe_append(node_id, group_id, req.leader_commit.as_ref());
+            RaftReply::Append(raft.append_entries(req).await)
+        }
         RaftCall::Snapshot { vote, meta, data } => {
             // Deferral belongs to transport ingress: returning a storage error
             // from the SM worker would fatally stop this native Group.
@@ -174,6 +191,7 @@ async fn handle_node_message<S: StateMachine>(groups: GroupMap<S>, msg: NodeMess
                 ))));
                 return;
             }
+            guard.observe_snapshot(node_id, group_id, meta.last_log_id.as_ref());
             let snapshot = Snapshot {
                 meta,
                 snapshot: Cursor::new(data),
@@ -202,6 +220,8 @@ pub struct GroupApp<S: StateMachine> {
     pub group_id: GroupId,
     pub raft: Raft<S>,
     pub state_machine: StateMachineStore<S>,
+    /// Inbound vote guard for a Forbidden-started pristine voter; disarmed otherwise.
+    pub rejoin_guard: Arc<RejoinGuard>,
 }
 
 pub async fn create_node<S, F>(

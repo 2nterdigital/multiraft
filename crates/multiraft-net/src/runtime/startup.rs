@@ -4,11 +4,36 @@ mod operation;
 use super::*;
 pub use multiraft_core::{InitializeDisposition, StartupProvenance};
 
+pub use crate::multiraft::InitializePolicy;
+
 /// One local declaration; preference changes initialization order only.
 #[derive(Debug, Clone)]
 pub struct StartupGroup {
     pub group: GroupConfig,
     pub preferred_initializer: Option<NodeId>,
+    /// `Allowed` (default) keeps native pristine initialization and grace
+    /// fallback. `Forbidden` skips both: a pristine Group waits until it has
+    /// applied the first observed leader commit (bounded by the batch
+    /// `recovery_timeout`) and arms the inbound rejoin vote guard meanwhile.
+    pub initialize: InitializePolicy,
+}
+
+impl StartupGroup {
+    /// Declaration with the default [`InitializePolicy::Allowed`].
+    pub fn new(group: GroupConfig, preferred_initializer: Option<NodeId>) -> Self {
+        Self {
+            group,
+            preferred_initializer,
+            initialize: InitializePolicy::Allowed,
+        }
+    }
+
+    /// Replace the initialize policy.
+    #[must_use]
+    pub fn with_initialize(mut self, initialize: InitializePolicy) -> Self {
+        self.initialize = initialize;
+        self
+    }
 }
 /// Opt-in batch on an empty owner. All registration precedes any initialization.
 #[derive(Debug, Clone)]

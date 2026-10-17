@@ -10,17 +10,41 @@ use openraft::raft::TransferLeaderResponse;
 
 use crate::decode;
 use crate::encode;
+use crate::rejoin_guard::RejoinGuard;
 use multiraft_core::typ::*;
+use multiraft_core::GroupId;
+use multiraft_core::NodeId;
 use multiraft_fsm::StateMachine;
 use multiraft_store::Raft;
 
-pub async fn vote<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
-    let res = raft.vote(decode(req)).await;
-    encode(res)
+/// Identity and rejoin guard of the local Group serving an inbound call.
+pub struct Inbound<'a> {
+    pub node_id: NodeId,
+    pub group_id: GroupId,
+    pub guard: &'a RejoinGuard,
 }
 
-pub async fn append<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
-    let res = raft.append_entries(decode(req)).await;
+/// `None` means the rejoin guard dropped the request (no reply, never a grant).
+pub async fn vote<S: StateMachine>(
+    raft: &Raft<S>,
+    req: &[u8],
+    inbound: Inbound<'_>,
+) -> Option<Vec<u8>> {
+    if !inbound.guard.admit_vote(inbound.group_id, raft) {
+        return None;
+    }
+    let res = raft.vote(decode(req)).await;
+    Some(encode(res))
+}
+
+pub async fn append<S: StateMachine>(raft: &Raft<S>, req: &[u8], inbound: Inbound<'_>) -> Vec<u8> {
+    let req: AppendEntriesRequest = decode(req);
+    inbound.guard.observe_append(
+        inbound.node_id,
+        inbound.group_id,
+        req.leader_commit.as_ref(),
+    );
+    let res = raft.append_entries(req).await;
     encode(res)
 }
 
@@ -30,6 +54,7 @@ pub async fn snapshot<S: StateMachine>(
     raft: &Raft<S>,
     req: &[u8],
     cap: usize,
+    inbound: Inbound<'_>,
 ) -> Result<Vec<u8>, tonic::Status> {
     let (vote, snapshot_meta, snapshot_data) =
         decode_snapshot_request(req, cap).map_err(|error| match error {
@@ -40,6 +65,11 @@ pub async fn snapshot<S: StateMachine>(
                 tonic::Status::invalid_argument("invalid native snapshot encoding")
             }
         })?;
+    inbound.guard.observe_snapshot(
+        inbound.node_id,
+        inbound.group_id,
+        snapshot_meta.last_log_id.as_ref(),
+    );
     let snapshot = Snapshot {
         meta: snapshot_meta,
         snapshot: Cursor::new(snapshot_data),

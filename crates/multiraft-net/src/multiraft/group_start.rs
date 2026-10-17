@@ -2,9 +2,12 @@
 use super::*;
 
 impl<S: StateMachine> MultiRaft<S> {
+    /// `rejoin_guard` is installed with the Group, so an armed guard is in force
+    /// before any peer can reach the published Group.
     pub(super) async fn spawn_local_group(
         &self,
         group: GroupId,
+        rejoin_guard: crate::RejoinGuard,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
         self.ensure_node_log().await?;
         // Every admitted mode is manual-only. Native protocol snapshots still
@@ -292,6 +295,7 @@ impl<S: StateMachine> MultiRaft<S> {
                     group_id: group,
                     raft: raft.clone(),
                     state_machine: state_machine_store,
+                    rejoin_guard: Arc::new(rejoin_guard),
                 },
             );
             registered_at = tokio::time::Instant::now();

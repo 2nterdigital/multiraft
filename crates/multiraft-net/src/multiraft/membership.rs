@@ -13,6 +13,26 @@ impl<S: StateMachine> MultiRaft<S> {
     /// **Standby:** local node may be absent from `members` (voters only). Spawns
     /// the local raft without calling `initialize`; join via [`Self::add_standby`].
     pub async fn create_group(&self, group: u64, members: &[u64]) -> Result<(), MultiRaftError> {
+        self.create_group_with_policy(group, members, InitializePolicy::Allowed)
+            .await
+    }
+
+    /// [`Self::create_group`] with an explicit [`InitializePolicy`].
+    ///
+    /// `Allowed` is exactly [`Self::create_group`]. `Forbidden` spawns the local
+    /// raft and never calls `initialize` on either transport; the Group can only
+    /// be caught up by an existing leader. When the local storage is pristine
+    /// (voter role), the inbound rejoin vote guard is armed before the Group is
+    /// published and drops vote requests until the first observed leader commit
+    /// is applied. Await [`Self::wait_for_recovery`] before serving: on an empty
+    /// log it completes only after that first leader commit has been applied.
+    /// An already-registered Group is left unchanged (its guard is not re-armed).
+    pub async fn create_group_with_policy(
+        &self,
+        group: u64,
+        members: &[u64],
+        policy: InitializePolicy,
+    ) -> Result<(), MultiRaftError> {
         if members.is_empty() {
             return Err(MultiRaftError::Other(anyhow::anyhow!(
                 "create_group requires at least one member"
@@ -30,10 +50,18 @@ impl<S: StateMachine> MultiRaft<S> {
 
         let needs_spawn = !self.groups.lock().unwrap().contains_key(&group);
         if needs_spawn {
-            self.spawn_local_group(group).await?;
+            let guard = match policy {
+                InitializePolicy::Allowed => crate::RejoinGuard::disarmed(),
+                InitializePolicy::Forbidden => {
+                    self.ensure_node_log().await?;
+                    let provenance = self.local_provenance(group)?;
+                    self.rejoin_guard_for(group, policy, provenance)
+                }
+            };
+            self.spawn_local_group(group, guard).await?;
         }
 
-        if is_standby {
+        if is_standby || policy == InitializePolicy::Forbidden {
             // Learner: wait for leader `add_learner`; do not initialize.
             return Ok(());
         }

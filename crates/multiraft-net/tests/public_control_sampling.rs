@@ -244,6 +244,7 @@ async fn start_node(
             group_id: group,
             raft: raft.clone(),
             state_machine,
+            rejoin_guard: Default::default(),
         },
     );
     RawNode {

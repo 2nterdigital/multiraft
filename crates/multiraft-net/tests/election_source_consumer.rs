@@ -525,6 +525,7 @@ async fn twenty_group_burst_reports_source_coverage_and_releases_all_resources()
                     voters: vec![1, 2, 3],
                 },
                 preferred_initializer: Some(id % 3 + 1),
+                initialize: multiraft_net::InitializePolicy::Allowed,
             })
             .collect(),
         grace: Duration::from_millis(500),

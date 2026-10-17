@@ -4,8 +4,8 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use multiraft_core::{ClusterConfig, FileLogSyncLevel, MultiRaftError};
 use multiraft_fsm::{ApplyOut, GroupId, StateMachine};
 use multiraft_net::{
-    FsmFactoryContext, GroupConfig, NodeOwner, RuntimeConfig, RuntimeError, RuntimeHandle,
-    StartupBatch, StartupGroup, StateMachineFactory,
+    FsmFactoryContext, GroupConfig, InitializePolicy, NodeOwner, RuntimeConfig, RuntimeError,
+    RuntimeHandle, StartupBatch, StartupGroup, StateMachineFactory,
 };
 use std::{
     fs::{self, OpenOptions},
@@ -165,6 +165,15 @@ pub fn batch(
     preferred: Option<u64>,
     budget: Duration,
 ) -> StartupBatch {
+    batch_with_policy(groups, voters, preferred, budget, InitializePolicy::Allowed)
+}
+pub fn batch_with_policy(
+    groups: &[u64],
+    voters: &[u64],
+    preferred: Option<u64>,
+    budget: Duration,
+    initialize: InitializePolicy,
+) -> StartupBatch {
     StartupBatch {
         input_digest: Some([7; 32]),
         groups: groups
@@ -175,6 +184,7 @@ pub fn batch(
                     voters: voters.to_vec(),
                 },
                 preferred_initializer: preferred,
+                initialize,
             })
             .collect(),
         grace: GRACE,

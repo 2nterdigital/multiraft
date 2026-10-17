@@ -100,6 +100,7 @@ mod local;
 mod startup;
 pub use local::LocalGroupStatus;
 pub(crate) use startup::digest_label;
+pub use startup::InitializePolicy;
 mod maintenance;
 mod membership;
 mod read;

@@ -662,6 +662,7 @@ async fn recovering_native_group_refuses_peers_without_invoking_fatal_sm_guard()
                 group_id: 7,
                 raft: raft.clone(),
                 state_machine: sm.clone(),
+                rejoin_guard: Default::default(),
             },
         )])));
         let port = address();

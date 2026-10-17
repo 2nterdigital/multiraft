@@ -55,6 +55,7 @@ async fn oversized_inprocess_snapshot_does_not_enter_native_install() {
             group_id: 7,
             raft: raft.clone(),
             state_machine: sm,
+            rejoin_guard: Default::default(),
         },
     )])));
     let router = Router::new();
