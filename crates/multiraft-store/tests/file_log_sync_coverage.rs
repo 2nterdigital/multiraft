@@ -345,38 +345,70 @@ fn data_sync_group_commit_batches_one_fdatasync() {
     });
 }
 
+/// Timed group-commit holds a whole overlapping burst until the coalesce tick
+/// and flushes it as one batch. On tokio's paused clock virtual time advances
+/// only when every task is idle, so the 512 appends are all enqueued before the
+/// first tick can fire, independent of CPU or fsync speed: completion at exactly
+/// one window proves both "held until the timer" (not earlier) and "one window
+/// covers the burst" (not a later window). Wall-clock bounds measured machine
+/// load instead (the burst can straddle a tick, fdatasync can take 100+ ms).
 #[test]
 fn hold_overlap_stress_batch() {
-    use std::time::Instant;
-    TypeConfig::run(async {
-        let dir = temp_dir("hold-stress");
-        let stream = multiraft_store::FileLogStreamOptions {
-            stream_buf_bytes: 64 * 1024 * 1024,
-            stream_flush_ms: 0,
-            hold_overlap: true,
-        };
-        let store =
-            FileLogStoreOf::open_with_full_options(&dir, 50_000, FileLogSyncLevel::Data, stream)
-                .unwrap();
-        let n = 512u64;
-        let t0 = Instant::now();
-        let futs = (1..=n).map(|i| {
+    let window = Duration::from_millis(50);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let dir = temp_dir("hold-stress");
+            let stream = multiraft_store::FileLogStreamOptions {
+                stream_buf_bytes: 64 * 1024 * 1024,
+                stream_flush_ms: 0,
+                hold_overlap: true,
+            };
+            let store = FileLogStoreOf::open_with_full_options(
+                &dir,
+                u64::try_from(window.as_micros()).unwrap(),
+                FileLogSyncLevel::Data,
+                stream,
+            )
+            .unwrap();
+            let n = 512u64;
+            let t0 = tokio::time::Instant::now();
+            let futs = (1..=n).map(|i| {
+                let mut s = store.clone();
+                async move {
+                    s.blocking_append(vec![blank(i)]).await.unwrap();
+                    tokio::time::Instant::now()
+                }
+            });
+            let completed = join_all(futs).await;
+            for done in &completed {
+                assert_eq!(
+                    done.duration_since(t0),
+                    window,
+                    "every append of the burst completes at the first coalesce tick"
+                );
+            }
             let mut s = store.clone();
-            async move { s.blocking_append(vec![blank(i)]).await }
+            let state = s.get_log_state().await.unwrap();
+            assert_eq!(state.last_log_id.map(|x| x.index()), Some(n));
+            drop((s, store));
+            let mut reopened =
+                FileLogStoreOf::open_with_options(&dir, 0, FileLogSyncLevel::Data).unwrap();
+            assert_eq!(
+                reopened
+                    .get_log_state()
+                    .await
+                    .unwrap()
+                    .last_log_id
+                    .map(|x| x.index()),
+                Some(n),
+                "the single batch is durable"
+            );
+            let _ = fs::remove_dir_all(&dir);
         });
-        for r in join_all(futs).await {
-            r.unwrap();
-        }
-        let elapsed = t0.elapsed();
-        println!(
-            "hold_stress n={n} elapsed_ms={:.1}",
-            elapsed.as_secs_f64() * 1000.0
-        );
-        // One timer window should cover the burst (plus fdatasync).
-        assert!(elapsed >= Duration::from_millis(40), "got {elapsed:?}");
-        assert!(elapsed < Duration::from_millis(200), "too slow {elapsed:?}");
-        let _ = fs::remove_dir_all(&dir);
-    });
 }
 
 #[test]
