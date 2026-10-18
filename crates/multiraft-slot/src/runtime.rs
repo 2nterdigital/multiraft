@@ -45,6 +45,8 @@ pub struct SlotNodeConfig {
     /// fields are checked against the verified manifest before opening the node.
     pub native: ClusterConfig,
     pub limits: SlotLimits,
+    /// Optional dial catalog and local binds; excluded from persistent identity.
+    pub transport: Option<crate::SlotTransportConfig>,
     /// Bootstrap grace and recovery budget for the native preference startup;
     /// default 1000 ms grace and 30 s budget. See [`SlotStartupPlan`].
     pub startup: SlotStartupPlan,
@@ -66,11 +68,19 @@ impl SlotNodeConfig {
             data_dir,
             native,
             limits: SlotLimits::default(),
+            transport: None,
             startup: SlotStartupPlan::default(),
         }
     }
     fn validate(&self) -> Result<(), RuntimeError> {
         self.limits.validate()?;
+        if let Some(transport) = &self.transport {
+            transport.validate(&self.layout)?;
+        }
+        // Slot owns transport overrides, rather than accepting hidden native overrides.
+        if self.native.transport.is_some() {
+            return Err(RuntimeError::InvalidConfig);
+        }
         self.layout
             .node(self.node_id)
             .map_err(|_| RuntimeError::InvalidConfig)?;
@@ -210,6 +220,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             });
         }
         let mut cluster = config.native;
+        cluster.transport = config.transport.as_ref().map(|t| t.native());
         // Source the native compatibility domain from the disk-verified layout.
         cluster.raft_transport_fingerprint = Some(manifest.layout_digest().0);
         // Groups are declared by the batch below, never by the owner itself.
@@ -286,7 +297,18 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             .filter(|n| n.node_id != config.node_id)
             .map(|n| (n.node_id, n.application_rpc))
             .collect();
-        let rpc_config = ApplicationRpcConfig::new(config.node_id, address, peers);
+        let mut rpc_config = ApplicationRpcConfig::new(config.node_id, address, peers);
+        if let Some(transport) = config.transport {
+            rpc_config.listen_address = transport.application_rpc_bind;
+            rpc_config.dial_addresses = Some(
+                transport
+                    .nodes
+                    .into_iter()
+                    .filter(|n| n.node_id != config.node_id)
+                    .map(|n| (n.node_id, n.application_rpc))
+                    .collect(),
+            );
+        }
         let result = ApplicationRpcOwner::start(
             rpc_config,
             Arc::new(crate::rpc::Handler {

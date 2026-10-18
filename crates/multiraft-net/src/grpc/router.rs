@@ -221,6 +221,10 @@ impl GrpcRouter {
             config.node_id,
             StandbyThrottle::from_config(config),
         );
+        if let Some(transport) = &config.transport {
+            router.transport.channels =
+                GrpcPeerChannelPool::with_dial_addresses(transport.peers.clone());
+        }
         router.transport.snapshot_cap = config.max_snapshot_bytes;
         router.transport.fingerprint = config.raft_transport_fingerprint;
         router

@@ -41,3 +41,6 @@ pub use error::{
     NativeFailure, ProposalError, ProposalFailure, ReadIndexFailure, RecoveryError,
     RecoveryFailure, RecoveryStage,
 };
+
+mod transport;
+pub use transport::{valid_dial_address, validate_dial_catalog, RaftTransportConfig};

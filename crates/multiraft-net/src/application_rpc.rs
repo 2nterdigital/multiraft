@@ -28,6 +28,8 @@ pub struct ApplicationRpcConfig {
     pub local_node_id: NodeId,
     pub listen_address: SocketAddr,
     pub peers: Vec<(NodeId, SocketAddr)>,
+    /// Complete transport-only override for the remote peer catalog.
+    pub dial_addresses: Option<Vec<(NodeId, String)>>,
     pub max_inflight: usize,
     /// At most eight ASCII keys; names and values are never interpreted by the library.
     pub metadata_keys: BTreeSet<String>,
@@ -42,6 +44,7 @@ impl ApplicationRpcConfig {
             local_node_id,
             listen_address,
             peers,
+            dial_addresses: None,
             max_inflight: DEFAULT_RPC_MAX_INFLIGHT,
             metadata_keys: BTreeSet::new(),
         }
