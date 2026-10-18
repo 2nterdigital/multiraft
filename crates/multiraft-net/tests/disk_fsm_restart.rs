@@ -135,7 +135,7 @@ async fn write(handles: &[RuntimeHandle<DiskCounter>], delta: u64) -> u64 {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             for handle in handles {
-                if let Ok(receipt) = handle
+                match handle
                     .propose(
                         GROUP,
                         delta.to_be_bytes().to_vec(),
@@ -143,7 +143,19 @@ async fn write(handles: &[RuntimeHandle<DiskCounter>], delta: u64) -> u64 {
                     )
                     .await
                 {
-                    return u64::from_be_bytes(receipt.effects.try_into().unwrap());
+                    Ok(receipt) => return u64::from_be_bytes(receipt.effects.try_into().unwrap()),
+                    // A possibly committed write must not be resubmitted.
+                    Err(
+                        error @ (multiraft_net::RuntimeError::Deadline {
+                            outcome_unknown: true,
+                            ..
+                        }
+                        | multiraft_net::RuntimeError::Interrupted {
+                            outcome_unknown: true,
+                            ..
+                        }),
+                    ) => panic!("ambiguous write outcome: {error}"),
+                    Err(_) => {}
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -348,4 +360,9 @@ async fn disk_mode_requires_a_durable_voter_log() {
     )
     .await;
     assert!(result.is_err(), "memory logs cannot back a disk FSM");
+
+    let mut standby = nodes(root.path()).remove(0);
+    standby.config.snapshot_mode = SnapshotMode::StandbyOffload;
+    let result = start(&standby).await;
+    assert!(result.is_err(), "StandbyOffload hot-dumps whole images");
 }

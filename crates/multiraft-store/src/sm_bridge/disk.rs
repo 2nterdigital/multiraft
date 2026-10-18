@@ -115,14 +115,21 @@ impl<S: StateMachine> StateMachineStore<S> {
         self.disk
     }
 
-    /// Disk mode only: load the FSM's applied position and fail closed when
-    /// it exists but `log` has no persisted basis (the directories differ).
+    /// Disk mode only: fail closed on a whole-image catalog snapshot (this
+    /// data space was not created for disk mode), then load the FSM's applied
+    /// position and fail closed when it exists but `log` has no persisted
+    /// basis (the directories differ).
     pub async fn check_disk_log_basis<L: RaftLogStorage<TypeConfig>>(
         &self,
         log: &mut L,
     ) -> io::Result<()> {
         if !self.disk {
             return Ok(());
+        }
+        if self.native_snapshot_info().await?.is_some() {
+            return Err(invalid(
+                "whole-image snapshot found for a disk-backed state machine",
+            ));
         }
         let applied = {
             let mut inner = self.inner.lock().await;

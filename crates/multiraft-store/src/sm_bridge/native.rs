@@ -112,8 +112,12 @@ impl<S: StateMachine> StateMachineStore<S> {
     }
 
     pub(super) async fn prepare_builder(&self, force: bool) -> Option<SnapshotBuilder<S>> {
-        if self.disk && !force {
-            return None;
+        if self.disk {
+            // No whole-image provider, not even a reused catalog checkpoint.
+            return force.then(|| SnapshotBuilder {
+                store: self.clone(),
+                capture: Some(Err(super::disk::unsupported("snapshot"))),
+            });
         }
         let Some(native) = &self.native else {
             return Some(SnapshotBuilder {

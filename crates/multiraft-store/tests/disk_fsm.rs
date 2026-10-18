@@ -284,6 +284,49 @@ async fn native_durable_compaction_refuses_disk_capture() {
     ));
     let mut store = store;
     assert!(store.get_current_snapshot().await.unwrap().is_none());
+    let error = store
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::Unsupported,
+        "forced build refuses"
+    );
+}
+
+#[tokio::test]
+async fn leftover_whole_image_catalog_snapshot_fails_closed() {
+    let root = scratch();
+    let catalog = Arc::new(SnapshotCatalog::new(root.path().join("snapshots"), 1));
+    let meta = SnapshotMetaOf::<TypeConfig> {
+        last_log_id: Some(log_id(1)),
+        last_membership: Default::default(),
+        snapshot_id: "whole-image".into(),
+    };
+    catalog
+        .publish_native(GROUP, &meta, b"image", 1024)
+        .unwrap();
+    let mut store = StateMachineStore::with_native_options(
+        GROUP,
+        DiskCounter::open(&db_path(root.path())),
+        NativeSmOptions {
+            catalog,
+            max_snapshot_bytes: 1024,
+            build_budget: Arc::new(Semaphore::new(1)),
+        },
+    )
+    .unwrap();
+    // The FSM is already ahead, so OpenRaft would skip installing the image.
+    apply(&mut store, vec![blank(0), add(1, 2), add(2, 3)])
+        .await
+        .unwrap();
+    let mut log = multiraft_store::MemLogStore::default();
+    let error = store.check_disk_log_basis(&mut log).await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
 }
 
 #[tokio::test]
