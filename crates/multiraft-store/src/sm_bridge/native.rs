@@ -112,6 +112,13 @@ impl<S: StateMachine> StateMachineStore<S> {
     }
 
     pub(super) async fn prepare_builder(&self, force: bool) -> Option<SnapshotBuilder<S>> {
+        if self.disk {
+            // No whole-image provider, not even a reused catalog checkpoint.
+            return force.then(|| SnapshotBuilder {
+                store: self.clone(),
+                capture: Some(Err(super::disk::unsupported("snapshot"))),
+            });
+        }
         let Some(native) = &self.native else {
             return Some(SnapshotBuilder {
                 store: self.clone(),
@@ -213,6 +220,10 @@ impl<S: StateMachine> StateMachineStore<S> {
     }
 
     async fn capture_native(&self, native: &NativeRuntime) -> Result<Capture, NativeCaptureError> {
+        if self.disk {
+            // Streaming disk snapshots are a separate provider (#190).
+            return Err(NativeCaptureError::Refused(CaptureRefusal::Unsupported));
+        }
         let node_permit = native
             .options
             .build_budget

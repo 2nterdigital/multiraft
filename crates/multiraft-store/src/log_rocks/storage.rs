@@ -162,6 +162,8 @@ where
         let entries: Vec<_> = entries.into_iter().collect();
         // The callback belongs to the blocking operation: cancellation of the async
         // caller must not abandon notification after a durable write finishes.
+        // Returning only after the write is also what keeps a disk-backed FSM
+        // behind the durable log (docs/specs/2026-10-18-disk-backed-fsm-mode.md).
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             let result = (|| {

@@ -1436,6 +1436,7 @@ dependencies = [
  "multiraft-fsm",
  "multiraft-net",
  "multiraft-slot",
+ "multiraft-store",
  "serde",
  "serde_json",
  "tokio",

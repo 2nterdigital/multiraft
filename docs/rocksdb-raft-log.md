@@ -25,7 +25,9 @@ The first retained Group startup opens one shared engine per node at `{data_dir}
 its selection in `{data_dir}/raft-log-backend` (`rocksdb-v1` plus a newline).
 Groups use stable numeric Group IDs as namespaces in the default column family;
 there is no separate RocksDB engine or column family per group.
-Application FSM databases are independent and are not included in this engine.
+Application FSM databases are independent and are not included in this engine;
+the [disk-backed FSM mode](./specs/2026-10-18-disk-backed-fsm-mode.md) keeps one separate RocksDB
+instance per Group under `{data_dir}/fsm-rocksdb/group-{id}/`.
 The native recovery path keeps its asynchronous consumer proof, validation budget,
 cancellation, and application-generation readiness gates. A rejected startup proof
 rolls back the local node owner; selecting RocksDB does not bypass that proof.

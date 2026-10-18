@@ -3,6 +3,7 @@
 //! Memory log + SM bridge adapted from openraft `examples/{log-mem,sm-mem,multi-raft-kv}`
 //! at tag `v0.10.0-alpha.30`.
 
+mod disk_fsm;
 mod durability;
 mod log_file;
 mod log_mem;
@@ -12,6 +13,10 @@ mod sm_bridge;
 mod snapshot_catalog;
 pub mod stub_network;
 
+/// The pinned RocksDB crate used by [`DiskFsmDb`].
+pub use rocksdb;
+
+pub use disk_fsm::{DiskFsmDb, DiskFsmOptions, DISK_FSM_META_CF};
 pub use log_file::FileLogStore;
 pub use log_file::FileLogStreamOptions;
 pub use log_mem::LogStore;

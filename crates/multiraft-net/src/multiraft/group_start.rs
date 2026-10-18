@@ -202,6 +202,30 @@ impl<S: StateMachine> MultiRaft<S> {
                 },
             )
         };
+        if state_machine_store.is_disk_backed() {
+            // Disk mode (docs/specs/2026-10-18-disk-backed-fsm-mode.md) recovers its
+            // applied position from the FSM store and replays a durable local log.
+            // Only the RocksDB log returns from append after its synchronous
+            // write, so an entry is durable in the log before it can be applied.
+            let reason = if self.config.data_dir.as_os_str().is_empty()
+                || self.config.log_storage_backend != LogStorageBackend::RocksDb
+            {
+                Some("disk-backed state machine requires the RocksDB Raft log")
+            } else if self.config.snapshot_mode == SnapshotMode::StandbyOffload
+                || self.config.role != NodeRole::Voter
+            {
+                Some("disk-backed state machine requires a voter without StandbyOffload")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                tracing::error!(target: "multiraft::recovery", operation = "group_start", phase = "error",
+                    node_id = self.node_id, group_id = group, transport, storage,
+                    directory = %group_directory.display(), reason_code = "disk_fsm_mode_rejected",
+                    reason, "rejected disk-backed state machine configuration");
+                return Err(MultiRaftError::Other(anyhow::anyhow!(reason)));
+            }
+        }
         let state_machine_store = state_machine_store
             .with_validation_options(multiraft_store::ValidationOptions {
                 deadline: self.fsm_factory.validation_timeout(context),
@@ -248,6 +272,19 @@ impl<S: StateMachine> MultiRaft<S> {
             );
             MultiRaftError::Other(anyhow::Error::new(error).context(message))
         })?;
+        state_machine_store
+            .check_disk_log_basis(&mut log_store)
+            .await
+            .map_err(|error| {
+                tracing::error!(target: "multiraft::recovery", operation = "group_start", phase = "error",
+                    node_id = self.node_id, group_id = group, transport, storage,
+                    directory = %group_directory.display(), error = %error,
+                    reason_code = "disk_fsm_basis_rejected", "rejected disk-backed FSM recovery basis");
+                MultiRaftError::Other(anyhow::Error::new(error).context(format!(
+                    "disk FSM basis for node {}, group {}",
+                    self.node_id, group
+                )))
+            })?;
         let durable_basis = if recovery::durable_local_mode(&self.config) {
             Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?)
         } else {
