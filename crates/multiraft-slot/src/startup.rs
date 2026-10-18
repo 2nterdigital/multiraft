@@ -32,9 +32,12 @@ pub const MAX_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 ///   any other voter only after `bootstrap_grace` if the group is still
 ///   uninitialized (native fallback, reported as `fallback == true`).
 /// - [`InitializePolicy::Forbidden`]: a pristine slot never initializes; it
-///   must be caught up by an existing leader, with the native rejoin vote
-///   guard armed until it has applied the leader-commit anchor. Startup fails
-///   if that does not happen within `recovery_timeout`.
+///   must be caught up by an existing leader (OpenRaft `wait_for_recovery`:
+///   applied covers the first observed leader commit). Startup fails if that
+///   does not happen within `recovery_timeout`. This is the library side of
+///   OpenRaft's documented rejoin procedures; the caller must not start a
+///   wiped voter of a formed group outside them (OpenRaft assumes stable
+///   storage and provides no vote protection for wiped members).
 ///
 /// Persisted slots only recover under either policy.
 #[derive(Debug, Clone, PartialEq, Eq)]

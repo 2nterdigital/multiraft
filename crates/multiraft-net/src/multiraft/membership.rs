@@ -21,14 +21,13 @@ impl<S: StateMachine> MultiRaft<S> {
     ///
     /// `Allowed` is exactly [`Self::create_group`]. `Forbidden` spawns the local
     /// raft and never calls `initialize` on either transport; the Group can only
-    /// be caught up by an existing leader. When the local storage is pristine
-    /// (voter role), the rejoin guard is armed before the Group is published: it
-    /// drops inbound vote requests and disables local elections until applied
-    /// covers the per-term anchor (see [`crate::RejoinGuard`]); a Group-owned
-    /// watcher releases it as soon as that holds. Await
+    /// be caught up by an existing leader (log or snapshot). Use it for a node
+    /// rejoining a formed Group through OpenRaft's documented procedures
+    /// (remove, re-add as learner, promote; or `allow_next_revert` on the leader
+    /// before wiping); `initialize` is only for brand-new nodes. Await
     /// [`Self::wait_for_recovery`] before serving: on an empty log it completes
     /// only after the first observed leader commit is applied.
-    /// An already-registered Group is left unchanged (its guard is not re-armed).
+    /// An already-registered Group is left unchanged.
     pub async fn create_group_with_policy(
         &self,
         group: u64,
@@ -52,15 +51,7 @@ impl<S: StateMachine> MultiRaft<S> {
 
         let needs_spawn = !self.groups.lock().unwrap().contains_key(&group);
         if needs_spawn {
-            let guard = match policy {
-                InitializePolicy::Allowed => crate::RejoinGuard::disarmed(),
-                InitializePolicy::Forbidden => {
-                    self.ensure_node_log().await?;
-                    let provenance = self.local_provenance(group)?;
-                    self.rejoin_guard_for(group, policy, provenance)
-                }
-            };
-            self.spawn_local_group(group, guard).await?;
+            self.spawn_local_group(group).await?;
         }
 
         if is_standby || policy == InitializePolicy::Forbidden {

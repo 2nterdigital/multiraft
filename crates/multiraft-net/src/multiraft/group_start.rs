@@ -2,12 +2,9 @@
 use super::*;
 
 impl<S: StateMachine> MultiRaft<S> {
-    /// `rejoin_guard` is installed with the Group, so an armed guard is in force
-    /// before any peer can reach the published Group.
     pub(super) async fn spawn_local_group(
         &self,
         group: GroupId,
-        rejoin_guard: crate::RejoinGuard,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
         self.ensure_node_log().await?;
         // Every admitted mode is manual-only. Native protocol snapshots still
@@ -285,16 +282,6 @@ impl<S: StateMachine> MultiRaft<S> {
                 .unwrap()
                 .insert(group, target);
         }
-        // Disable native elections before publication; the owned watcher
-        // releases the guard (and re-enables elections once) when caught up.
-        let rejoin_guard = Arc::new(rejoin_guard);
-        if rejoin_guard.is_armed() {
-            rejoin_guard.install_raft(&raft);
-            let guard = rejoin_guard.clone();
-            let watched = raft.clone();
-            self.tasks
-                .spawn(async move { guard.watch_release(group, watched).await });
-        }
         let registered_at;
         {
             let mut g = self.groups.lock().unwrap();
@@ -305,7 +292,6 @@ impl<S: StateMachine> MultiRaft<S> {
                     group_id: group,
                     raft: raft.clone(),
                     state_machine: state_machine_store,
-                    rejoin_guard,
                 },
             );
             registered_at = tokio::time::Instant::now();

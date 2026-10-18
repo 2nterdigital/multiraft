@@ -148,15 +148,10 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
     groups: &GroupMap<S>,
     req: RaftRequest,
 ) -> Result<Response<RaftResponse>, Status> {
-    let (node_id, raft, state_machine, guard) = {
+    let (raft, state_machine) = {
         let groups = groups.lock().unwrap();
         match groups.get(&req.group_id) {
-            Some(g) => (
-                g.node_id,
-                g.raft.clone(),
-                g.state_machine.clone(),
-                g.rejoin_guard.clone(),
-            ),
+            Some(g) => (g.raft.clone(), g.state_machine.clone()),
             None => {
                 let payload = encode::<Result<(), typ::RaftError>>(Err(typ::RaftError::Fatal(
                     openraft::error::Fatal::Stopped,
@@ -166,35 +161,22 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
         }
     };
 
-    let inbound = api::Inbound {
-        node_id,
-        group_id: req.group_id,
-        guard: &guard,
-    };
     let res = match req.path.as_str() {
-        "/raft/append" => api::append(&raft, &req.payload, inbound).await,
+        "/raft/append" => api::append(&raft, &req.payload).await,
         "/raft/snapshot" => {
             // Native storage errors are fatal, including WouldBlock. Refuse peer
             // input here, before Core/SM dispatch, while startup proof is pending.
             state_machine.application_ready().map_err(|_| {
                 Status::unavailable("application validation pending; peer snapshot not dispatched")
             })?;
-            let result = api::snapshot(
-                &raft,
-                &req.payload,
-                state_machine.snapshot_byte_limit(),
-                inbound,
-            )
-            .await;
+            let result =
+                api::snapshot(&raft, &req.payload, state_machine.snapshot_byte_limit()).await;
             // Fatal/Stopped can close the native API waiter before the application
             // worker returns. The owned receive slot follows the actual transition.
             state_machine.wait_native_quiescent().await;
             result?
         }
-        "/raft/vote" => api::vote(&raft, &req.payload, inbound)
-            .await
-            // Rejoin guard: behave like packet loss; the sender sees Unreachable.
-            .ok_or_else(|| Status::unavailable("vote dropped by rejoin guard"))?,
+        "/raft/vote" => api::vote(&raft, &req.payload).await,
         "/raft/transfer_leader" => api::transfer_leader(&raft, &req.payload).await,
         _ => {
             tracing::warn!("unknown grpc path: {}", req.path);

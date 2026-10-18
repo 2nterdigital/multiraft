@@ -183,13 +183,15 @@ impl<S: StateMachine> RuntimeShared<S> {
         if pristine && forbidden && self.node.startup_voter() {
             // No durable-local "empty basis is done" shortcut: an empty rejoining
             // voter must catch up from an existing leader within the budget.
-            // A Standby is not in membership until a leader adds it, so it keeps
-            // the existing wait (and is never guarded).
+            // Native `wait_for_recovery` on an empty log pins its target to the
+            // first `cluster_committed` (set by AppendEntries `leader_commit`)
+            // and returns promptly if the Raft core stops (Fatal), carrying the
+            // native cause. A Standby is not in membership until a leader adds
+            // it, so it keeps the existing wait.
             self.bounded(
                 index,
                 &progress,
-                self.node
-                    .wait_for_rejoin_recovery(input.group.group_id, remaining),
+                self.node.wait_for_recovery(input.group.group_id, remaining),
             )
             .await?;
         } else {

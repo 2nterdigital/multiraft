@@ -74,7 +74,6 @@ async fn native_grpc_transfers_five_mib_and_receiver_reopens_its_local_checkpoin
             group_id: 7,
             raft: raft.clone(),
             state_machine: sm.clone(),
-            rejoin_guard: Default::default(),
         },
     )])));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
