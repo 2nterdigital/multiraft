@@ -86,9 +86,14 @@ applied 位置和 membership。
   所以手动压缩返回拒绝、日志从不被清理；整块构建和安装被显式拒绝。目录里已有
   整块快照会让 group 启动失败（安装被拒），因为新格式只在新数据空间启动。#190 用读取
   该 FSM 实例的流式 provider 替换这个拒绝。
-- **`LogStorageBackend::RocksDb`**：仍是独立、共享、同步 WAL 的日志引擎。落盘模式
-  要求持久的本地日志（`RocksDb`，或 `Data`/`All` 等级的 `FileLog`）和非空 `data_dir`；
-  内存日志或 `Os` 等级在 group 启动时被拒绝。
+- **`LogStorageBackend::RocksDb`**：仍是独立、共享、同步 WAL 的日志引擎，落盘模式
+  **必须**使用它（并且 `data_dir` 非空）。内存日志和任何同步等级的 FileLog 都在 group
+  启动时被拒绝。锁定的 OpenRaft 把条目 apply 到*已提交给日志 IO* 的位置，而不是已 flush
+  的位置（`engine_impl.rs`，`log_submitted.min(apply_accepted)`）。RaftCore 在执行后续
+  `SaveCommittedAndApply` 之前会就地 await `log_store.append`（`core/raft_core.rs`）。
+  RocksDB 的 `append` 在同步 WAL 写入完成后才返回（`log_rocks/storage.rs`），因此条目在
+  FSM 写入之前已在本地日志中落盘。FileLog 的 `append` 可能在合并组提交之前返回，崩溃后
+  可能出现已落盘的 FSM 领先本地日志。
 
 ## 启动与失败规则
 
@@ -97,9 +102,12 @@ applied 位置和 membership。
 - Raft 日志已持久而 FSM 库为空：在没有任何清理时，可从 index 1 重放恢复；日志已被
   清理时会在 OpenRaft 的重放检查（或被拒绝的安装）中失败。在 #190 之前，落盘模式
   从不清理日志。
-- FSM 领先于本地日志尾部（例如本地日志丢了尾部，而 FSM 保留了一条已提交的条目）：
-  OpenRaft 把本地日志清理到 applied 位置，与安装快照后一样。applied 状态是已提交状态，
-  不构成分叉。
+- FSM 领先于本地日志尾部：在 OpenRaft 运行**之前** fail closed。否则 OpenRaft 会把本地
+  日志清理到 applied 位置（不可逆），随后发现日志已被清理却没有快照，于是强制构建
+  快照，而本模式拒绝构建，该 Group 将永远无法启动。使用 RocksDB 日志时，正常崩溃不会
+  进入这个状态（见上文），因此它意味着目录不匹配或损坏。处理办法：删除该 Group 的
+  FSM 目录和该节点的数据后重新加入；因为本模式从不清理日志，可以从 leader 重放日志
+  追上。#190 可以让这次强制构建成功。
 - 默认每次写入都同步 WAL（`DiskFsmOptions::sync_writes`）。关闭同步后 SIGKILL 仍安全
   （WAL 仍然写出）；掉电后 FSM 可能回到更早的 applied 位置，只要本地日志保留 FSM
   持久点之后的所有条目就是安全的。落盘模式不能压缩时这一点总成立；#190 必须在清理
@@ -117,6 +125,15 @@ applied 位置和 membership。
 - **每 Slot 的资源**：每个实例有自己的 WAL、memtable 和文件句柄。使用方应通过
   `DiskFsmOptions::db_options` 传入共享的 `Cache`/`WriteBufferManager`，并按进程文件
   句柄上限设置 `max_open_files`（macOS 默认值较低）。
+- **首次创建被中断**：RocksDB 创建新 FSM 实例期间（`CURRENT` 写出之前，或各列族
+  创建之间）崩溃，会留下 `open` 拒绝的目录；此时尚未 apply 任何条目。处理办法：删除
+  该 Group 的 FSM 目录。
+- **同一 Group 混用模式**：一个 Group 的所有副本必须在新数据空间中使用同一种 FSM
+  模式。整块模式副本可能压缩并发送快照，而落盘副本会拒绝安装（该 follower 致命）。
+  配置阶段不做检查。
+- **apply 延迟**：每条条目的同步 FSM 写入在 bridge 的异步 apply 中、持有 FSM 锁、
+  运行在 Tokio worker 上。大量繁忙 Slot 可能占满 worker 并推迟心跳；批量写入或把写入
+  移到阻塞线程是后续工作。
 - **不能靠快照追赶**：#190 之前，所需日志已不存在的 follower 无法追上，因此落盘模式
   从不清理日志。
 - **64 MiB 上限**：ech0 长期容量规格 §4 列出的存储层和网络层快照上限这里不改。
@@ -130,4 +147,5 @@ applied 位置和 membership。
   RocksDB 恢复状态和 applied index。
 - `multiraft-slot-demo --fsm-storage disk` 配合 `scripts/slot_acceptance.py --case disk`：
   三个 OS 进程、RF3、SIGKILL leader，再 SIGKILL 全部节点并冷重启；每个节点的状态与
-  applied index 一致。现有整块用例不变。
+  applied index 一致。这些 SIGKILL 发生在空闲集群上；写入过程中的崩溃由上文的顺序论证
+  覆盖，没有专门测试。现有整块用例不变。

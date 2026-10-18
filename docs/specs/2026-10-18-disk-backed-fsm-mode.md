@@ -112,9 +112,16 @@ reopen the instance. ech0's composite FSM (#191) implements `DiskState` over
   space. #190 replaces the refusal with a streaming provider that reads
   this FSM instance.
 - **`LogStorageBackend::RocksDb`.** This remains the separate, shared,
-  synchronous-WAL log engine. Disk mode needs a durable local log
-  (`RocksDb`, or `FileLog` at `Data`/`All`) and a non-empty `data_dir`.
-  Memory or `Os`-level logs are rejected at group start.
+  synchronous-WAL log engine, and disk mode **requires** it (and a non-empty
+  `data_dir`). Memory logs and FileLog at every sync level are rejected at group
+  start. The pinned OpenRaft applies entries up to the *submitted* log IO, not
+  the flushed IO (`engine_impl.rs`, `log_submitted.min(apply_accepted)`).
+  RaftCore awaits `log_store.append` inline before it runs a later
+  `SaveCommittedAndApply` (`core/raft_core.rs`). The RocksDB `append` returns
+  only after its synchronous WAL write (`log_rocks/storage.rs`), so an entry is
+  durable in the local log before its FSM write. FileLog's `append` can return
+  before its coalesced group commit, which would let a crash leave the durable
+  FSM ahead of the local log.
 
 ## Startup and failure rules
 
@@ -124,10 +131,15 @@ reopen the instance. ech0's composite FSM (#191) implements `DiskState` over
 - Raft log persisted and FSM database empty: recoverable by replay from
   index 1 while nothing is purged. A purged log fails in OpenRaft's replay
   check (or in the refused install). Disk mode never purges until #190.
-- FSM ahead of the local log tail (for example, the local log lost its tail
-  while the FSM kept a committed entry): OpenRaft purges the local log up to
-  the applied position, as it does after a snapshot install. The applied state
-  is committed state, so this is not a divergence.
+- FSM ahead of the local log tail: fail closed **before** OpenRaft runs.
+  Otherwise OpenRaft purges the local log up to the applied position
+  (irreversible), then finds no snapshot for the purged log and forces a
+  snapshot build that this mode refuses, so the Group could never start again.
+  With the RocksDB log, normal crashes cannot reach this state (see above), so
+  it signals mismatched or damaged directories. Remedy: remove both the
+  Group's FSM directory and that node's data, then rejoin. Log replay from
+  the leader works, because this mode never purges. #190 can make the forced
+  build succeed.
 - Every write uses a synchronous WAL by default (`DiskFsmOptions::sync_writes`).
   Turning it off survives SIGKILL (the WAL is still written). After power
   loss the FSM may move back to an earlier applied position, which is safe
@@ -152,6 +164,18 @@ reopen the instance. ech0's composite FSM (#191) implements `DiskState` over
   handles. Consumers should pass a shared `Cache`/`WriteBufferManager` through
   `DiskFsmOptions::db_options` and size `max_open_files` against the process
   file limit (macOS defaults are low).
+- **Interrupted first creation.** A crash while RocksDB creates a new FSM
+  instance (before `CURRENT`, or between column-family creations) leaves a
+  directory that `open` rejects. No entry was applied yet. Remedy: delete that
+  Group's FSM directory.
+- **Mixed modes in one Group.** All replicas of a Group must run the same
+  FSM mode in a new data space. A whole-image replica could compact and send
+  a snapshot that a disk replica refuses (fatal on that follower). This is not
+  checked at configuration time.
+- **Apply latency.** Each entry's synchronous FSM write runs inside the
+  bridge's async apply, under the FSM lock, on a Tokio worker. Many busy
+  Slots can occupy workers and delay heartbeats. Batching or moving this
+  write to a blocking thread is follow-up work.
 - **No catch-up by snapshot.** Until #190, a follower whose required log
   entries are gone cannot catch up. Disk mode therefore never purges.
 - **64 MiB caps.** The storage and network snapshot caps listed in ech0's
@@ -169,5 +193,6 @@ reopen the instance. ech0's composite FSM (#191) implements `DiskState` over
 - `multiraft-slot-demo --fsm-storage disk` with
   `scripts/slot_acceptance.py --case disk`: three OS processes, RF3,
   SIGKILL of the leader, then SIGKILL of all nodes and a cold restart; state
-  and applied index agree on every node. The existing whole-image cases are
-  unchanged.
+  and applied index agree on every node. These SIGKILLs hit an idle cluster;
+  crashes during writes are covered by the ordering argument above, not by a
+  test. The existing whole-image cases are unchanged.

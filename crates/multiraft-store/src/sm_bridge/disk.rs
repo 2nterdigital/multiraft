@@ -115,10 +115,11 @@ impl<S: StateMachine> StateMachineStore<S> {
         self.disk
     }
 
-    /// Disk mode only: fail closed on a whole-image catalog snapshot (this
-    /// data space was not created for disk mode), then load the FSM's applied
-    /// position and fail closed when it exists but `log` has no persisted
-    /// basis (the directories differ).
+    /// Disk mode only, before OpenRaft construction. Fail closed on a
+    /// whole-image catalog snapshot (this data space was not created for disk
+    /// mode), on FSM state over a pristine log, and on an FSM ahead of the
+    /// local log tail: OpenRaft would irreversibly purge the log up to the
+    /// applied index and then require a snapshot this mode cannot build.
     pub async fn check_disk_log_basis<L: RaftLogStorage<TypeConfig>>(
         &self,
         log: &mut L,
@@ -147,6 +148,16 @@ impl<S: StateMachine> StateMachineStore<S> {
                 format!(
                     "disk FSM applied index {} has no persisted Raft log basis",
                     applied.index
+                ),
+            ));
+        }
+        if state.last_log_id.map(|id| id.index) < Some(applied.index) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "disk FSM applied index {} is ahead of the local Raft log tail {:?}",
+                    applied.index,
+                    state.last_log_id.map(|id| id.index)
                 ),
             ));
         }

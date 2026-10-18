@@ -205,8 +205,12 @@ impl<S: StateMachine> MultiRaft<S> {
         if state_machine_store.is_disk_backed() {
             // Disk mode (docs/specs/2026-10-18-disk-backed-fsm-mode.md) recovers its
             // applied position from the FSM store and replays a durable local log.
-            let reason = if !recovery::durable_local_mode(&self.config) {
-                Some("disk-backed state machine requires a durable local Raft log")
+            // Only the RocksDB log returns from append after its synchronous
+            // write, so an entry is durable in the log before it can be applied.
+            let reason = if self.config.data_dir.as_os_str().is_empty()
+                || self.config.log_storage_backend != LogStorageBackend::RocksDb
+            {
+                Some("disk-backed state machine requires the RocksDB Raft log")
             } else if self.config.snapshot_mode == SnapshotMode::StandbyOffload
                 || self.config.role != NodeRole::Voter
             {

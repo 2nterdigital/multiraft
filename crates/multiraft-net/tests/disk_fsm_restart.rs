@@ -361,6 +361,13 @@ async fn disk_mode_requires_a_durable_voter_log() {
     .await;
     assert!(result.is_err(), "memory logs cannot back a disk FSM");
 
+    let mut file_log = nodes(root.path()).remove(0);
+    file_log.config.log_storage_backend = LogStorageBackend::FileLog;
+    file_log.config.file_log_sync_level = multiraft_core::FileLogSyncLevel::Data;
+    file_log.config.snapshot_mode = SnapshotMode::Disabled;
+    let result = start(&file_log).await;
+    assert!(result.is_err(), "FileLog may apply before its group commit");
+
     let mut standby = nodes(root.path()).remove(0);
     standby.config.snapshot_mode = SnapshotMode::StandbyOffload;
     let result = start(&standby).await;

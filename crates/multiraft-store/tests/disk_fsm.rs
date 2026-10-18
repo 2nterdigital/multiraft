@@ -299,6 +299,22 @@ async fn native_durable_compaction_refuses_disk_capture() {
 }
 
 #[tokio::test]
+async fn disk_state_ahead_of_the_local_log_fails_closed_before_purge() {
+    use openraft::storage::{IOFlushed, RaftLogStorage};
+    let root = scratch();
+    let path = db_path(root.path());
+    let mut store = StateMachineStore::new(GROUP, DiskCounter::open(&path));
+    apply(&mut store, vec![blank(0), add(1, 2)]).await.unwrap();
+    let mut log = multiraft_store::MemLogStore::default();
+    log.append([blank(0)], IOFlushed::noop()).await.unwrap();
+    let error = store.check_disk_log_basis(&mut log).await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    assert_eq!(log.get_log_state().await.unwrap().last_purged_log_id, None);
+    log.append([add(1, 2)], IOFlushed::noop()).await.unwrap();
+    store.check_disk_log_basis(&mut log).await.unwrap();
+}
+
+#[tokio::test]
 async fn leftover_whole_image_catalog_snapshot_fails_closed() {
     let root = scratch();
     let catalog = Arc::new(SnapshotCatalog::new(root.path().join("snapshots"), 1));
