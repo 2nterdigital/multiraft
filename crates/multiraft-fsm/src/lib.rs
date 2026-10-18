@@ -1,7 +1,9 @@
 //! Pluggable state machine for multiraft.
 
 mod counter_fsm;
+mod disk;
 pub use counter_fsm::CounterFsm;
+pub use disk::{AppliedState, DiskState};
 
 pub type GroupId = u64;
 pub type NodeId = u64;
@@ -43,65 +45,6 @@ pub enum CaptureRefusal {
 pub enum CaptureError<E> {
     Refused(CaptureRefusal),
     Application(E),
-}
-
-/// Raft applied position for one entry, handed to a disk-backed state machine.
-///
-/// `record` is the bridge's versioned encoding of the applied log id and
-/// membership. Persist it verbatim, in the same atomic write as the entry's
-/// rows, and return it from [`DiskState::durable_applied`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppliedState {
-    index: u64,
-    term: u64,
-    record: Vec<u8>,
-}
-
-impl AppliedState {
-    /// Constructed by the storage bridge; applications only persist it.
-    pub fn new(index: u64, term: u64, record: Vec<u8>) -> Self {
-        Self {
-            index,
-            term,
-            record,
-        }
-    }
-
-    pub fn index(&self) -> u64 {
-        self.index
-    }
-
-    pub fn term(&self) -> u64 {
-        self.term
-    }
-
-    pub fn record(&self) -> &[u8] {
-        &self.record
-    }
-}
-
-/// Disk-backed mode: the state machine owns its durable store and commits each
-/// entry's rows together with the applied position. Restart recovers both from
-/// that store; no whole-image restore is involved.
-///
-/// In this mode the bridge never calls [`StateMachine::apply`],
-/// [`StateMachine::snapshot`], [`StateMachine::restore`] or the capture hooks.
-pub trait DiskState {
-    /// The last record committed by [`Self::apply_durable`], or `None` for a
-    /// new store. Called before the first entry is applied.
-    fn durable_applied(&self) -> std::io::Result<Option<Vec<u8>>>;
-
-    /// Apply one entry exactly once. `data` is `None` for entries without an
-    /// application payload (blank, membership, internal). Before returning,
-    /// make the entry's rows and `applied.record()` durable in ONE atomic
-    /// write; an error stops the Group and the entry is replayed on restart.
-    fn apply_durable(
-        &mut self,
-        group: GroupId,
-        index: u64,
-        data: Option<&[u8]>,
-        applied: &AppliedState,
-    ) -> std::io::Result<ApplyOut>;
 }
 
 pub trait StateMachine: Send + 'static {

@@ -15,5 +15,6 @@ multiraft-slot = { path = "../multiraft-slot" }
 multiraft-store = { path = "../multiraft-store" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

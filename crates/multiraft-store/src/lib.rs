@@ -4,6 +4,7 @@
 //! at tag `v0.10.0-alpha.30`.
 
 mod disk_fsm;
+pub mod disk_snapshot;
 mod durability;
 mod log_file;
 mod log_mem;
@@ -17,6 +18,7 @@ pub mod stub_network;
 pub use rocksdb;
 
 pub use disk_fsm::{DiskFsmDb, DiskFsmOptions, DISK_FSM_META_CF};
+pub use disk_snapshot::{is_disk_snapshot, DiskChunk};
 pub use log_file::FileLogStore;
 pub use log_file::FileLogStreamOptions;
 pub use log_mem::LogStore;

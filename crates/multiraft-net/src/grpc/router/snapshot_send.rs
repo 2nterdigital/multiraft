@@ -52,6 +52,11 @@ impl SnapshotSender {
                 tokio::sync::TryAcquireError::Closed => refused("native snapshot owner closed"),
                 tokio::sync::TryAcquireError::NoPermits => refused("native snapshot send busy"),
             })?;
+        if multiraft_store::is_disk_snapshot(&snapshot.meta, snapshot.snapshot.get_ref()) {
+            return self
+                .send_disk(transport, target, group_id, vote, snapshot, option, permit)
+                .await;
+        }
         if transport.snapshot_cap == 0
             || transport.snapshot_cap > 64 * 1024 * 1024
             || snapshot.snapshot.get_ref().len() > transport.snapshot_cap
@@ -88,6 +93,56 @@ impl SnapshotSender {
                 )
                 .await
                 .map_err(StreamingError::Unreachable);
+            let _ = reply.send(result);
+        });
+        if !registered {
+            return Err(refused("native snapshot owner closed"));
+        }
+        receiver.await.unwrap_or_else(|_| {
+            Err(refused(
+                "native snapshot send task stopped; outcome unconfirmed",
+            ))
+        })
+    }
+
+    /// Disk mode (`docs/specs/2026-10-19-disk-fsm-streaming-snapshot.md`): the
+    /// whole-image byte caps do not apply; the manifest names a checkpoint
+    /// directory that is streamed in bounded chunks.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_disk(
+        &self,
+        transport: RpcTransport,
+        target: NodeId,
+        group_id: GroupId,
+        vote: typ::Vote,
+        snapshot: SnapshotOf<TypeConfig, typ::SnapshotData>,
+        option: RPCOption,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
+        // The manifest travels twice: in `Begin` (bounded by MAX_MANIFEST_BYTES
+        // at the receiver) and as the OpenRaft snapshot (bounded by the cap).
+        let manifest = snapshot.snapshot.get_ref().len();
+        if manifest > transport.snapshot_cap
+            || manifest > multiraft_store::disk_snapshot::MAX_MANIFEST_BYTES
+        {
+            return Err(refused(
+                "disk snapshot manifest exceeds the snapshot message cap",
+            ));
+        }
+        let ttl = option.hard_ttl();
+        let (reply, receiver) = oneshot::channel();
+        let registered = self.jobs.spawn(async move {
+            let _permit = permit;
+            let result = super::disk_snapshot_send::stream(
+                &transport,
+                target,
+                group_id,
+                vote,
+                snapshot,
+                ttl,
+                || reply.is_closed(),
+            )
+            .await;
             let _ = reply.send(result);
         });
         if !registered {

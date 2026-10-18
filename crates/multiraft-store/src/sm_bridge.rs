@@ -68,6 +68,8 @@ struct StateMachineStoreInner<S: StateMachine> {
     current_snapshot: Option<StoredSnapshot>,
     /// Disk mode: applied position/membership already read from the FSM store.
     disk_loaded: bool,
+    /// Disk mode: the FSM's snapshot workspace, opened with the store.
+    disk_workspace: Option<crate::disk_snapshot::Workspace>,
     // Fields drop in declaration order: signal only AFTER application FSM Drop.
     _release: release::ReleaseOnDrop,
 }
@@ -82,6 +84,7 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: None,
             disk_loaded: false,
+            disk_workspace: None,
             _release: release::ReleaseOnDrop(release),
         }
     }
@@ -98,6 +101,7 @@ pub struct StateMachineStore<S: StateMachine> {
     native: Option<Arc<native::NativeRuntime>>,
     /// Fixed at construction from [`StateMachine::disk_state`].
     disk: bool,
+    disk_rt: Arc<disk::DiskRuntime>,
     allow_hot_build: bool,
     catalog: Option<Arc<SnapshotCatalog>>,
     on_standby_trigger: Option<TriggerCb>,
@@ -124,6 +128,7 @@ impl<S: StateMachine> Clone for StateMachineStore<S> {
             inner: self.inner.clone(),
             native: self.native.clone(),
             disk: self.disk,
+            disk_rt: self.disk_rt.clone(),
             allow_hot_build: self.allow_hot_build,
             catalog: self.catalog.clone(),
             on_standby_trigger: self.on_standby_trigger.clone(),
@@ -159,6 +164,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             ))),
             native: None,
             disk,
+            disk_rt: Arc::default(),
             allow_hot_build: opts.allow_hot_build,
             catalog: opts.catalog,
             on_standby_trigger: opts.on_standby_trigger,
@@ -480,7 +486,11 @@ where
         snapshot: Self::SnapshotData,
     ) -> Result<(), io::Error> {
         if self.disk {
-            return Err(disk::unsupported("snapshot install"));
+            let data = snapshot.into_inner();
+            if !crate::disk_snapshot::is_disk_snapshot(meta, &data) {
+                return Err(disk::unsupported("snapshot install"));
+            }
+            return self.install_disk_snapshot(meta, data).await;
         }
         if self.native.is_some() {
             return self
@@ -497,6 +507,9 @@ where
     ) -> Result<Option<SnapshotOf<TypeConfig, Self::SnapshotData>>, io::Error> {
         if !self.validation.recovering() {
             self.validation.readable()?;
+        }
+        if self.disk {
+            return self.load_disk_snapshot().await;
         }
         if self.native.is_some() {
             return self.load_native_snapshot().await;

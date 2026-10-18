@@ -27,11 +27,27 @@ On macOS, a source RocksDB build may also require `LIBCLANG_PATH` and
 directory; the default is a unique directory below `.tmp/slot-foundation/`.
 `--case normal`, `--case recovery` and `--case fingerprint` run the three independent scenario sets; `--case all` runs all three.
 `--case disk` runs the separate [disk-backed FSM](./specs/2026-10-18-disk-backed-fsm-mode.md) scenario (`--fsm-storage disk`, fresh `disk-data-N` directories; not part of `all`).
-It covers exact effects and idempotency, refused compaction with no whole-image snapshot, a SIGKILLed
+It covers exact effects and idempotency, compaction that publishes a RocksDB checkpoint (never a whole image) and purges the log, a SIGKILLed
 leader that reopens its RocksDB state, SIGKILL of all three nodes followed by a cold restart, and a clean
 cold restart with a committed suffix. On every node, the value and apply count must match. The FSM-stored
 applied index must equal the bridge's applied index, and that index must be equal across nodes. The other
 cases pass `--fsm-storage image`, the default whole-image mode, and are unchanged.
+
+`--case disk-snapshot` runs the [streaming disk snapshot](./specs/2026-10-19-disk-fsm-streaming-snapshot.md)
+scenario (fresh `disk-snapshot-data-N` directories; not part of `all`). `--snapshot-mib N` (default 1024) sets
+how much data is written to one Slot while a follower is stopped. The test-only `/bulk` endpoint
+proposes small commands from which every replica's FSM generates the same incompressible 4 MiB rows, so
+the FSM (and the snapshot) reaches GB scale while the Raft log stays small; the RocksDB Raft log encodes
+entries as JSON, which makes GB-scale payloads through the log impractically slow in this harness. Both live
+replicas compact (checkpoint + purge), then the stopped follower restarts and must catch up by snapshot
+install (the `installed` marker in its workspace, equal blob counters, SHA-256 chain and newest rows). RSS of
+all three processes is sampled every 50 ms from the follower's start until it has caught up; every peak
+must be at most 256 MiB. Then: a restart right after the catch-up; a further round where the receiver is
+SIGKILLed while staging the transfer, must reopen at its old applied index and then catch up; and a round
+where `MULTIRAFT_TEST_DISK_INSTALL_FAULT=abort_after_retire` aborts the receiver between the two install
+renames (live directory missing, `retired-*` present), after which a normal restart must roll back to the
+old store and then catch up. Run it with a release build (`cargo build --release -p multiraft-slot-demo`).
+Recorded runs are listed in the [streaming snapshot spec](./specs/2026-10-19-disk-fsm-streaming-snapshot.md#recorded-runs).
 
 The Python standard-library harness launches three actual `Popen` OS processes,
 with distinct PIDs, loopback Raft/application/admin ports and per-node data.
