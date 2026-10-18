@@ -59,6 +59,7 @@ class Run:
         self.cases = []
         self.stop_signal = None
         self.cleaning = False
+        self.fsm_storage = 'image'
         ports = free_ports(9)
         self.admin = dict(zip(range(1, 4), ports[6:]))
         self.placement = dict(cluster_id='slot-acceptance-' + uuid.uuid4().hex, slot_count=slot_count, group_id_base=100,
@@ -146,7 +147,8 @@ class Run:
         assert node not in self.processes
         log_path = self.output / f'node-{node}-{time.time_ns()}.log'
         log = log_path.open('wb')
-        command = [self.binary, '--layout', str(layout or self.layout_path), '--node-id', str(node), '--data-dir', str(self.output / f'data-{node}'), '--admin', f'127.0.0.1:{self.admin[node]}', '--test-controls']
+        data = f'data-{node}' if self.fsm_storage == 'image' else f'{self.fsm_storage}-data-{node}'
+        command = [self.binary, '--layout', str(layout or self.layout_path), '--node-id', str(node), '--data-dir', str(self.output / data), '--admin', f'127.0.0.1:{self.admin[node]}', '--test-controls', '--fsm-storage', self.fsm_storage]
         try:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             self.processes[node] = process
@@ -403,6 +405,102 @@ class Run:
         self.read(2, key, 6)
         self.passed('native_fingerprint_RF3_AA_quorum_AB_no_applied_unknown_disambiguated', no_quorum_result=outcome, isolated_B=isolated, resolved=resolved)
 
+    def local_view(self, node, key):
+        response = self.api(node, '/read', dict(key=key, local=True))
+        assert response.get('ok') and response['result']['storage'] == 'disk', response
+        return dict(response['result'], applied=response['applied'])
+
+    def disk_converged(self, label, expected, calls):
+        """Every node: expected value and apply count, FSM-stored applied index equal
+        to the bridge's applied index, and that index equal across nodes."""
+        def observe():
+            views = {n: {k: self.local_view(n, k) for k in self.keys.values()} for n in (1, 2, 3)}
+            for k in self.keys.values():
+                if any(views[n][k]['applied'] is None for n in (1, 2, 3)):
+                    return None  # A replica that has applied nothing yet.
+                indices = {views[n][k]['applied']['index'] for n in (1, 2, 3)}
+                if len(indices) != 1 or any(views[n][k]['value'] != expected[k] or views[n][k]['apply_calls'] != calls[k]
+                                            or views[n][k]['applied_index'] != views[n][k]['applied']['index'] for n in (1, 2, 3)):
+                    return None
+            return views
+        return self.poll(label, observe, 45)
+
+    def disk(self):
+        """Disk-backed FSM mode: SIGKILL and cold restarts recover state and applied index from RocksDB."""
+        self.ensure_layout()
+        self.fsm_storage = 'disk'
+        for n in (1, 2, 3):
+            self.start(n)
+        self.ready((1, 2, 3))
+        for state in [self.api(n, '/status') for n in (1, 2, 3)]:
+            assert state['fsm_storage'] == 'disk', state
+            assert all(s['storage']['backend'] == 'Some(RocksDb)' and s['storage']['snapshot'] is None for s in state['slots']), state
+        expected, calls = {}, {}
+        for slot, key in self.keys.items():
+            leader = self.leader(slot)
+            follower = next(n for n in (1, 2, 3) if n != leader)
+            effect = dict(key=key, command_id=f'disk-{slot}', value=3, accepted=True)
+            result = self.write(follower, key, f'disk-{slot}', 3)
+            assert result.get('ok') and result['effects'] == effect and result['slot'] == slot, result
+            retry = self.write(follower, key, f'disk-{slot}', 3)
+            assert retry.get('ok') and retry['effects'] == effect, retry
+            changed = self.write(follower, key, f'disk-{slot}', 99)
+            assert changed.get('ok') and changed['effects'] == dict(effect, accepted=False), changed
+            expected[key], calls[key] = 3, 3
+        # No whole-image provider: compaction is refused and nothing is snapshotted.
+        refused = self.api(1, '/compact', dict(slot=0))
+        assert not refused.get('ok'), refused
+        self.disk_converged('disk replicas converge', expected, calls)
+        self.passed('disk_fsm_RF3_forward_exact_effects_idempotency_and_no_whole_image_snapshot', refused_compaction=refused)
+        slot, key = next(iter(self.keys.items()))
+        leader = self.leader(slot)
+        self.stop(leader, kill=True)
+        survivors = tuple(n for n in (1, 2, 3) if n != leader)
+        new_leader = self.leader(slot, survivors)
+        result = self.write(survivors[0], key, 'disk-after-kill', 1)
+        expected[key] += 1
+        calls[key] += 1
+        assert result.get('ok') and result['effects']['value'] == expected[key], result
+        self.start(leader)
+        self.ready((leader,))
+        recovered = self.poll('killed node recovered from RocksDB', lambda: (v if (v := self.local_view(leader, key))['value'] == expected[key] else None))
+        assert recovered['opened_index'] is not None and recovered['opened_index'] > 0, recovered
+        self.disk_converged('disk replicas converge after leader kill', expected, calls)
+        self.passed('disk_fsm_sigkill_leader_restart_opens_rocksdb_state', killed=leader, elected=new_leader, recovered=recovered)
+        # SIGKILL every node at once, then cold-start all from the same data.
+        before = {n: {k: self.local_view(n, k)['applied_index'] for k in self.keys.values()} for n in (1, 2, 3)}
+        for n in (1, 2, 3):
+            self.stop(n, kill=True)
+        for n in (1, 2, 3):
+            self.start(n)
+        self.ready((1, 2, 3))
+        for n in (1, 2, 3):
+            for k in self.keys.values():
+                opened = self.local_view(n, k)['opened_index']
+                assert opened is not None and opened >= before[n][k], (n, k, opened, before[n][k])
+        views = self.disk_converged('disk replicas converge after all-node SIGKILL', expected, calls)
+        self.passed('disk_fsm_sigkill_all_cold_restart_state_and_applied_index_agree', opened_at_least=before,
+                    applied={n: {k: v['applied']['index'] for k, v in views[n].items()} for n in views})
+        # Clean shutdown and cold restart, then a committed suffix and an exact retry.
+        for n in (1, 2, 3):
+            self.stop(n)
+        for n in (1, 2, 3):
+            self.start(n)
+        self.ready((1, 2, 3))
+        for s, k in self.keys.items():
+            self.leader(s)
+            result = self.write(1, k, f'disk-suffix-{s}', 4)
+            expected[k] += 4
+            calls[k] += 1
+            assert result.get('ok') and result['effects']['value'] == expected[k], result
+            retry = self.write(2, k, f'disk-{s}', 3)
+            calls[k] += 1
+            assert retry.get('ok') and retry['effects'] == dict(key=k, command_id=f'disk-{s}', value=3, accepted=True), retry
+        self.disk_converged('disk replicas converge after clean cold restart', expected, calls)
+        for n in (1, 2, 3):
+            self.stop(n)
+        self.passed('disk_fsm_clean_cold_restart_suffix_and_original_dedup_effects')
+
     def finish(self, error=None):
         self.cleaning = True
         try:
@@ -435,7 +533,7 @@ def main(argv=None):
     parser.add_argument('--layout-tool', help='slot-layout generator; defaults to the sibling of --binary')
     parser.add_argument('--slot-count', type=int, default=4)
     parser.add_argument('--output-dir', type=Path)
-    parser.add_argument('--case', choices=('all', 'normal', 'recovery', 'fingerprint'), default='all')
+    parser.add_argument('--case', choices=('all', 'normal', 'recovery', 'fingerprint', 'disk'), default='all')
     args = parser.parse_args(argv)
     output = args.output_dir or Path('.tmp/slot-foundation') / ('acceptance-' + uuid.uuid4().hex)
     run = Run(args.binary, output, args.layout_tool, args.slot_count)
@@ -459,6 +557,9 @@ def main(argv=None):
                 (run.output / f'data-{n}').mkdir()
         if args.case in ('all', 'fingerprint'):
             run.fingerprint()
+            run.checkpoint()
+        if args.case == 'disk':
+            run.disk()
             run.checkpoint()
     except BaseException as exc:
         import traceback

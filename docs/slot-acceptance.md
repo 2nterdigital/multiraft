@@ -26,6 +26,12 @@ On macOS, a source RocksDB build may also require `LIBCLANG_PATH` and
 `--binary PATH` selects a prebuilt binary. `--output-dir PATH` must name a new
 directory; the default is a unique directory below `.tmp/slot-foundation/`.
 `--case normal`, `--case recovery` and `--case fingerprint` run the three independent scenario sets; `--case all` runs all three.
+`--case disk` runs the separate [disk-backed FSM](./specs/2026-10-18-disk-backed-fsm-mode.md) scenario (`--fsm-storage disk`, fresh `disk-data-N` directories; not part of `all`).
+It covers exact effects and idempotency, refused compaction with no whole-image snapshot, a SIGKILLed
+leader that reopens its RocksDB state, SIGKILL of all three nodes followed by a cold restart, and a clean
+cold restart with a committed suffix. On every node, the value and apply count must match. The FSM-stored
+applied index must equal the bridge's applied index, and that index must be equal across nodes. The other
+cases pass `--fsm-storage image`, the default whole-image mode, and are unchanged.
 
 The Python standard-library harness launches three actual `Popen` OS processes,
 with distinct PIDs, loopback Raft/application/admin ports and per-node data.

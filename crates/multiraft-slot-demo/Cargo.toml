@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 multiraft-fsm = { path = "../multiraft-fsm" }
 multiraft-net = { path = "../multiraft-net" }
 multiraft-slot = { path = "../multiraft-slot" }
+multiraft-store = { path = "../multiraft-store" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

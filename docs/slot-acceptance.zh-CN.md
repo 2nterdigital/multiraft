@@ -24,6 +24,10 @@ macOS 从源码构建 RocksDB 时可能需要将 `LIBCLANG_PATH`、`DYLD_LIBRARY
 设为 Xcode toolchain 的 `usr/lib`。`--binary PATH` 指定已构建二进制；
 `--output-dir PATH` 必须是尚不存在的目录，默认在 `.tmp/slot-foundation/`
 创建唯一目录。`--case normal`、`--case recovery` 或 `--case fingerprint` 可分别运行三个独立场景集；`--case all` 运行全部三组。
+`--case disk` 运行独立的[落盘状态机](./specs/2026-10-18-disk-backed-fsm-mode.zh-CN.md)场景（`--fsm-storage disk`，使用新的 `disk-data-N` 目录，不包含在 `all` 中）：
+精确效果与幂等、压缩被拒绝且没有整块快照、被 SIGKILL 的 leader 重新打开其 RocksDB 状态、三节点同时 SIGKILL 后冷重启，
+以及正常关停后的冷重启与新提交后缀。每个节点上值和 apply 次数必须一致，FSM 中存的 applied index 必须等于 bridge 的
+applied index，且各节点该 index 相同。其他用例传入默认的整块模式 `--fsm-storage image`，行为不变。
 
 Python 标准库脚本通过 `Popen` 启动三个真实 OS 进程，分别持有不同 PID、
 loopback Raft／应用 RPC／管理端口和数据目录。候选端口同时保留，启动前释放；

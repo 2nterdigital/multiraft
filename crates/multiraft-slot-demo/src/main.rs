@@ -6,10 +6,11 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use fsm::{Command, DemoFsm, Gate, GateState, Image};
+use fsm::{Command, DemoFsm, DiskImage, Gate, GateState, Image};
 use multiraft_slot::{
     ClusterLayout, LayoutConfig, SlotHandle, SlotId, SlotNodeConfig, SlotNodeOwner,
 };
+use multiraft_store::DiskFsmDb;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -31,12 +32,21 @@ struct Args {
     per_slot_requests: usize,
     #[arg(long, default_value_t = 16)]
     global_requests: usize,
+    /// `image` keeps whole-image snapshots; `disk` keeps state in per-Slot RocksDB.
+    #[arg(long, value_enum, default_value_t = FsmStorage::Image)]
+    fsm_storage: FsmStorage,
+}
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum FsmStorage {
+    Image,
+    Disk,
 }
 #[derive(Clone)]
 struct App {
     handle: SlotHandle<DemoFsm>,
     gate: Arc<Gate>,
     controls: bool,
+    disk: bool,
 }
 #[derive(Deserialize)]
 struct Write {
@@ -146,7 +156,7 @@ async fn status(State(app): State<App>) -> Json<Value> {
     let inflight = app.handle.inflight();
     let gate = app.gate.state.lock().expect("gate mutex");
     Json(
-        json!({"ok":true,"node_id":app.handle.node_id(),"digest":app.handle.layout().digest().0,"route_digest":app.handle.layout().route_digest().0,"slots":slots,"inflight":{"global":inflight.global.requests,"slots":inflight.slots.iter().map(|s|s.requests).collect::<Vec<_>>()},"gate":{"entered":gate.entered,"released":gate.released,"command_id":gate.command_id}}),
+        json!({"ok":true,"node_id":app.handle.node_id(),"fsm_storage":if app.disk {"disk"} else {"image"},"digest":app.handle.layout().digest().0,"route_digest":app.handle.layout().route_digest().0,"slots":slots,"inflight":{"global":inflight.global.requests,"slots":inflight.slots.iter().map(|s|s.requests).collect::<Vec<_>>()},"gate":{"entered":gate.entered,"released":gate.released,"command_id":gate.command_id}}),
     )
 }
 async fn compact(State(app): State<App>, Json(request): Json<Slot>) -> Json<Value> {
@@ -194,6 +204,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let config = LayoutConfig::from_json(&std::fs::read(args.layout)?)?;
     let layout = ClusterLayout::new(config)?;
+    let disk = args.fsm_storage == FsmStorage::Disk;
+    let data_dir = args.data_dir.clone();
     let mut config = SlotNodeConfig::new(layout.clone(), args.node_id, args.data_dir);
     config.limits.per_slot_requests = args.per_slot_requests;
     config.limits.global_requests = args.global_requests;
@@ -204,13 +216,22 @@ async fn main() -> anyhow::Result<()> {
     let owner = SlotNodeOwner::start(
         config,
         move |context: multiraft_net::FsmFactoryContext| {
+            let group = context.group_id();
             Ok(DemoFsm {
                 image: Image {
-                    group: context.group_id(),
+                    group,
                     ..Image::default()
                 },
                 layout: layout.clone(),
                 gate: factory_gate.clone(),
+                disk: if disk {
+                    Some(DiskImage::open(
+                        &DiskFsmDb::group_path(&data_dir, group),
+                        group,
+                    )?)
+                } else {
+                    None
+                },
             })
         },
         deadline(30000),
@@ -220,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
         handle: owner.handle(),
         gate: gate_control.clone(),
         controls: args.test_controls,
+        disk,
     };
     let router = Router::new()
         .route("/status", get(status))

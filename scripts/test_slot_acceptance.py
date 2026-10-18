@@ -53,6 +53,26 @@ class DisconnectTests(unittest.TestCase):
             run.finish()
 
 
+class FsmStorageTests(unittest.TestCase):
+    def test_disk_case_uses_disk_flag_and_separate_data_directories(self):
+        Path('.tmp').mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir='.tmp') as directory:
+            run = acceptance.Run('unused', Path(directory) / 'storage')
+            process = mock.Mock(pid=4242)
+            with mock.patch.object(acceptance.subprocess, 'Popen', return_value=process) as spawn:
+                run.start(1)
+                run.processes.clear()
+                run.fsm_storage = 'disk'
+                run.start(1)
+            image, disk = (call.args[0] for call in spawn.call_args_list)
+            self.assertEqual(image[image.index('--fsm-storage') + 1], 'image')
+            self.assertTrue(image[image.index('--data-dir') + 1].endswith('/data-1'))
+            self.assertEqual(disk[disk.index('--fsm-storage') + 1], 'disk')
+            self.assertTrue(disk[disk.index('--data-dir') + 1].endswith('/disk-data-1'))
+            run.processes.clear()
+            run.finish()
+
+
 class InterruptionTests(unittest.TestCase):
     def check_interruption(self, trigger, expected_exit):
         Path('.tmp').mkdir(exist_ok=True)

@@ -1,6 +1,10 @@
 //! Deliberately small acceptance FSM, not a production message implementation.
-use multiraft_fsm::{ApplyOut, CaptureError, CaptureRefusal, StateMachine};
+use multiraft_fsm::{
+    AppliedState, ApplyOut, CaptureError, CaptureRefusal, DiskState, StateMachine,
+};
 use multiraft_slot::{ClusterLayout, SlotStateMachine};
+use multiraft_store::rocksdb::{IteratorMode, WriteBatch};
+use multiraft_store::{DiskFsmDb, DiskFsmOptions};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -63,10 +67,108 @@ impl Gate {
         Ok(())
     }
 }
+/// Disk-backed variant: values, commands and the apply count live only in
+/// RocksDB, committed with the applied position (`--fsm-storage disk`).
+pub struct DiskImage {
+    db: DiskFsmDb,
+    /// Applied index found in RocksDB when this process opened the store.
+    opened_index: Option<u64>,
+}
+const VALUES: &str = "values";
+const COMMANDS: &str = "commands";
+impl DiskImage {
+    pub fn open(path: &std::path::Path, group: u64) -> io::Result<Self> {
+        let mut options = DiskFsmOptions::new(b"slot-demo-disk-v1".to_vec());
+        options.column_families = vec![VALUES.into(), COMMANDS.into()];
+        let db = DiskFsmDb::open(path, group, options)?;
+        let opened_index = Self::read_u64(&db, b"applied_index")?;
+        Ok(Self { db, opened_index })
+    }
+    fn read_u64(db: &DiskFsmDb, key: &[u8]) -> io::Result<Option<u64>> {
+        let bytes = db
+            .db()
+            .get_cf(db.cf("default")?, key)
+            .map_err(io::Error::other)?;
+        bytes
+            .map(|b| {
+                Ok(u64::from_be_bytes(
+                    b.try_into().map_err(|_| io::Error::other("bad u64 row"))?,
+                ))
+            })
+            .transpose()
+    }
+    fn value(&self, key: &str) -> io::Result<i64> {
+        let bytes = self
+            .db
+            .db()
+            .get_cf(self.db.cf(VALUES)?, key)
+            .map_err(io::Error::other)?;
+        Ok(bytes
+            .map(|b| serde_json::from_slice(&b))
+            .transpose()?
+            .unwrap_or(0))
+    }
+    fn command(&self, id: &str) -> io::Result<Option<(Command, Effect)>> {
+        let bytes = self
+            .db
+            .db()
+            .get_cf(self.db.cf(COMMANDS)?, id)
+            .map_err(io::Error::other)?;
+        Ok(bytes.map(|b| serde_json::from_slice(&b)).transpose()?)
+    }
+    fn commands(&self) -> io::Result<BTreeMap<String, (Command, Effect)>> {
+        let mut out = BTreeMap::new();
+        for row in self
+            .db
+            .db()
+            .iterator_cf(self.db.cf(COMMANDS)?, IteratorMode::Start)
+        {
+            let (key, value) = row.map_err(io::Error::other)?;
+            out.insert(
+                String::from_utf8_lossy(&key).into_owned(),
+                serde_json::from_slice(&value)?,
+            );
+        }
+        Ok(out)
+    }
+}
 pub struct DemoFsm {
     pub image: Image,
     pub layout: ClusterLayout,
     pub gate: Arc<Gate>,
+    pub disk: Option<DiskImage>,
+}
+/// Same-id same-intent replays the stored effect; a changed intent is refused.
+fn decide(
+    existing: Option<&(Command, Effect)>,
+    current: i64,
+    command: &Command,
+) -> io::Result<(Effect, bool)> {
+    if let Some((original, effect)) = existing {
+        return Ok(if original == command {
+            (effect.clone(), false)
+        } else {
+            (
+                Effect {
+                    accepted: false,
+                    ..effect.clone()
+                },
+                false,
+            )
+        });
+    }
+    let value = current
+        .checked_add(command.delta)
+        .ok_or_else(|| io::Error::other("counter overflow"))?;
+    Ok((
+        Effect {
+            key: command.key.clone(),
+            command_id: command.command_id.clone(),
+            value,
+            accepted: true,
+        },
+        true,
+    ))
 }
 impl DemoFsm {
     fn check_key(&self, group: u64, key: &str) -> io::Result<()> {
@@ -93,37 +195,18 @@ impl StateMachine for DemoFsm {
         self.check_key(group, &command.key)?;
         self.gate.wait(&command.command_id)?;
         self.image.apply_calls += 1;
-        let effect = if let Some((original, effect)) = self.image.commands.get(&command.command_id)
-        {
-            if original == &command {
-                effect.clone()
-            } else {
-                Effect {
-                    accepted: false,
-                    ..effect.clone()
-                }
-            }
-        } else {
-            let value = self
-                .image
-                .values
-                .get(&command.key)
-                .copied()
-                .unwrap_or(0)
-                .checked_add(command.delta)
-                .ok_or_else(|| io::Error::other("counter overflow"))?;
-            self.image.values.insert(command.key.clone(), value);
-            let effect = Effect {
-                key: command.key.clone(),
-                command_id: command.command_id.clone(),
-                value,
-                accepted: true,
-            };
+        let current = self.image.values.get(&command.key).copied().unwrap_or(0);
+        let (effect, new) = decide(
+            self.image.commands.get(&command.command_id),
+            current,
+            &command,
+        )?;
+        if new {
+            self.image.values.insert(command.key.clone(), effect.value);
             self.image
                 .commands
                 .insert(command.command_id.clone(), (command, effect.clone()));
-            effect
-        };
+        }
         Ok(ApplyOut {
             effects: serde_json::to_vec(&effect)?,
         })
@@ -193,11 +276,80 @@ impl StateMachine for DemoFsm {
         }
         Ok(writer.bytes)
     }
+    fn disk_state(&mut self) -> Option<&mut dyn DiskState> {
+        if self.disk.is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+impl DiskState for DemoFsm {
+    fn durable_applied(&self) -> io::Result<Option<Vec<u8>>> {
+        self.disk
+            .as_ref()
+            .ok_or_else(|| io::Error::other("not disk-backed"))?
+            .db
+            .applied_record()
+    }
+    fn apply_durable(
+        &mut self,
+        group: u64,
+        index: u64,
+        data: Option<&[u8]>,
+        applied: &AppliedState,
+    ) -> io::Result<ApplyOut> {
+        let command = data.map(serde_json::from_slice::<Command>).transpose()?;
+        if let Some(command) = &command {
+            self.check_key(group, &command.key)?;
+            self.gate.wait(&command.command_id)?;
+        }
+        let disk = self
+            .disk
+            .as_ref()
+            .ok_or_else(|| io::Error::other("not disk-backed"))?;
+        let mut batch = WriteBatch::default();
+        let default = disk.db.cf("default")?;
+        batch.put_cf(default, b"applied_index", index.to_be_bytes());
+        let mut effects = Vec::new();
+        if let Some(command) = command {
+            let calls = DiskImage::read_u64(&disk.db, b"apply_calls")?.unwrap_or(0) + 1;
+            batch.put_cf(default, b"apply_calls", calls.to_be_bytes());
+            let existing = disk.command(&command.command_id)?;
+            let (effect, new) = decide(existing.as_ref(), disk.value(&command.key)?, &command)?;
+            if new {
+                batch.put_cf(
+                    disk.db.cf(VALUES)?,
+                    &command.key,
+                    serde_json::to_vec(&effect.value)?,
+                );
+                batch.put_cf(
+                    disk.db.cf(COMMANDS)?,
+                    &command.command_id,
+                    serde_json::to_vec(&(&command, &effect))?,
+                );
+            }
+            effects = serde_json::to_vec(&effect)?;
+        }
+        disk.db.commit(batch, applied)?;
+        Ok(ApplyOut { effects })
+    }
 }
 impl SlotStateMachine for DemoFsm {
     fn query(&self, group: u64, request: &[u8]) -> io::Result<Vec<u8>> {
         let key: String = serde_json::from_slice(request)?;
         self.check_key(group, &key)?;
+        if let Some(disk) = &self.disk {
+            return Ok(serde_json::to_vec(&serde_json::json!({
+                "key": key,
+                "value": disk.value(&key)?,
+                "apply_calls": DiskImage::read_u64(&disk.db, b"apply_calls")?.unwrap_or(0),
+                "commands": disk.commands()?,
+                "storage": "disk",
+                "applied_index": DiskImage::read_u64(&disk.db, b"applied_index")?,
+                "opened_index": disk.opened_index,
+            }))?);
+        }
         Ok(serde_json::to_vec(
             &serde_json::json!({"key":key,"value":self.image.values.get(&key).copied().unwrap_or(0),"apply_calls":self.image.apply_calls,"commands":self.image.commands}),
         )?)
@@ -240,6 +392,7 @@ mod tests {
             },
             layout,
             gate: Arc::new(Gate::default()),
+            disk: None,
         }
     }
     #[test]
