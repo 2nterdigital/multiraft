@@ -5,33 +5,6 @@ use multiraft_core::{
 };
 use openraft::vote::RaftLeaderId;
 
-/// Whether a pristine local voter may initialize the Group's membership.
-///
-/// `Allowed` keeps native startup behavior: a pristine voter initializes (the
-/// preferred initializer immediately, others after the grace fallback).
-/// `Forbidden` never initializes: the Group may only be caught up by an existing
-/// leader (log or snapshot). It is the library side of OpenRaft's documented
-/// rejoin procedures; OpenRaft assumes stable storage and cannot tell a
-/// brand-new node from a wiped member, so the application must not start a
-/// wiped voter of a formed Group outside those procedures. Persisted local
-/// state never initializes under either policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum InitializePolicy {
-    #[default]
-    Allowed,
-    Forbidden,
-}
-
-impl InitializePolicy {
-    /// Bounded operational source label.
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::Allowed => "allowed",
-            Self::Forbidden => "forbidden",
-        }
-    }
-}
-
 pub(crate) fn digest_label(value: Option<[u8; 32]>) -> Option<String> {
     value.map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
@@ -50,22 +23,8 @@ impl<S: StateMachine> MultiRaft<S> {
     pub(crate) async fn register_startup_group(
         &self,
         group: GroupId,
-        policy: InitializePolicy,
     ) -> Result<(StartupProvenance, tokio::time::Instant), MultiRaftError> {
         self.ensure_node_log().await?;
-        let provenance = self.local_provenance(group)?;
-        tracing::info!(target: "multiraft::startup", node_id = self.node_id, group_id = group,
-            phase = "register", initialize_policy = policy.code(),
-            startup_provenance = provenance.code(), "startup Group registration begins");
-        let registered = self.spawn_local_group(group).await?;
-        Ok((provenance, registered))
-    }
-
-    /// Local storage provenance; call after `ensure_node_log`.
-    pub(super) fn local_provenance(
-        &self,
-        group: GroupId,
-    ) -> Result<StartupProvenance, MultiRaftError> {
         let mut provenance = StartupProvenance::Pristine;
         if !self.config.data_dir.as_os_str().is_empty() {
             provenance = self
@@ -79,9 +38,9 @@ impl<S: StateMachine> MultiRaft<S> {
                 provenance = snapshots;
             }
         }
-        Ok(provenance)
+        let registered = self.spawn_local_group(group).await?;
+        Ok((provenance, registered))
     }
-
     pub(crate) async fn startup_eligible(&self, group: GroupId) -> Result<bool, MultiRaftError> {
         let raft = self
             .raft(group)

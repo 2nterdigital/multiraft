@@ -1,7 +1,7 @@
 //! Owned fixed-slot runtime. Handles retain no idle native or listener resources.
 use crate::limits::{Budget, MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES};
 use crate::runtime_error::{native, startup_failure};
-use crate::startup::{local_voter_slots, SlotStartupPlan};
+use crate::startup::SlotStartupPlan;
 use crate::{
     ClusterLayout, InflightStatus, NodeId, RuntimeError, ShutdownReport, SlotId, SlotLimits,
     SlotManifest, SlotStatus,
@@ -45,9 +45,8 @@ pub struct SlotNodeConfig {
     /// fields are checked against the verified manifest before opening the node.
     pub native: ClusterConfig,
     pub limits: SlotLimits,
-    /// Per-slot initialize policy, bootstrap grace and recovery budget for the
-    /// native preference startup. The default allows initialization on every
-    /// slot with a 1000 ms grace; see [`SlotStartupPlan`].
+    /// Bootstrap grace and recovery budget for the native preference startup;
+    /// default 1000 ms grace and 30 s budget. See [`SlotStartupPlan`].
     pub startup: SlotStartupPlan,
 }
 impl SlotNodeConfig {
@@ -70,15 +69,12 @@ impl SlotNodeConfig {
             startup: SlotStartupPlan::default(),
         }
     }
-    pub(crate) fn validate(&self) -> Result<(), RuntimeError> {
+    fn validate(&self) -> Result<(), RuntimeError> {
         self.limits.validate()?;
         self.layout
             .node(self.node_id)
             .map_err(|_| RuntimeError::InvalidConfig)?;
-        if !self
-            .startup
-            .validate(&local_voter_slots(&self.layout, self.node_id))
-        {
+        if !self.startup.validate() {
             return Err(RuntimeError::InvalidConfig);
         }
         let c = &self.native;
@@ -208,10 +204,10 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
                     .map_err(|_| RuntimeError::InvalidConfig)?,
                 voters: assignment.voters.clone(),
             };
-            groups.push(
-                StartupGroup::new(group, Some(assignment.preferred_initializer))
-                    .with_initialize(config.startup.policy(assignment.slot)),
-            );
+            groups.push(StartupGroup {
+                group,
+                preferred_initializer: Some(assignment.preferred_initializer),
+            });
         }
         let mut cluster = config.native;
         // Source the native compatibility domain from the disk-verified layout.

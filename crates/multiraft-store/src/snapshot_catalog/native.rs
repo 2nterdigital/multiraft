@@ -122,26 +122,6 @@ impl SnapshotCatalog {
         group: GroupId,
         max_bytes: usize,
     ) -> io::Result<multiraft_core::StartupProvenance> {
-        self.classify_provenance(group, max_bytes, true)
-    }
-
-    /// The same validation and classification as [`Self::startup_provenance`]
-    /// without its post-validation cleanup: inert candidates and a pending
-    /// activation are left in place, so the namespace is never mutated.
-    pub fn probe_provenance(
-        &self,
-        group: GroupId,
-        max_bytes: usize,
-    ) -> io::Result<multiraft_core::StartupProvenance> {
-        self.classify_provenance(group, max_bytes, false)
-    }
-
-    fn classify_provenance(
-        &self,
-        group: GroupId,
-        max_bytes: usize,
-        cleanup: bool,
-    ) -> io::Result<multiraft_core::StartupProvenance> {
         use multiraft_core::StartupProvenance;
         check_cap(max_bytes)?;
         let mut registry = self
@@ -233,9 +213,6 @@ impl SnapshotCatalog {
             // an abandoned first candidate. Preserve its bytes for native log
             // coverage checks and exact repair; the namespace budget still applies.
             return Ok(StartupProvenance::Pristine);
-        }
-        if !cleanup {
-            return Ok(StartupProvenance::Persisted);
         }
         let mut removed = false;
         if let Some(path) = pending_path {

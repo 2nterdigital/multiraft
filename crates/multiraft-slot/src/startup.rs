@@ -1,19 +1,10 @@
-//! Native preference startup plan and the pre-start local Raft state probe.
+//! Static inputs for the native preference startup of the local voter slots.
 //!
-//! The bootstrap decision (which slots may initialize) belongs to the caller:
-//! it probes local state with [`SlotNodeConfig::probe_local_state`] before
-//! starting, chooses an [`InitializePolicy`] per slot, and passes the result in
-//! [`SlotNodeConfig::startup`]. This crate never derives policy on its own.
-use crate::{NodeId, SlotId, SlotNodeConfig};
-use multiraft_core::{StartupProvenance, TypeConfig};
-use multiraft_net::InitializePolicy;
-use multiraft_store::{FileLogStoreOf, RocksLogDb, SnapshotCatalog};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io,
-    path::Path,
-    time::Duration,
-};
+//! Startup uses only the native `start_groups_with_preference` admission: the
+//! layout names each slot's `preferred_initializer` and this plan supplies the
+//! grace and recovery budget. This crate keeps no bootstrap record and adds no
+//! initialization rule of its own.
+use std::time::Duration;
 
 /// Accepted [`SlotStartupPlan::bootstrap_grace`] range (the native admission bounds).
 pub const BOOTSTRAP_GRACE_RANGE: std::ops::RangeInclusive<Duration> =
@@ -25,26 +16,13 @@ pub const MAX_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// All local voter slots are registered first and then recovered concurrently
 /// by one native `start_groups_with_preference` batch. Each slot carries the
-/// layout's `preferred_initializer` and the policy chosen here:
-///
-/// - [`InitializePolicy::Allowed`] (default for every slot): a pristine slot
-///   initializes the layout membership — the preferred initializer at once,
-///   any other voter only after `bootstrap_grace` if the group is still
-///   uninitialized (native fallback, reported as `fallback == true`).
-/// - [`InitializePolicy::Forbidden`]: a pristine slot never initializes; it
-///   must be caught up by an existing leader (OpenRaft `wait_for_recovery`:
-///   applied covers the first observed leader commit). Startup fails if that
-///   does not happen within `recovery_timeout`. This is the library side of
-///   OpenRaft's documented rejoin procedures; the caller must not start a
-///   wiped voter of a formed group outside them (OpenRaft assumes stable
-///   storage and provides no vote protection for wiped members).
-///
-/// Persisted slots only recover under either policy.
+/// layout's `preferred_initializer`. A slot with persisted local state only
+/// recovers. A pristine slot initializes the layout membership: the preferred
+/// initializer at once, any other voter only after `bootstrap_grace` if the
+/// group is still uninitialized (native fallback, reported as
+/// `fallback == true`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotStartupPlan {
-    /// Per-slot policy; a local voter slot absent here is `Allowed`. Every key
-    /// must be a slot this node votes in, otherwise startup is rejected.
-    pub initialize: BTreeMap<SlotId, InitializePolicy>,
     /// Native grace before a non-preferred voter falls back to initializing.
     /// Must be within [`BOOTSTRAP_GRACE_RANGE`]; default 1000 ms.
     pub bootstrap_grace: Duration,
@@ -57,7 +35,6 @@ pub struct SlotStartupPlan {
 impl Default for SlotStartupPlan {
     fn default() -> Self {
         Self {
-            initialize: BTreeMap::new(),
             bootstrap_grace: Duration::from_millis(1000),
             recovery_timeout: MAX_RECOVERY_TIMEOUT,
         }
@@ -65,246 +42,9 @@ impl Default for SlotStartupPlan {
 }
 
 impl SlotStartupPlan {
-    /// Set one slot's policy.
-    #[must_use]
-    pub fn with_policy(mut self, slot: SlotId, policy: InitializePolicy) -> Self {
-        self.initialize.insert(slot, policy);
-        self
-    }
-
-    /// The policy that applies to `slot` (`Allowed` when not listed).
-    pub fn policy(&self, slot: SlotId) -> InitializePolicy {
-        self.initialize.get(&slot).copied().unwrap_or_default()
-    }
-
-    pub(crate) fn validate(&self, local_slots: &[SlotId]) -> bool {
+    pub(crate) fn validate(&self) -> bool {
         BOOTSTRAP_GRACE_RANGE.contains(&self.bootstrap_grace)
             && !self.recovery_timeout.is_zero()
             && self.recovery_timeout <= MAX_RECOVERY_TIMEOUT
-            && self.initialize.keys().all(|s| local_slots.contains(s))
     }
-}
-
-/// Failure of [`SlotNodeConfig::probe_local_state`]. Unknown or inconsistent
-/// on-disk state is an error, never `Pristine`.
-#[derive(Debug, thiserror::Error)]
-pub enum ProbeError {
-    #[error("invalid slot runtime configuration")]
-    InvalidConfig,
-    #[error("local Raft state of slot {slot:?} cannot be classified")]
-    Storage {
-        /// `None` when the failure is node-wide (log backend selection/open).
-        slot: Option<SlotId>,
-        #[source]
-        source: io::Error,
-    },
-}
-
-impl SlotNodeConfig {
-    /// Classify each local voter slot's Raft storage as `Pristine` or
-    /// `Persisted` without starting anything and without creating, locking or
-    /// modifying any file.
-    ///
-    /// The classification is the one the native batch reports as
-    /// `GroupStartupReport::provenance`, composed from the same storage
-    /// classifiers as `MultiRaft::local_provenance` / `log_provenance` in
-    /// multiraft-net (`multiraft/startup.rs`, `multiraft/recovery.rs`):
-    ///
-    /// - RocksDB log: `Persisted` iff the group's metadata has `ever_written`
-    ///   (a vote, committed id, purge or any appended entry was ever stored).
-    ///   An absent database (no `raft-log-backend` marker and no
-    ///   `raft-rocksdb/`) is pristine; a marker without `raft-rocksdb/CURRENT`
-    ///   or an unknown marker is an error, as in the native opener.
-    /// - Native snapshot catalog (`snapshots/`): `Persisted` iff a validated
-    ///   active snapshot exists. Unrecognized namespaces are errors.
-    /// - Node-wide, with the same refusal set as the native opener
-    ///   (`open_node_log`): every id with a `group-<id>/` FileLog root or a
-    ///   `snapshots/<id>/` namespace in `data_dir` is checked, including ids
-    ///   this node does not vote in. A malformed FileLog namespace, a
-    ///   malformed snapshot namespace of an id whose FileLog is pristine (the
-    ///   native check short-circuits on a persisted FileLog), and persisted
-    ///   FileLog or snapshot history without a RocksDB log basis are errors
-    ///   ([`ProbeError::Storage`] with `slot: None`), because the native
-    ///   runtime refuses to start on such a directory.
-    ///
-    /// `slot-manifest.json` is neither read nor written: a crash after the
-    /// manifest was created but before any Raft state was stored leaves a
-    /// manifest-only directory, which is `Pristine`. Nonexistent `data_dir`
-    /// means every slot is `Pristine`.
-    ///
-    /// Call it only while no runtime owns `data_dir` (before
-    /// [`crate::SlotNodeOwner::start`] or after shutdown completed).
-    ///
-    /// # Errors
-    ///
-    /// [`ProbeError::InvalidConfig`] when the configuration would be rejected
-    /// by `start`; [`ProbeError::Storage`] for unreadable, unknown or
-    /// inconsistent local state.
-    pub fn probe_local_state(&self) -> Result<BTreeMap<SlotId, StartupProvenance>, ProbeError> {
-        self.validate().map_err(|_| ProbeError::InvalidConfig)?;
-        let groups = local_voter_groups(self)?;
-        probe(&self.data_dir, self.native.max_snapshot_bytes, &groups)
-    }
-}
-
-fn local_voter_groups(config: &SlotNodeConfig) -> Result<Vec<(SlotId, u64)>, ProbeError> {
-    local_voter_slots(&config.layout, config.node_id)
-        .into_iter()
-        .map(|slot| {
-            config
-                .layout
-                .group_for_slot(slot)
-                .map(|group| (slot, group))
-                .map_err(|_| ProbeError::InvalidConfig)
-        })
-        .collect()
-}
-
-pub(crate) fn local_voter_slots(layout: &crate::ClusterLayout, node: NodeId) -> Vec<SlotId> {
-    layout
-        .config()
-        .slots
-        .iter()
-        .filter(|a| a.voters.contains(&node))
-        .map(|a| a.slot)
-        .collect()
-}
-
-fn storage(slot: Option<SlotId>) -> impl FnOnce(io::Error) -> ProbeError {
-    move |source| ProbeError::Storage { slot, source }
-}
-
-/// Mirrors `open_node_log` backend selection, read-only.
-fn open_log(root: &Path) -> io::Result<Option<RocksLogDb<TypeConfig>>> {
-    let database = root.join("raft-rocksdb");
-    let marked = match std::fs::read(root.join("raft-log-backend")) {
-        Ok(bytes) if bytes == b"rocksdb-v1\n" => true,
-        Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported Raft log backend marker",
-            ))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
-    };
-    if database.join("CURRENT").is_file() {
-        return RocksLogDb::open_read_only(&database).map(Some);
-    }
-    if marked {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "RocksDB Raft log database missing after backend selection",
-        ));
-    }
-    Ok(None)
-}
-
-/// Every group id with a legacy FileLog root (`group-<id>`) or a snapshot
-/// namespace (`snapshots/<id>`), as `open_node_log` collects them.
-fn history_ids(root: &Path) -> io::Result<BTreeSet<u64>> {
-    let mut ids = BTreeSet::new();
-    let mut scan = |dir: &Path, prefix: &str| -> io::Result<()> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        for entry in entries {
-            if let Some(id) = entry?
-                .file_name()
-                .to_str()
-                .and_then(|name| name.strip_prefix(prefix))
-                .and_then(|id| id.parse::<u64>().ok())
-            {
-                ids.insert(id);
-            }
-        }
-        Ok(())
-    };
-    scan(root, "group-")?;
-    scan(&root.join("snapshots"), "")?;
-    Ok(ids)
-}
-
-fn in_group(group: u64) -> impl FnOnce(io::Error) -> io::Error {
-    move |error| io::Error::new(error.kind(), format!("group {group}: {error}"))
-}
-
-/// Node-wide refusal of `open_node_log`, read-only and with the same refusal
-/// set: for every scanned id (voter or not) the FileLog namespace must be
-/// recognized; only when it is pristine is the snapshot namespace inspected
-/// (and must be recognized); persisted history of either kind needs a RocksDB
-/// log basis. Voter groups additionally get the per-group classification
-/// below, which, like native `local_provenance`, always inspects snapshots.
-fn check_history(
-    root: &Path,
-    db: Option<&RocksLogDb<TypeConfig>>,
-    catalog: &SnapshotCatalog,
-    max_snapshot_bytes: usize,
-) -> io::Result<()> {
-    for group in history_ids(root)? {
-        // Same short-circuit as `open_node_log`: the snapshot namespace is only
-        // inspected when the legacy FileLog is pristine.
-        let legacy = FileLogStoreOf::startup_provenance(root.join(format!("group-{group}")))
-            .map_err(in_group(group))?;
-        let persisted = legacy == StartupProvenance::Persisted
-            || catalog
-                .probe_provenance(group, max_snapshot_bytes)
-                .map_err(in_group(group))?
-                == StartupProvenance::Persisted;
-        if !persisted {
-            continue;
-        }
-        let basis = match db {
-            Some(db) => db.startup_provenance(group).map_err(in_group(group))?,
-            None => StartupProvenance::Pristine,
-        };
-        if basis == StartupProvenance::Pristine {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("group {group}: persisted FileLog or snapshot history without a RocksDB log basis; explicit migration or recovery required"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn probe(
-    root: &Path,
-    max_snapshot_bytes: usize,
-    groups: &[(SlotId, u64)],
-) -> Result<BTreeMap<SlotId, StartupProvenance>, ProbeError> {
-    let db = open_log(root).map_err(storage(None))?;
-    let catalog = SnapshotCatalog::new(root.join("snapshots"), 1);
-    check_history(root, db.as_ref(), &catalog, max_snapshot_bytes).map_err(storage(None))?;
-    let mut out = BTreeMap::new();
-    for &(slot, group) in groups {
-        let classify = || -> io::Result<StartupProvenance> {
-            let log = match &db {
-                Some(db) => db.startup_provenance(group)?,
-                None => StartupProvenance::Pristine,
-            };
-            let snapshots = catalog.probe_provenance(group, max_snapshot_bytes)?;
-            if log == StartupProvenance::Pristine {
-                let legacy =
-                    FileLogStoreOf::startup_provenance(root.join(format!("group-{group}")))?;
-                if legacy == StartupProvenance::Persisted
-                    || snapshots == StartupProvenance::Persisted
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "RocksDB group has no local log basis but persisted FileLog or snapshot history exists",
-                    ));
-                }
-            }
-            Ok(if snapshots == StartupProvenance::Persisted {
-                snapshots
-            } else {
-                log
-            })
-        };
-        out.insert(slot, classify().map_err(storage(Some(slot)))?);
-    }
-    Ok(out)
 }

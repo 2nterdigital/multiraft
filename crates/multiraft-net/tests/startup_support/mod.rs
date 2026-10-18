@@ -4,8 +4,8 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use multiraft_core::{ClusterConfig, FileLogSyncLevel, MultiRaftError};
 use multiraft_fsm::{ApplyOut, GroupId, StateMachine};
 use multiraft_net::{
-    FsmFactoryContext, GroupConfig, InitializePolicy, NodeOwner, RuntimeConfig, RuntimeError,
-    RuntimeHandle, StartupBatch, StartupGroup, StateMachineFactory,
+    FsmFactoryContext, GroupConfig, NodeOwner, RuntimeConfig, RuntimeError, RuntimeHandle,
+    StartupBatch, StartupGroup, StateMachineFactory,
 };
 use std::{
     fs::{self, OpenOptions},
@@ -59,7 +59,6 @@ impl Drop for Release {
 pub struct Bytes {
     pub value: Vec<u8>,
     lease: PathBuf,
-    restore_gate: Option<Gate>,
 }
 impl Drop for Bytes {
     fn drop(&mut self) {
@@ -90,9 +89,6 @@ impl StateMachine for Bytes {
         Ok(self.value.clone())
     }
     fn restore(&mut self, _: GroupId, data: &[u8]) -> Result<(), Self::Error> {
-        if let Some(gate) = &self.restore_gate {
-            gate.block();
-        }
         self.value = data.to_vec();
         Ok(())
     }
@@ -106,8 +102,6 @@ pub struct Factory {
     pub reject: Option<GroupId>,
     pub panic: Option<GroupId>,
     pub reject_validation: Option<GroupId>,
-    /// Blocks the first snapshot restore of this Group until released.
-    pub restore: Option<(GroupId, Gate)>,
 }
 impl Factory {
     pub fn new(root: &Path) -> Self {
@@ -119,7 +113,6 @@ impl Factory {
             reject: None,
             panic: None,
             reject_validation: None,
-            restore: None,
         }
     }
 }
@@ -136,11 +129,6 @@ impl StateMachineFactory<Bytes> for Factory {
         let fsm = Bytes {
             value: vec![],
             lease,
-            restore_gate: self
-                .restore
-                .as_ref()
-                .filter(|(id, _)| *id == context.group_id())
-                .map(|(_, gate)| gate.clone()),
         };
         if let Some((id, gate)) = &self.construct {
             if *id == context.group_id() {
@@ -177,15 +165,6 @@ pub fn batch(
     preferred: Option<u64>,
     budget: Duration,
 ) -> StartupBatch {
-    batch_with_policy(groups, voters, preferred, budget, InitializePolicy::Allowed)
-}
-pub fn batch_with_policy(
-    groups: &[u64],
-    voters: &[u64],
-    preferred: Option<u64>,
-    budget: Duration,
-    initialize: InitializePolicy,
-) -> StartupBatch {
     StartupBatch {
         input_digest: Some([7; 32]),
         groups: groups
@@ -196,7 +175,6 @@ pub fn batch_with_policy(
                     voters: voters.to_vec(),
                 },
                 preferred_initializer: preferred,
-                initialize,
             })
             .collect(),
         grace: GRACE,
@@ -250,24 +228,6 @@ pub fn reusable(root: &Path, peers: &[(u64, SocketAddr)]) {
         TcpListener::bind(address).unwrap();
     }
 }
-/// OpenRaft's normal transient outcomes while a leader is elected or changes:
-/// no leader yet or a stale one (`NotLeader`), a ReadIndex that could not reach
-/// a quorum in one heartbeat interval or did not finish in time, and a request
-/// whose deadline passed. Tests retry these within their own budget; production
-/// code never does. For writes `Deadline` and `NotLeader` leave the outcome
-/// unknown, so only idempotent test writes (the set-value [`Bytes`]) may retry.
-pub fn retryable(error: &RuntimeError) -> bool {
-    use multiraft_core::ReadIndexFailure;
-    matches!(
-        error,
-        RuntimeError::Source(MultiRaftError::NotLeader { .. })
-            | RuntimeError::Source(MultiRaftError::ReadIndex(
-                ReadIndexFailure::QuorumUnavailable { .. } | ReadIndexFailure::Deadline
-            ))
-            | RuntimeError::Deadline { .. }
-    )
-}
-
 pub async fn leader(handles: &[RuntimeHandle<Bytes>], group: u64) -> &RuntimeHandle<Bytes> {
     let nodes: Vec<_> = handles.iter().map(RuntimeHandle::node_id).collect();
     let index = confirmed_leader(&nodes, group, |index, until| {
@@ -294,22 +254,16 @@ where
         for (index, outcome) in outcomes.iter().enumerate() {
             let probe = &probe;
             pending.push(async move {
-                let mut attempts = 0_u32;
                 loop {
-                    // Never start a probe at or after the shared deadline: its
-                    // admission would fail with `Deadline` and race the outer
-                    // timeout. Park instead so the probes diagnostic is reported.
-                    if Instant::now() >= until {
-                        std::future::pending::<()>().await;
-                    }
-                    attempts += 1;
-                    let last = std::mem::take(&mut *outcome.lock().unwrap());
-                    *outcome.lock().unwrap() = format!("probing #{attempts}; previous: {last}");
+                    *outcome.lock().unwrap() = String::from("pending");
                     match probe(index, until).await {
                         Ok(()) => return index,
-                        Err(error) if retryable(&error) => {
-                            *outcome.lock().unwrap() = format!("#{attempts}: {error:?}")
-                        }
+                        Err(error @ RuntimeError::Source(MultiRaftError::NotLeader { .. }))
+                        | Err(
+                            error @ RuntimeError::Source(MultiRaftError::ReadIndex(
+                                multiraft_core::ReadIndexFailure::QuorumUnavailable { .. },
+                            )),
+                        ) => *outcome.lock().unwrap() = format!("{error:?}"),
                         Err(error) => panic!(
                             "unexpected leader read: group={group} node={} error={error:?}",
                             nodes[index]
@@ -377,25 +331,4 @@ async fn confirmed_leader_retries_while_another_read_is_pending() {
     .expect("a pending read must not prevent another node's next ReadIndex attempt");
     assert_eq!(confirmed, 1);
     assert_eq!(*calls.lock().unwrap(), [1, 2]);
-}
-
-#[tokio::test(start_paused = true)]
-async fn confirmed_leader_reports_probes_instead_of_panicking_at_the_deadline() {
-    // Every probe runs until the shared deadline and then fails its admission,
-    // as a real read does when `until` passes; the helper must report the
-    // probes diagnostic rather than panic on the Deadline error.
-    let outcome = tokio::spawn(confirmed_leader(&[1, 2], 7, |_, until| async move {
-        tokio::time::sleep_until(until).await;
-        Err(RuntimeError::Deadline {
-            phase: multiraft_net::RuntimePhase::Admission,
-            outcome_unknown: false,
-        })
-    }))
-    .await;
-    let panic = outcome.expect_err("no node confirmed").into_panic();
-    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
-    assert!(
-        message.starts_with("leader read timed out: group=7 probes="),
-        "{message}"
-    );
 }

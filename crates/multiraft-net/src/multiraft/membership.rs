@@ -13,27 +13,6 @@ impl<S: StateMachine> MultiRaft<S> {
     /// **Standby:** local node may be absent from `members` (voters only). Spawns
     /// the local raft without calling `initialize`; join via [`Self::add_standby`].
     pub async fn create_group(&self, group: u64, members: &[u64]) -> Result<(), MultiRaftError> {
-        self.create_group_with_policy(group, members, InitializePolicy::Allowed)
-            .await
-    }
-
-    /// [`Self::create_group`] with an explicit [`InitializePolicy`].
-    ///
-    /// `Allowed` is exactly [`Self::create_group`]. `Forbidden` spawns the local
-    /// raft and never calls `initialize` on either transport; the Group can only
-    /// be caught up by an existing leader (log or snapshot). Use it for a node
-    /// rejoining a formed Group through OpenRaft's documented procedures
-    /// (remove, re-add as learner, promote; or `allow_next_revert` on the leader
-    /// before wiping); `initialize` is only for brand-new nodes. Await
-    /// [`Self::wait_for_recovery`] before serving: on an empty log it completes
-    /// only after the first observed leader commit is applied.
-    /// An already-registered Group is left unchanged.
-    pub async fn create_group_with_policy(
-        &self,
-        group: u64,
-        members: &[u64],
-        policy: InitializePolicy,
-    ) -> Result<(), MultiRaftError> {
         if members.is_empty() {
             return Err(MultiRaftError::Other(anyhow::anyhow!(
                 "create_group requires at least one member"
@@ -54,7 +33,7 @@ impl<S: StateMachine> MultiRaft<S> {
             self.spawn_local_group(group).await?;
         }
 
-        if is_standby || policy == InitializePolicy::Forbidden {
+        if is_standby {
             // Learner: wait for leader `add_learner`; do not initialize.
             return Ok(());
         }
@@ -73,13 +52,6 @@ impl<S: StateMachine> MultiRaft<S> {
         }
 
         Ok(())
-    }
-
-    /// Whether the local native Raft of `group` holds any initialized state
-    /// (membership or log). A Forbidden Group stays uninitialized until a leader
-    /// replicates to it.
-    pub async fn is_initialized(&self, group: u64) -> Result<bool, MultiRaftError> {
-        self.startup_eligible(group).await.map(|eligible| !eligible)
     }
 
     /// Leader-only: add a Standby as an openraft Learner (`add_learner`, blocking).

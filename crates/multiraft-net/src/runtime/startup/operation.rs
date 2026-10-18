@@ -20,7 +20,7 @@ impl<S: StateMachine> RuntimeShared<S> {
             }
             let (provenance, registered) = self
                 .node
-                .register_startup_group(input.group.group_id, input.initialize)
+                .register_startup_group(input.group.group_id)
                 .await
                 .map_err(|e| failure(&progress, index, RuntimeError::Source(e)))?;
             update(&progress, index, |group| {
@@ -107,10 +107,7 @@ impl<S: StateMachine> RuntimeShared<S> {
         self.check_budget(&progress, index)?;
         let pristine =
             progress.lock().unwrap().groups[index].provenance == Some(StartupProvenance::Pristine);
-        let forbidden = input.initialize == InitializePolicy::Forbidden;
-        // Forbidden never dispatches initialize nor enters the grace fallback;
-        // the report keeps Pristine / NotDispatched / fallback=false.
-        if pristine && !forbidden && self.node.startup_voter() {
+        if pristine && self.node.startup_voter() {
             let preferred = input.preferred_initializer;
             if preferred.is_some_and(|id| id != self.node.node_id()) {
                 update(&progress, index, |group| group.phase = StartupPhase::Grace);
@@ -179,30 +176,15 @@ impl<S: StateMachine> RuntimeShared<S> {
         });
         self.check_budget(&progress, index)?;
         let deadline = progress.lock().unwrap().groups[index].deadline.unwrap();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if pristine && forbidden && self.node.startup_voter() {
-            // No durable-local "empty basis is done" shortcut: an empty rejoining
-            // voter must catch up from an existing leader within the budget.
-            // Native `wait_for_recovery` on an empty log pins its target to the
-            // first `cluster_committed` (set by AppendEntries `leader_commit`)
-            // and returns promptly if the Raft core stops (Fatal), carrying the
-            // native cause. A Standby is not in membership until a leader adds
-            // it, so it keeps the existing wait.
-            self.bounded(
-                index,
-                &progress,
-                self.node.wait_for_recovery(input.group.group_id, remaining),
-            )
-            .await?;
-        } else {
-            self.bounded(
-                index,
-                &progress,
-                self.node
-                    .wait_for_owned_recovery(input.group.group_id, remaining),
-            )
-            .await?;
-        }
+        self.bounded(
+            index,
+            &progress,
+            self.node.wait_for_owned_recovery(
+                input.group.group_id,
+                deadline.saturating_duration_since(Instant::now()),
+            ),
+        )
+        .await?;
         self.node
             .ensure_recovery_running(input.group.group_id)
             .map_err(|e| failure(&progress, index, RuntimeError::Source(e)))?;

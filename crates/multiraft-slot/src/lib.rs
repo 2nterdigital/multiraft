@@ -34,10 +34,8 @@ pub use limits::{
 };
 pub use multiraft_core::StartupProvenance;
 pub use multiraft_net::{AppliedView, ObservedLogId};
-pub use multiraft_net::{
-    GroupStartupReport, InitializeDisposition, InitializePolicy, StartupPhase, StartupReport,
-};
+pub use multiraft_net::{GroupStartupReport, InitializeDisposition, StartupPhase, StartupReport};
 pub use runtime::{SlotApplied, SlotHandle, SlotNodeConfig, SlotNodeOwner, SlotStateMachine};
 pub use runtime_error::{MaintenanceFailure, RuntimeError};
-pub use startup::{ProbeError, SlotStartupPlan, BOOTSTRAP_GRACE_RANGE, MAX_RECOVERY_TIMEOUT};
+pub use startup::{SlotStartupPlan, BOOTSTRAP_GRACE_RANGE, MAX_RECOVERY_TIMEOUT};
 pub use status::{ShutdownReport, SlotStatus};
