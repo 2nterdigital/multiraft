@@ -225,3 +225,52 @@ fn chunk_stream_roundtrip_survives_republish_and_rejects_corruption() {
     let error = receive(true, &mut source).err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
 }
+
+#[test]
+fn an_exact_retry_of_the_last_chunk_is_accepted_and_other_disorder_is_not() {
+    let root = scratch();
+    let workspace = Workspace::open(root.path().join("ws")).unwrap();
+    let capture = workspace.temp_checkpoint();
+    fs::create_dir_all(capture.path()).unwrap();
+    let data: Vec<u8> = (0..(MAX_CHUNK_BYTES + 5)).map(|i| (i % 7) as u8).collect();
+    fs::write(capture.path().join("a.sst"), &data).unwrap();
+    let published = workspace.publish(7, capture, meta(5)).unwrap();
+    let mut source = ChunkSource::open(published.bytes, 7).unwrap();
+    let DiskChunk::Begin { transfer, manifest } = source.next_chunk().unwrap().unwrap() else {
+        panic!("begin first");
+    };
+    let mut incoming = Incoming::begin(&workspace, 7, transfer, manifest).unwrap();
+    let mut chunks = Vec::new();
+    while let Some(DiskChunk::Data {
+        file,
+        offset,
+        bytes,
+        sha256,
+        ..
+    }) = source.next_chunk().unwrap()
+    {
+        chunks.push((file, offset, bytes, sha256));
+    }
+    let (file, offset, bytes, sha) = &chunks[0];
+    incoming.write(*file, *offset, bytes, *sha).unwrap();
+    incoming.write(*file, *offset, bytes, *sha).unwrap();
+    let (file2, offset2, bytes2, sha2) = &chunks[1];
+    let mut incoming = {
+        let mut fresh =
+            Incoming::begin(&workspace, 7, transfer, incoming.manifest_bytes().to_vec()).unwrap();
+        fresh.write(*file, *offset, bytes, *sha).unwrap();
+        assert!(
+            fresh.write(*file2, offset2 + 1, bytes2, *sha2).is_err(),
+            "gap refused"
+        );
+        Incoming::begin(&workspace, 7, transfer, fresh.manifest_bytes().to_vec()).unwrap()
+    };
+    for (file, offset, bytes, sha) in &chunks {
+        incoming.write(*file, *offset, bytes, *sha).unwrap();
+    }
+    // Retrying the final (digest-carrying) chunk after the file completed is a no-op.
+    let (file, offset, bytes, sha) = chunks.last().unwrap();
+    incoming.write(*file, *offset, bytes, *sha).unwrap();
+    assert!(incoming.complete());
+    assert_eq!(fs::read(incoming.dir().join("a.sst")).unwrap(), data);
+}

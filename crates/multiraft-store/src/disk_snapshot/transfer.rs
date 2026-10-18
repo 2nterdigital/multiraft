@@ -170,6 +170,8 @@ pub(crate) struct Incoming {
     writer: Option<fs::File>,
     hasher: Sha256,
     verified: bool,
+    /// (file, offset, length) of the last chunk written.
+    last: Option<(u32, u64, usize)>,
 }
 
 impl Incoming {
@@ -193,6 +195,7 @@ impl Incoming {
             writer: None,
             hasher: Sha256::new(),
             verified: false,
+            last: None,
         })
     }
 
@@ -232,6 +235,11 @@ impl Incoming {
         bytes: &[u8],
         sha256: Option<[u8; 32]>,
     ) -> io::Result<()> {
+        if self.last == Some((file, offset, bytes.len())) {
+            // A retry of a chunk whose first delivery was written; the file
+            // digest still covers the bytes actually written.
+            return Ok(());
+        }
         let Some(entry) = self.manifest.files.get(self.file) else {
             return Err(invalid("disk snapshot chunk after the last file"));
         };
@@ -256,6 +264,7 @@ impl Incoming {
         writer.write_all(bytes)?;
         self.hasher.update(bytes);
         self.offset = end;
+        self.last = Some((file, offset, bytes.len()));
         match sha256 {
             None => Ok(()),
             Some(expected) => {

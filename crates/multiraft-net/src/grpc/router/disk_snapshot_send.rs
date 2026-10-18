@@ -3,11 +3,15 @@
 //! the OpenRaft snapshot. Memory is one chunk, independent of snapshot size.
 //!
 //! Each call gets the native install timeout as its own deadline, so progress
-//! rather than total size bounds the transfer. The owned job stops between
+//! rather than total size bounds the transfer; a failed chunk is retried a few
+//! times (the receiver accepts an exact duplicate of its last chunk). The owned job stops between
 //! chunks once its waiter is gone (OpenRaft canceled or replaced the stream).
 use super::*;
 use multiraft_store::disk_snapshot::ChunkSource;
 use tokio::time::Instant;
+
+/// Deliveries of one chunk before the transfer is abandoned.
+const CHUNK_ATTEMPTS: usize = 5;
 
 fn unreachable(reason: String) -> StreamingError<TypeConfig> {
     StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(reason)))
@@ -50,10 +54,28 @@ pub(super) async fn stream(
         let Some(chunk) = chunk else {
             break;
         };
-        transport
-            .send::<_, ()>(target, group_id, "/raft/snapshot_chunk", chunk, deadline())
-            .await
-            .map_err(StreamingError::Unreachable)?;
+        // A chunk whose reply timed out may still have been written; the
+        // receiver accepts an exact retry of its last chunk, so a transient
+        // stall costs one chunk instead of the whole transfer.
+        let mut attempt = 0;
+        loop {
+            match transport
+                .send::<_, ()>(target, group_id, "/raft/snapshot_chunk", &chunk, deadline())
+                .await
+            {
+                Ok(()) => break,
+                Err(error) if attempt + 1 >= CHUNK_ATTEMPTS || abandoned() => {
+                    return Err(StreamingError::Unreachable(error));
+                }
+                Err(error) => {
+                    attempt += 1;
+                    tracing::debug!(target: "multiraft::transport", peer = target, group_id,
+                        attempt, error = %error, "retrying disk snapshot chunk");
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
+                }
+            }
+        }
     }
     // Release the hard-link lease off the async workers.
     tokio::task::spawn_blocking(move || drop(source));

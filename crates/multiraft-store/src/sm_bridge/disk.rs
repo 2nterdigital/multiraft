@@ -41,6 +41,9 @@ pub(super) struct DiskRuntime {
     pub(super) transition: tokio::sync::Mutex<()>,
     /// The transfer currently being received, at most one per Group.
     pub(super) incoming: std::sync::Mutex<Option<Incoming>>,
+    /// Serializes chunk writes and verification, so a retried chunk waits for
+    /// its first delivery instead of racing it.
+    pub(super) receiving: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub(super) fn unsupported(operation: &str) -> io::Error {

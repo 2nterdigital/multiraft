@@ -53,6 +53,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         self.require_disk()?;
         match chunk {
             DiskChunk::Begin { transfer, manifest } => {
+                let _receiving = self.disk_rt.receiving.lock().await;
                 let workspace = self.disk_workspace().await?;
                 let group = self.group_id;
                 let incoming = tokio::task::spawn_blocking(move || {
@@ -73,25 +74,34 @@ impl<S: StateMachine> StateMachineStore<S> {
                 bytes,
                 sha256,
             } => {
-                let mut incoming = self
-                    .take_incoming(|incoming| incoming.transfer() == transfer)
-                    .ok_or_else(|| invalid("unknown disk snapshot transfer"))?;
-                let (incoming, result) = tokio::task::spawn_blocking(move || {
-                    let result = incoming.write(file, offset, &bytes, sha256);
-                    (incoming, result)
+                // Owned task: if the RPC is cancelled (sender deadline), the
+                // write still finishes and puts the transfer back, so the
+                // sender's retry of this chunk is recognized as a duplicate.
+                let store = self.clone();
+                tokio::spawn(async move {
+                    let _receiving = store.disk_rt.receiving.clone().lock_owned().await;
+                    let mut incoming = store
+                        .take_incoming(|incoming| incoming.transfer() == transfer)
+                        .ok_or_else(|| invalid("unknown disk snapshot transfer"))?;
+                    let (incoming, result) = tokio::task::spawn_blocking(move || {
+                        let result = incoming.write(file, offset, &bytes, sha256);
+                        (incoming, result)
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                    match result {
+                        Ok(()) => {
+                            store.restore_incoming(incoming);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            discard(incoming);
+                            Err(error)
+                        }
+                    }
                 })
                 .await
-                .map_err(io::Error::other)?;
-                match result {
-                    Ok(()) => {
-                        self.restore_incoming(incoming);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        discard(incoming);
-                        Err(error)
-                    }
-                }
+                .map_err(io::Error::other)?
             }
         }
     }
@@ -111,6 +121,7 @@ impl<S: StateMachine> StateMachineStore<S> {
                 "disk snapshot manifest disagrees with its metadata",
             ));
         }
+        let _receiving = self.disk_rt.receiving.lock().await;
         let mut incoming = self
             .take_incoming(|incoming| incoming.manifest_bytes() == data)
             .ok_or_else(|| invalid("disk snapshot files were not received"))?;
