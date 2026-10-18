@@ -73,7 +73,12 @@ gRPC transport").
 The receiver stages one transfer per Group in `staging-{nonce}`: chunks must
 arrive in order, never exceed the manifest sizes, and each file's digest must
 match before the next file starts. A new `Begin` replaces an unfinished
-transfer. Before `/raft/snapshot` is dispatched to OpenRaft, the server checks:
+transfer, but not one verified at ingress within the last 60 s (it may be about
+to be installed; replacing it would make that install fail fatally); such a
+`Begin` is refused and the sender retries later. A re-sent submission of an
+already verified manifest is accepted without re-verifying. `Begin` carries the
+whole manifest (up to 32 MiB, enough for ~100k files); senders refuse manifests
+larger than that or than the snapshot message cap. Before `/raft/snapshot` is dispatched to OpenRaft, the server checks:
 
 - **digest**: every file arrived complete with a matching SHA-256;
 - **layout**: `DiskState::inspect_checkpoint` opens the staged checkpoint
@@ -97,7 +102,12 @@ this manifest, refuses to regress the applied position, gates reads
 2. `DiskState::install_checkpoint`: `DiskFsmDb` closes the live database and
    swaps directories with two renames through the workspace
    (`live → retired-N`, `staging → live`), syncing both parents after each,
-   then reopens. Any error renames the old directory back and reopens it.
+   then reopens without ever creating a database. Any error renames the old
+   directory back (or, if that rename fails too, leaves the live path missing
+   for recovery), runs swap recovery and reopens only an existing store; if
+   none can be opened the store stays closed and every call errors. A failure
+   before the swap (workspace, marker, owner closing) removes the staging and
+   reopens reads.
 3. Reloads the applied position from the swapped-in store and checks it
    against the metadata, runs the recovery-validation hooks, publishes a local
    checkpoint at the installed cut (the receiver's current snapshot), and
@@ -105,7 +115,8 @@ this manifest, refuses to regress the applied position, gates reads
 
 Crash recovery happens in `DiskFsmDb::open`, before RocksDB opens: live
 missing and `retired-*` present means the crash hit between the renames, so
-the retired (old) store is renamed back; live present means the swap finished
+the retired (old) store is renamed back; a live directory without `CURRENT`
+next to a `retired-*` is not a swapped-in store and is set aside the same way; live present means the swap finished
 and `retired-*` is garbage. Workspace leftovers (`tmp-*`, `staging-*`,
 leases, incomplete checkpoints) are removed when the bridge opens the
 workspace.
@@ -141,7 +152,10 @@ bulk bytes through them:
 - The sender's lease, the receiver's staging and the published checkpoint can
   each hold one snapshot's worth of disk space (hard links share SST data
   with the live store until compaction rewrites it).
-- `install_checkpoint` holds the FSM lock for close, two renames and reopen.
+- `inspect_checkpoint` (ingress) and `install_checkpoint` (close, two renames,
+  reopen) do blocking RocksDB/filesystem IO on a Tokio worker while holding
+  the bridge's FSM lock (the FSM lives inside that async mutex; moving it to a
+  blocking thread is follow-up work, as for apply).
 
 ## Verification
 

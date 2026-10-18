@@ -403,3 +403,138 @@ async fn failed_swaps_keep_the_old_store_live_and_durable() {
         );
     }
 }
+
+fn staging_dirs(root: &Path) -> usize {
+    std::fs::read_dir(DiskFsmDb::workspace_path(&path(root)).unwrap())
+        .unwrap()
+        .filter(|entry| {
+            let name = entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            name.starts_with("staging-") || name.starts_with("retired-")
+        })
+        .count()
+}
+
+/// Swap failures with the live directory moved away (a failed directory sync
+/// after the first rename; a failed rename back) must never leave an empty
+/// database at the live path, now or after a restart.
+#[tokio::test]
+async fn swap_failures_after_retire_never_replace_the_old_store_with_an_empty_one() {
+    let _serial = INSTALLS.lock().await;
+    let root = scratch();
+    let live = path(root.path());
+    {
+        let old = DiskFsmDb::open(&live, GROUP, options(b"disk-blobs-v1")).unwrap();
+        old.commit(
+            WriteBatch::default(),
+            &AppliedState::new(3, 1, b"old".to_vec()),
+        )
+        .unwrap();
+    }
+    let source =
+        DiskFsmDb::open(root.path().join("source"), GROUP, options(b"disk-blobs-v1")).unwrap();
+    source
+        .commit(
+            WriteBatch::default(),
+            &AppliedState::new(9, 1, b"new".to_vec()),
+        )
+        .unwrap();
+    let workspace = DiskFsmDb::workspace_path(&live).unwrap();
+    for fault in [
+        InstallFault::SyncFailAfterRetire,
+        InstallFault::RollbackRenameFail,
+    ] {
+        let mut db = DiskFsmDb::open(&live, GROUP, options(b"disk-blobs-v1")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let staged = workspace.join("staging-test");
+        let _ = std::fs::remove_dir_all(&staged);
+        source.checkpoint(&staged).unwrap();
+        inject_install_fault(Some(fault));
+        let result = db.install_checkpoint(&staged);
+        inject_install_fault(None);
+        assert!(result.is_err(), "{fault:?}");
+        assert_eq!(
+            db.applied_record().unwrap().as_deref(),
+            Some(&b"old"[..]),
+            "{fault:?}: the old store is live again"
+        );
+        drop(db);
+        let reopened = DiskFsmDb::open(&live, GROUP, options(b"disk-blobs-v1")).unwrap();
+        assert_eq!(
+            reopened.applied_record().unwrap().as_deref(),
+            Some(&b"old"[..]),
+            "{fault:?}"
+        );
+        assert!(
+            !std::fs::read_dir(&workspace).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("retired-")),
+            "{fault:?}: no retired store left behind"
+        );
+    }
+}
+
+/// A verified transfer waiting for OpenRaft's install is not replaced by a new
+/// `Begin` (that would make the install fail fatally), and a re-sent
+/// submission of the same manifest keeps it in place.
+#[tokio::test]
+async fn a_verified_transfer_survives_a_new_begin_and_a_resubmission() {
+    let _serial = INSTALLS.lock().await;
+    let root = scratch();
+    let (leader, meta, data) = leader(&root.path().join("a"), 20).await;
+    let expected = leader.with_fsm(|fsm| (fsm.sum(), fsm.blobs())).await;
+    let follower_root = root.path().join("b");
+    let mut follower = store(&follower_root, DiskBlobs::open(&path(&follower_root)));
+    apply(&mut follower, vec![membership(0), add(1, 1)]).await;
+    transfer(&follower, data.clone(), None).await.unwrap();
+    follower.verify_disk_snapshot(&meta, &data).await.unwrap();
+
+    // Another sender (new leader, or the same one after a deadline) starts over.
+    let error = transfer(&follower, data.clone(), None).await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+    follower.verify_disk_snapshot(&meta, &data).await.unwrap();
+
+    follower
+        .install_snapshot(&meta, io::Cursor::new(data.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        follower.with_fsm(|fsm| (fsm.sum(), fsm.blobs())).await,
+        expected
+    );
+    // Once installed, the slot is free for the next transfer.
+    transfer(&follower, data.clone(), None).await.unwrap();
+}
+
+/// A failure before the swap (here: the install marker cannot be written)
+/// removes the staging, reopens reads and leaves the old state.
+#[tokio::test]
+async fn a_failure_before_the_swap_cleans_up_and_reopens_reads() {
+    let _serial = INSTALLS.lock().await;
+    let root = scratch();
+    let (_leader, meta, data) = leader(&root.path().join("a"), 20).await;
+    let follower_root = root.path().join("b");
+    let mut follower = store(&follower_root, DiskBlobs::open(&path(&follower_root)));
+    apply(&mut follower, vec![membership(0), add(1, 1)]).await;
+    let old = follower.with_fsm(|fsm| (fsm.sum(), fsm.blobs())).await;
+    transfer(&follower, data.clone(), None).await.unwrap();
+    follower.verify_disk_snapshot(&meta, &data).await.unwrap();
+    // A non-empty directory where the marker file goes makes its rename fail.
+    let marker = DiskFsmDb::workspace_path(&path(&follower_root))
+        .unwrap()
+        .join("installed");
+    std::fs::create_dir_all(marker.join("blocker")).unwrap();
+    let result = follower
+        .install_snapshot(&meta, io::Cursor::new(data.clone()))
+        .await;
+    assert!(result.is_err());
+    follower.application_ready().unwrap();
+    assert_eq!(follower.with_fsm(|fsm| (fsm.sum(), fsm.blobs())).await, old);
+    assert_eq!(staging_dirs(&follower_root), 0, "staging removed");
+}

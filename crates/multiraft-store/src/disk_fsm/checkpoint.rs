@@ -1,7 +1,7 @@
 //! [`multiraft_fsm::DiskState`] snapshot hooks for [`DiskFsmDb`]: checkpoint,
 //! read-only inspection of a received checkpoint, and crash-safe install.
 use super::{check_markers, column_families, db_error, invalid, meta_cf, DiskFsmDb, APPLIED_KEY};
-use crate::disk_snapshot::install_dir;
+use crate::disk_snapshot::{install_dir, recover_swap};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::DB;
 use std::collections::BTreeSet;
@@ -64,7 +64,8 @@ impl DiskFsmDb {
 
     /// For [`multiraft_fsm::DiskState::install_checkpoint`]: close the live
     /// store, swap `dir` in (see [`crate::disk_snapshot::install_dir`]) and
-    /// reopen. Any failure puts the old store back and reopens it.
+    /// reopen. Any failure puts the old store back and reopens it, or leaves
+    /// the store closed (errors on every call) if even that fails.
     pub fn install_checkpoint(&mut self, dir: &Path) -> io::Result<()> {
         self.inspect_checkpoint(dir)?;
         let workspace = self.snapshot_workspace()?;
@@ -72,11 +73,11 @@ impl DiskFsmDb {
         let swapped = match install_dir(&self.path, &workspace, dir) {
             Ok(swapped) => swapped,
             Err(error) => {
-                self.db = Some(Self::open_db(&self.path, self.group, &self.options)?);
+                self.reopen_after_failure(&workspace);
                 return Err(error);
             }
         };
-        match Self::open_db(&self.path, self.group, &self.options) {
+        match Self::open_db(&self.path, self.group, &self.options, false) {
             Ok(db) => {
                 self.db = Some(db);
                 if let Err(error) = swapped.commit() {
@@ -86,9 +87,27 @@ impl DiskFsmDb {
                 Ok(())
             }
             Err(error) => {
-                swapped.rollback()?;
-                self.db = Some(Self::open_db(&self.path, self.group, &self.options)?);
+                if let Err(rollback) = swapped.rollback() {
+                    tracing::error!(error = %rollback, "failed to roll back an FSM store swap");
+                }
+                self.reopen_after_failure(&workspace);
                 Err(error)
+            }
+        }
+    }
+
+    /// After a failed install: finish or undo the swap on disk, then reopen
+    /// only an existing store (never create one). If that fails the store
+    /// stays closed and every later call errors (fail closed); the next
+    /// [`DiskFsmDb::open`] runs the same recovery.
+    fn reopen_after_failure(&mut self, workspace: &Path) {
+        let reopened = recover_swap(&self.path, workspace)
+            .and_then(|()| Self::open_db(&self.path, self.group, &self.options, false));
+        match reopened {
+            Ok(db) => self.db = Some(db),
+            Err(error) => {
+                tracing::error!(error = %error, "FSM store closed after a failed snapshot install");
+                self.db = None;
             }
         }
     }

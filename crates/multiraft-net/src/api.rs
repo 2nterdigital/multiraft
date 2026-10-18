@@ -72,8 +72,24 @@ pub async fn snapshot_chunk<S: StateMachine>(
     state_machine: &StateMachineStore<S>,
     req: &[u8],
 ) -> Result<Vec<u8>, tonic::Status> {
+    let chunk = decode_disk_chunk(req)?;
+    state_machine
+        .receive_disk_chunk(chunk)
+        .await
+        .map_err(|error| {
+            tonic::Status::failed_precondition(format!("disk snapshot chunk refused: {error}"))
+        })?;
+    Ok(encode::<Result<(), RaftError>>(Ok(())))
+}
+
+/// Data chunks hold at most `MAX_CHUNK_BYTES`; `Begin` carries the manifest,
+/// which may be up to `MAX_MANIFEST_BYTES` (checkpoints with many files).
+// tonic requires this concrete status type at the protocol boundary.
+#[allow(clippy::result_large_err)]
+fn decode_disk_chunk(req: &[u8]) -> Result<multiraft_store::DiskChunk, tonic::Status> {
     use bincode::Options;
-    let limit = (multiraft_store::disk_snapshot::MAX_CHUNK_BYTES + 64 * 1024) as u64;
+    use multiraft_store::disk_snapshot::{MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES};
+    let limit = (MAX_CHUNK_BYTES.max(MAX_MANIFEST_BYTES) + 64 * 1024) as u64;
     if req.len() as u64 > limit {
         return Err(tonic::Status::resource_exhausted(
             "disk snapshot chunk too large",
@@ -86,13 +102,14 @@ pub async fn snapshot_chunk<S: StateMachine>(
         .with_limit(limit)
         .deserialize(req)
         .map_err(|_| tonic::Status::invalid_argument("invalid disk snapshot chunk"))?;
-    state_machine
-        .receive_disk_chunk(chunk)
-        .await
-        .map_err(|error| {
-            tonic::Status::failed_precondition(format!("disk snapshot chunk refused: {error}"))
-        })?;
-    Ok(encode::<Result<(), RaftError>>(Ok(())))
+    if let multiraft_store::DiskChunk::Data { bytes, .. } = &chunk {
+        if bytes.len() > MAX_CHUNK_BYTES {
+            return Err(tonic::Status::resource_exhausted(
+                "disk snapshot chunk too large",
+            ));
+        }
+    }
+    Ok(chunk)
 }
 
 pub async fn transfer_leader<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
@@ -160,6 +177,37 @@ fn decode_snapshot_request(
 #[cfg(test)]
 mod snapshot_bound_tests {
     use super::*;
+
+    #[test]
+    fn disk_begin_carries_a_large_manifest_but_data_chunks_stay_bounded() {
+        use multiraft_store::disk_snapshot::{MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES};
+        use multiraft_store::DiskChunk;
+        // A manifest far larger than one chunk (e.g. ~100k checkpoint files).
+        let begin = encode(DiskChunk::Begin {
+            transfer: 1,
+            manifest: vec![b'x'; 8 * 1024 * 1024],
+        });
+        assert!(matches!(
+            decode_disk_chunk(&begin),
+            Ok(DiskChunk::Begin { .. })
+        ));
+        let too_big = encode(DiskChunk::Begin {
+            transfer: 1,
+            manifest: vec![b'x'; MAX_MANIFEST_BYTES + 128 * 1024],
+        });
+        assert!(decode_disk_chunk(&too_big).is_err());
+        let data = |len| {
+            encode(DiskChunk::Data {
+                transfer: 1,
+                file: 0,
+                offset: 0,
+                bytes: vec![0; len],
+                sha256: None,
+            })
+        };
+        assert!(decode_disk_chunk(&data(MAX_CHUNK_BYTES)).is_ok());
+        assert!(decode_disk_chunk(&data(MAX_CHUNK_BYTES + 1)).is_err());
+    }
     #[test]
     fn oversized_declared_metadata_is_classified_before_payload_completeness() {
         let meta = SnapshotMeta {

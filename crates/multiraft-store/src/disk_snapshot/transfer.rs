@@ -169,7 +169,7 @@ pub(crate) struct Incoming {
     offset: u64,
     writer: Option<fs::File>,
     hasher: Sha256,
-    verified: bool,
+    verified: Option<std::time::Instant>,
     /// (file, offset, length) of the last chunk written.
     last: Option<(u32, u64, usize)>,
 }
@@ -194,7 +194,7 @@ impl Incoming {
             offset: 0,
             writer: None,
             hasher: Sha256::new(),
-            verified: false,
+            verified: None,
             last: None,
         })
     }
@@ -220,11 +220,16 @@ impl Incoming {
     }
 
     pub(crate) fn verified(&self) -> bool {
-        self.verified
+        self.verified.is_some()
+    }
+
+    /// Verified within `hold`: it may still be waiting for OpenRaft's install.
+    pub(crate) fn awaiting_install(&self, hold: std::time::Duration) -> bool {
+        self.verified.is_some_and(|at| at.elapsed() < hold)
     }
 
     pub(crate) fn mark_verified(&mut self) {
-        self.verified = true;
+        self.verified = Some(std::time::Instant::now());
     }
 
     /// Append one chunk in order; verify size and digest at each file's end (blocking IO).

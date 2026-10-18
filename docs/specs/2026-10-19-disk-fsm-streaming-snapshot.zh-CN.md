@@ -37,7 +37,7 @@
 
 ### 接收与校验（传输入口）
 
-接收端每个 Group 只暂存一个传输，位于 `staging-{nonce}`：分块必须按序到达，不得超过 manifest 中的大小，下一个文件开始前当前文件摘要必须匹配。新的 `Begin` 替换未完成的传输。`/raft/snapshot` 交给 OpenRaft 之前，服务端检查：
+接收端每个 Group 只暂存一个传输，位于 `staging-{nonce}`：分块必须按序到达，不得超过 manifest 中的大小，下一个文件开始前当前文件摘要必须匹配。新的 `Begin` 替换未完成的传输，但不替换最近 60 s 内已在入口校验通过的传输（它可能即将被安装，替换会让安装致命失败）；这样的 `Begin` 被拒绝，发送端稍后重试。对已校验 manifest 的重复提交直接接受，不重新校验。`Begin` 携带完整 manifest（最多 32 MiB，约可容纳 10 万个文件）；发送端拒绝超过该值或超过快照消息上限的 manifest。`/raft/snapshot` 交给 OpenRaft 之前，服务端检查：
 
 - **摘要**：每个文件完整到达且 SHA-256 匹配；
 - **布局**：`DiskState::inspect_checkpoint` 只读打开暂存的 checkpoint，要求列族、schema、Group 与应用格式标记都与本库一致；
@@ -50,10 +50,10 @@
 `install_snapshot` 要求该 manifest 的暂存传输已在入口校验通过，拒绝让 applied 位置回退，屏蔽读（validation `begin`），然后：
 
 1. 持久写入 `installed` 标记（截止点的 log id）。
-2. `DiskState::install_checkpoint`：`DiskFsmDb` 关闭活库，经工作区做两次改名（`live → retired-N`、`staging → live`），每次后同步两个父目录，然后重新打开。任何错误都把旧目录改名回去并重新打开。
+2. `DiskState::install_checkpoint`：`DiskFsmDb` 关闭活库，经工作区做两次改名（`live → retired-N`、`staging → live`），每次后同步两个父目录，然后重新打开，且从不创建数据库。任何错误都把旧目录改名回去（若这次改名也失败，则让活路径保持缺失以待恢复），执行替换恢复，只重新打开已存在的库；若都打不开，库保持关闭，之后每次调用都报错。替换之前的失败（工作区、标记、所有者关闭）会删除暂存并重新开放读取。
 3. 从换入的库重新读取 applied 位置并与元数据核对，执行恢复校验钩子，在安装截止点发布一个本地 checkpoint（接收端的当前快照），然后重新开放读取。
 
-崩溃恢复在 `DiskFsmDb::open` 中、RocksDB 打开之前进行：活库缺失且存在 `retired-*`，说明崩溃发生在两次改名之间，于是把 retired（旧库）改名回来；活库存在说明替换已完成，`retired-*` 是垃圾。工作区残留（`tmp-*`、`staging-*`、租约、不完整的 checkpoint）在桥接层打开工作区时删除。
+崩溃恢复在 `DiskFsmDb::open` 中、RocksDB 打开之前进行：活库缺失且存在 `retired-*`，说明崩溃发生在两次改名之间，于是把 retired（旧库）改名回来；存在 `retired-*` 时，没有 `CURRENT` 的活目录不是换入的库，同样被移开；活库存在说明替换已完成，`retired-*` 是垃圾。工作区残留（`tmp-*`、`staging-*`、租约、不完整的 checkpoint）在桥接层打开工作区时删除。
 
 替换完成后、OpenRaft 裁剪日志前崩溃，会让 FSM 超前于本地日志尾。启动基线检查只在 `installed` 标记恰好等于 FSM 的 applied 位置时接受这种情况，若没有更新的 checkpoint 就在该位置发布一个，并让 OpenRaft 裁剪到该位置（已安装状态是已提交的）。其他任何“FSM 超前于日志”的情况仍然 fail closed。
 
@@ -75,7 +75,7 @@
 - 恢复校验钩子在替换之后执行，因此校验拒绝会在新库已持久的情况下停止 Group（新库是已提交状态）。
 - OpenRaft 跳过安装（截止点已在本地提交）时，已校验的暂存目录会留在磁盘上，直到下一次传输或重启。
 - 发送端租约、接收端暂存和已发布 checkpoint 各自可能占用一份快照的磁盘空间（硬链接与活库共享 SST 数据，直到压缩重写）。
-- `install_checkpoint` 在关闭、两次改名和重新打开期间持有 FSM 锁。
+- `inspect_checkpoint`（入口）和 `install_checkpoint`（关闭、两次改名、重新打开）在持有桥接层 FSM 锁时于 Tokio 工作线程上做阻塞的 RocksDB/文件系统 IO（FSM 位于该异步互斥锁内；移到阻塞线程是后续工作，与 apply 相同）。
 
 ## 验证
 

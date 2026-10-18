@@ -9,6 +9,11 @@ use super::*;
 use crate::disk_snapshot::{DiskChunk, DiskManifest};
 use multiraft_fsm::ValidationKind;
 
+/// How long a transfer verified at ingress is protected from replacement by a
+/// new `Begin`: long enough for OpenRaft to dispatch its install, short enough
+/// that one whose install OpenRaft skipped does not block later transfers.
+const VERIFIED_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl<S: StateMachine> StateMachineStore<S> {
     fn require_disk(&self) -> io::Result<()> {
         if !self.disk {
@@ -54,6 +59,20 @@ impl<S: StateMachine> StateMachineStore<S> {
         match chunk {
             DiskChunk::Begin { transfer, manifest } => {
                 let _receiving = self.disk_rt.receiving.lock().await;
+                if self
+                    .disk_rt
+                    .incoming
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|incoming| incoming.awaiting_install(VERIFIED_HOLD))
+                {
+                    // Replacing it would make the pending install fail fatally.
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "a verified disk snapshot is awaiting install",
+                    ));
+                }
                 let workspace = self.disk_workspace().await?;
                 let group = self.group_id;
                 let incoming = tokio::task::spawn_blocking(move || {
@@ -122,6 +141,18 @@ impl<S: StateMachine> StateMachineStore<S> {
             ));
         }
         let _receiving = self.disk_rt.receiving.lock().await;
+        if self
+            .disk_rt
+            .incoming
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|incoming| incoming.verified() && incoming.manifest_bytes() == data)
+        {
+            // A re-sent submission of an already verified transfer: keep it in
+            // place, so a concurrent install can still take it.
+            return Ok(());
+        }
         let mut incoming = self
             .take_incoming(|incoming| incoming.manifest_bytes() == data)
             .ok_or_else(|| invalid("disk snapshot files were not received"))?;
@@ -200,25 +231,34 @@ impl<S: StateMachine> StateMachineStore<S> {
             }
         }
         self.validation.begin()?;
-        let workspace = self.disk_workspace().await?;
         let staged = incoming.take_dir();
+        // Until the swap is attempted the live store is untouched: a failure
+        // removes the staging and reopens the gate this install closed.
+        let abandon = |error: io::Error| -> io::Error {
+            let _ = std::fs::remove_dir_all(&staged);
+            let _ = self.validation.ready(false);
+            error
+        };
+        let workspace = self.disk_workspace().await.map_err(abandon)?;
         let marker = workspace.clone();
         tokio::task::spawn_blocking(move || marker.write_installed(&last))
             .await
-            .map_err(io::Error::other)??;
+            .map_err(io::Error::other)
+            .and_then(|written| written)
+            .map_err(abandon)?;
         let started = std::time::Instant::now();
         let (context, input) = {
             let mut inner = self.inner.lock().await;
             if self.native_is_closing() {
-                return Err(io::Error::new(
+                return Err(abandon(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "native snapshot owner closed",
-                ));
+                )));
             }
             let disk = inner
                 .fsm
                 .disk_state()
-                .ok_or_else(|| invalid("state machine left disk-backed mode"))?;
+                .ok_or_else(|| abandon(invalid("state machine left disk-backed mode")))?;
             if let Err(error) = disk.install_checkpoint(&staged) {
                 let _ = std::fs::remove_dir_all(&staged);
                 return Err(error);

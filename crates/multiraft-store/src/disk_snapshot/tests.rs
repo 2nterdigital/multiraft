@@ -274,3 +274,34 @@ fn an_exact_retry_of_the_last_chunk_is_accepted_and_other_disorder_is_not() {
     assert!(incoming.complete());
     assert_eq!(fs::read(incoming.dir().join("a.sst")).unwrap(), data);
 }
+
+#[test]
+fn recover_swap_prefers_the_retired_store_over_a_live_dir_without_current() {
+    let root = scratch();
+    let live = root.path().join("group-7");
+    let workspace = root.path().join("group-7.snapshots");
+    fs::create_dir_all(&workspace).unwrap();
+    write_tree(&workspace.join("retired-1"), "old");
+    // E.g. an empty directory a failed reopen left at the live path.
+    fs::create_dir_all(&live).unwrap();
+    recover_swap(&live, &workspace).unwrap();
+    assert_eq!(fs::read_to_string(live.join("CURRENT")).unwrap(), "old");
+    assert_eq!(fs::read_dir(&workspace).unwrap().count(), 0);
+}
+
+#[test]
+fn a_manifest_with_tens_of_thousands_of_files_round_trips() {
+    let files: Vec<(String, u64)> = (0..30_000)
+        .map(|i| (format!("{i:06}.sst"), 64 << 20))
+        .collect();
+    let refs: Vec<(&str, u64)> = files.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+    let large = manifest(&refs);
+    let bytes = large.encode().unwrap();
+    assert!(
+        bytes.len() > MAX_CHUNK_BYTES,
+        "larger than one data chunk: {}",
+        bytes.len()
+    );
+    assert!(bytes.len() < MAX_MANIFEST_BYTES);
+    assert_eq!(DiskManifest::decode(&bytes, 7).unwrap().files.len(), 30_000);
+}

@@ -119,7 +119,12 @@ impl SnapshotSender {
         option: RPCOption,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
-        if snapshot.snapshot.get_ref().len() > transport.snapshot_cap {
+        // The manifest travels twice: in `Begin` (bounded by MAX_MANIFEST_BYTES
+        // at the receiver) and as the OpenRaft snapshot (bounded by the cap).
+        let manifest = snapshot.snapshot.get_ref().len();
+        if manifest > transport.snapshot_cap
+            || manifest > multiraft_store::disk_snapshot::MAX_MANIFEST_BYTES
+        {
             return Err(refused(
                 "disk snapshot manifest exceeds the snapshot message cap",
             ));

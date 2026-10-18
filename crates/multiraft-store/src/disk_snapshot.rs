@@ -26,7 +26,8 @@ const MAGIC: &[u8] = b"multiraft-disk-snapshot-v1\n";
 /// Every disk snapshot id starts with this prefix; whole-image ids never do.
 pub const DISK_SNAPSHOT_ID_PREFIX: &str = "disk-v1-";
 const MAX_FILES: usize = 100_000;
-const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
+/// Largest manifest accepted (also bounds the `Begin` chunk on the wire).
+pub const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 
 /// One file of a checkpoint directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -24,6 +24,10 @@ pub enum InstallFault {
     ErrorAfterRetire,
     /// Abort the process between the two renames.
     AbortAfterRetire,
+    /// Fail the directory sync right after the first rename.
+    SyncFailAfterRetire,
+    /// Fail the second rename and then the rename back (live stays missing).
+    RollbackRenameFail,
 }
 
 static FAULT: Mutex<Option<InstallFault>> = Mutex::new(None);
@@ -41,6 +45,8 @@ fn fault() -> Option<InstallFault> {
         Ok("error_before_swap") => Some(InstallFault::ErrorBeforeSwap),
         Ok("error_after_retire") => Some(InstallFault::ErrorAfterRetire),
         Ok("abort_after_retire") => Some(InstallFault::AbortAfterRetire),
+        Ok("sync_fail_after_retire") => Some(InstallFault::SyncFailAfterRetire),
+        Ok("rollback_rename_fail") => Some(InstallFault::RollbackRenameFail),
         _ => None,
     }
 }
@@ -85,7 +91,9 @@ impl Swapped {
 
 /// Replace the closed store at `live` with `staged` (a verified, synced
 /// directory inside `workspace`, same filesystem). On error the old store is
-/// back at `live`.
+/// put back at `live` when possible; otherwise `live` may be missing (never
+/// replaced by anything else) and [`recover_swap`] restores the retired store.
+/// Callers must run [`recover_swap`] after an error before reopening.
 pub fn install_dir(live: &Path, workspace: &Path, staged: &Path) -> io::Result<Swapped> {
     let fault = fault();
     if fault == Some(InstallFault::ErrorBeforeSwap) {
@@ -93,27 +101,49 @@ pub fn install_dir(live: &Path, workspace: &Path, staged: &Path) -> io::Result<S
     }
     let retired = workspace.join(format!("retired-{}", nonce()));
     fs::rename(live, &retired)?;
-    sync_both(live, workspace)?;
+    let put_back = |error: io::Error| -> io::Error {
+        if fault == Some(InstallFault::RollbackRenameFail) {
+            return error; // simulated failed rename back: live stays missing
+        }
+        if fs::rename(&retired, live).is_ok() {
+            let _ = sync_both(live, workspace);
+        }
+        error
+    };
+    let synced = if fault == Some(InstallFault::SyncFailAfterRetire) {
+        Err(injected("sync after retire"))
+    } else {
+        sync_both(live, workspace)
+    };
+    if let Err(error) = synced {
+        return Err(put_back(error));
+    }
     if fault == Some(InstallFault::AbortAfterRetire) {
         eprintln!("injected disk install fault: aborting between swap renames");
         std::process::abort();
     }
-    let second = if fault == Some(InstallFault::ErrorAfterRetire) {
+    let second = if matches!(
+        fault,
+        Some(InstallFault::ErrorAfterRetire | InstallFault::RollbackRenameFail)
+    ) {
         Err(injected("after retire"))
     } else {
         fs::rename(staged, live)
     };
     if let Err(error) = second {
-        fs::rename(&retired, live)?;
-        sync_both(live, workspace)?;
-        return Err(error);
+        return Err(put_back(error));
     }
-    sync_both(live, workspace)?;
-    Ok(Swapped {
+    let swapped = Swapped {
         live: live.to_owned(),
         workspace: workspace.to_owned(),
         retired,
-    })
+    };
+    if let Err(error) = sync_both(live, workspace) {
+        // The new store's rename may not be durable; go back to the old one.
+        let _ = swapped.rollback();
+        return Err(error);
+    }
+    Ok(swapped)
 }
 
 /// Finish or undo an interrupted swap before the store at `live` is opened.
@@ -138,6 +168,14 @@ pub fn recover_swap(live: &Path, workspace: &Path) -> io::Result<()> {
         return Ok(());
     }
     retired.sort();
+    // A swap only ever moves a complete store (with CURRENT) into `live`. A
+    // `live` without CURRENT next to a retired store is not a swapped-in store
+    // (e.g. an empty directory left by a failed reopen); the retired one wins.
+    if !retired.is_empty() && live.try_exists()? && !live.join("CURRENT").try_exists()? {
+        let stray = workspace.join(format!("failed-{}", nonce()));
+        fs::rename(live, &stray)?;
+        failed.push(stray);
+    }
     if !live.try_exists()? {
         if let Some(newest) = retired.pop() {
             fs::rename(&newest, live)?;

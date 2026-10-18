@@ -85,7 +85,7 @@ impl DiskFsmDb {
     ) -> io::Result<Self> {
         let path = path.as_ref();
         crate::disk_snapshot::recover_swap(path, &Self::workspace_path(path)?)?;
-        let db = Self::open_db(path, group, &options)?;
+        let db = Self::open_db(path, group, &options, true)?;
         Ok(Self {
             db: Some(db),
             path: path.to_owned(),
@@ -94,9 +94,19 @@ impl DiskFsmDb {
         })
     }
 
-    fn open_db(path: &Path, group: GroupId, options: &DiskFsmOptions) -> io::Result<DB> {
+    /// `create`: whether a missing database may be created. Reopening after an
+    /// install never creates; a missing store there must fail closed.
+    fn open_db(
+        path: &Path,
+        group: GroupId,
+        options: &DiskFsmOptions,
+        create: bool,
+    ) -> io::Result<DB> {
         let names = column_families(options)?;
         let existing = path.join("CURRENT").try_exists()?;
+        if !existing && !create {
+            return Err(invalid("FSM database missing after a snapshot install"));
+        }
         if !existing {
             match std::fs::read_dir(path) {
                 Ok(mut entries) => {
