@@ -39,3 +39,6 @@ pub use runtime::{SlotApplied, SlotHandle, SlotNodeConfig, SlotNodeOwner, SlotSt
 pub use runtime_error::{MaintenanceFailure, RuntimeError};
 pub use startup::{SlotStartupPlan, BOOTSTRAP_GRACE_RANGE, MAX_RECOVERY_TIMEOUT};
 pub use status::{ShutdownReport, SlotStatus};
+
+mod transport;
+pub use transport::{SlotTransportConfig, SlotTransportNode};

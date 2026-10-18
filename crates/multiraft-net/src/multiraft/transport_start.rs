@@ -9,8 +9,8 @@ impl<S: StateMachine> MultiRaft<S> {
         factory: Arc<dyn StateMachineFactory<S>>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            config.raft_transport_fingerprint.is_none(),
-            "fingerprinted Raft transport requires gRPC"
+            config.raft_transport_fingerprint.is_none() && config.transport.is_none(),
+            "fingerprinted or overridden Raft transport requires gRPC"
         );
         config
             .validate_snapshot_storage()
@@ -73,6 +73,11 @@ impl<S: StateMachine> MultiRaft<S> {
                 )
             })?;
 
+        if let Some(transport) = &config.transport {
+            transport
+                .validate(&config.peers)
+                .map_err(anyhow::Error::msg)?;
+        }
         recovery::check_node_log(&config)?;
         let groups: GroupMap<S> = Arc::new(Mutex::new(BTreeMap::new()));
         let grpc_router = GrpcRouter::from_config(&config);
@@ -82,7 +87,11 @@ impl<S: StateMachine> MultiRaft<S> {
         let groups_for_server = groups.clone();
         let snapshot_cap = config.max_snapshot_bytes;
         let fingerprint = config.raft_transport_fingerprint;
-        let listener = tokio::net::TcpListener::bind(self_addr).await?;
+        let bind = config
+            .transport
+            .as_ref()
+            .map_or(self_addr, |t| t.listen_address);
+        let listener = tokio::net::TcpListener::bind(bind).await?;
         let tasks = tasks::OwnedTasks::default();
         let ingress_tasks = Arc::new(tasks::OwnedTasks::default());
         let ingress_accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));

@@ -96,7 +96,10 @@ impl ApplicationRpcOwner {
             core: Arc::new(Core {
                 node: config.local_node_id,
                 handler,
-                channels: GrpcPeerChannelPool::new(config.peers),
+                channels: match config.dial_addresses {
+                    Some(peers) => GrpcPeerChannelPool::with_dial_addresses(peers),
+                    None => GrpcPeerChannelPool::new(config.peers),
+                },
                 keys: config.metadata_keys,
                 admission: Arc::new(Semaphore::new(config.max_inflight)),
                 accepting: AtomicBool::new(true),
@@ -256,6 +259,9 @@ fn validate(config: &ApplicationRpcConfig) -> Result<(), RpcError> {
         {
             return Err(bad());
         }
+    }
+    if let Some(peers) = &config.dial_addresses {
+        multiraft_core::validate_dial_catalog(peers, nodes).map_err(|_| bad())?;
     }
     Ok(())
 }

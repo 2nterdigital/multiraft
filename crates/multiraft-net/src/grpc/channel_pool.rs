@@ -75,7 +75,7 @@ impl GrpcPeerChannelLease {
     }
 }
 struct PeerLink {
-    address: SocketAddr,
+    address: String,
     current: Mutex<Option<Arc<Generation>>>,
     connect: tokio::sync::Mutex<()>,
     next_generation: Mutex<u64>,
@@ -92,6 +92,15 @@ pub struct GrpcPeerChannelPool {
 }
 impl GrpcPeerChannelPool {
     pub fn new(peers: Vec<(NodeId, SocketAddr)>) -> Self {
+        Self::with_dial_addresses(
+            peers
+                .into_iter()
+                .map(|(id, addr)| (id, addr.to_string()))
+                .collect(),
+        )
+    }
+    /// The caller validates the complete transport catalog before publication.
+    pub fn with_dial_addresses(peers: Vec<(NodeId, String)>) -> Self {
         Self {
             peers: Arc::new(
                 peers

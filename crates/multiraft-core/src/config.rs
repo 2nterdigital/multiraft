@@ -77,6 +77,8 @@ impl FileLogSyncLevel {
 pub struct ClusterConfig {
     pub node_id: NodeId,
     pub peers: Vec<(NodeId, SocketAddr)>,
+    /// Optional transport-only dial and bind overrides; peers remain native identity.
+    pub transport: Option<crate::RaftTransportConfig>,
     /// Immutable native replication domain, checked on requests and responses.
     /// None accepts only legacy peers without a fingerprint; it is not a wildcard.
     pub raft_transport_fingerprint: Option<[u8; 32]>,
@@ -216,6 +218,7 @@ impl ClusterConfig {
             node_id,
             peers,
             raft_transport_fingerprint: None,
+            transport: None,
             data_dir: PathBuf::new(),
             log_storage_backend: LogStorageBackend::FileLog,
             heartbeat_interval_ms: 100,
