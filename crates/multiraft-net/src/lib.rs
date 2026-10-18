@@ -61,6 +61,16 @@ pub struct AppliedView<R> {
     pub applied: Option<ObservedLogId>,
 }
 
+/// A linearizable FSM query and the applied log identity captured under the
+/// same lock, after this call's own ReadIndex confirmation. `applied` is the
+/// serving FSM's own applied id, which the value reflects; it is at or beyond
+/// the confirmed read point but is sampled, not copied from that point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinearizableView<R> {
+    pub value: R,
+    pub applied: ObservedLogId,
+}
+
 pub use grpc::node_rpc;
 pub use grpc::GrpcPeerChannelError;
 pub use grpc::GrpcPeerChannelLease;

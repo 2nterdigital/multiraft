@@ -33,7 +33,7 @@ pub use limits::{
     Inflight, InflightStatus, SlotLimits, MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES,
 };
 pub use multiraft_core::StartupProvenance;
-pub use multiraft_net::{AppliedView, ObservedLogId};
+pub use multiraft_net::{AppliedView, LinearizableView, ObservedLogId};
 pub use multiraft_net::{GroupStartupReport, InitializeDisposition, StartupPhase, StartupReport};
 pub use runtime::{SlotApplied, SlotHandle, SlotNodeConfig, SlotNodeOwner, SlotStateMachine};
 pub use runtime_error::{MaintenanceFailure, RuntimeError};

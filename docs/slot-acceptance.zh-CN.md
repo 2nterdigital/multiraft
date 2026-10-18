@@ -57,7 +57,9 @@ owner 完成关闭且无剩余请求。脚本不访问实验室、SSH 或其他�
 仅 `--test-controls` 开启 `/gate`。gate 有 45 秒保护上限，管理线程可独立释放；
 本测试服务不应暴露为生产服务。`/compact` 只代表提交，`/status` 是本地瞬时事实，
 不代表 quorum readiness。本地 `/read` 保留 `result` 字段，并增加与值在同一 FSM
-锁内采集的 `applied`（term、node_id、index，或 null）。
+锁内采集的 `applied`（term、node_id、index，或 null）。线性一致 `/read` 同样增加
+`applied`（不为 null）：由提供服务的副本在 ReadIndex 之后、与值在同一 FSM 锁内采集，
+即该值所反映的 applied index，不小于读之前已完成的任何写。
 
 所有 HTTP 请求、原始响应／传输错误写入 `requests.jsonl`。布局、每次启动日志、
 数据和 `receipt.json` 在成功或失败时均保留。收据包括 PID、完整启动命令、通过
