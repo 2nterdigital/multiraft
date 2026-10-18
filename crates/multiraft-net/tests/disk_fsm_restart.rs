@@ -336,6 +336,7 @@ async fn disk_mode_requires_a_durable_voter_log() {
     // An empty data_dir selects memory logs; the FSM still has its own path.
     let fsm_root = memory.config.data_dir.clone();
     memory.config.data_dir = PathBuf::new();
+    memory.config.snapshot_mode = SnapshotMode::Disabled;
     let payload_applies = memory.payload_applies.clone();
     let result = NodeOwner::start(
         RuntimeConfig::new(
@@ -359,17 +360,18 @@ async fn disk_mode_requires_a_durable_voter_log() {
         deadline(),
     )
     .await;
-    assert!(result.is_err(), "memory logs cannot back a disk FSM");
+    let error = format!("{:?}", result.err().unwrap());
+    assert!(error.contains("requires the RocksDB Raft log"), "{error}");
 
     let mut file_log = nodes(root.path()).remove(0);
     file_log.config.log_storage_backend = LogStorageBackend::FileLog;
     file_log.config.file_log_sync_level = multiraft_core::FileLogSyncLevel::Data;
     file_log.config.snapshot_mode = SnapshotMode::Disabled;
-    let result = start(&file_log).await;
-    assert!(result.is_err(), "FileLog may apply before its group commit");
+    let error = format!("{:?}", start(&file_log).await.err().unwrap());
+    assert!(error.contains("requires the RocksDB Raft log"), "{error}");
 
     let mut standby = nodes(root.path()).remove(0);
     standby.config.snapshot_mode = SnapshotMode::StandbyOffload;
-    let result = start(&standby).await;
-    assert!(result.is_err(), "StandbyOffload hot-dumps whole images");
+    let error = format!("{:?}", start(&standby).await.err().unwrap());
+    assert!(error.contains("without StandbyOffload"), "{error}");
 }
