@@ -407,9 +407,9 @@ async fn failed_startup_reports_the_native_cause_and_releases_the_node() {
         }
         other => panic!("unexpected startup error: {other}"),
     }
-    // Listener, database lock and data directory are released: the same node
-    // starts again on the same ports and fails the same native way, proving
-    // the second start also cleans up.
+    // The first failed start released its listener and database lock: a
+    // leaked resource would make this second start fail inside
+    // `NodeOwner::start` instead of with the same native deadline failure.
     let again = try_start(&layout, 1, &dir, short(300)).await;
     assert!(
         matches!(again, Err(RuntimeError::StartupFailed { .. })),
