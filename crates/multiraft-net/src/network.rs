@@ -68,6 +68,14 @@ impl GroupRouter<TypeConfig, GroupId> for Router {
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
+        if multiraft_store::is_disk_snapshot(&snapshot.meta, snapshot.snapshot.get_ref()) {
+            // Disk snapshots stream checkpoint files; only the gRPC transport does that.
+            return Err(StreamingError::Unreachable(
+                openraft::error::Unreachable::new(&std::io::Error::other(
+                    "disk snapshots require the gRPC transport",
+                )),
+            ));
+        }
         let data: Vec<u8> = snapshot.snapshot.into_inner();
         let sending = self.send_snapshot(target, group_id, vote, snapshot.meta, data);
         tokio::pin!(sending, cancel);

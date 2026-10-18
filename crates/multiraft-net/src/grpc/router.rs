@@ -15,6 +15,7 @@ use openraft::OptionalSend;
 use openraft_multi::GroupRouter;
 use std::{fmt, future::Future, net::SocketAddr, sync::Arc};
 
+mod disk_snapshot_send;
 mod snapshot_send;
 use snapshot_send::SnapshotSender;
 

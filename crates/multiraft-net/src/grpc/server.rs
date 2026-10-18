@@ -169,12 +169,17 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
             state_machine.application_ready().map_err(|_| {
                 Status::unavailable("application validation pending; peer snapshot not dispatched")
             })?;
-            let result =
-                api::snapshot(&raft, &req.payload, state_machine.snapshot_byte_limit()).await;
+            let result = api::snapshot(&raft, &state_machine, &req.payload).await;
             // Fatal/Stopped can close the native API waiter before the application
             // worker returns. The owned receive slot follows the actual transition.
             state_machine.wait_native_quiescent().await;
             result?
+        }
+        "/raft/snapshot_chunk" => {
+            state_machine.application_ready().map_err(|_| {
+                Status::unavailable("application validation pending; disk snapshot chunk refused")
+            })?;
+            api::snapshot_chunk(&state_machine, &req.payload).await?
         }
         "/raft/vote" => api::vote(&raft, &req.payload).await,
         "/raft/transfer_leader" => api::transfer_leader(&raft, &req.payload).await,
