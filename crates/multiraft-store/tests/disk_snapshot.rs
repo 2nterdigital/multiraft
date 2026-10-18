@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use futures::stream;
 use multiraft_core::typ::{Entry, LogId};
@@ -24,7 +24,7 @@ use tokio::sync::Semaphore;
 
 const GROUP: GroupId = 7;
 /// Install faults are process-global; tests that install take this lock.
-static INSTALLS: Mutex<()> = Mutex::new(());
+static INSTALLS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn scratch() -> tempfile::TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/issue-190/store-tests");
@@ -251,7 +251,7 @@ async fn build_publishes_a_manifest_and_restart_serves_it() {
 
 #[tokio::test]
 async fn streamed_install_replaces_state_and_survives_restart() {
-    let _serial = INSTALLS.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = INSTALLS.lock().await;
     let root = scratch();
     let (leader, meta, data) = leader(&root.path().join("a"), 40).await;
     let expected = leader.with_fsm(|fsm| (fsm.sum(), fsm.blobs())).await;
@@ -297,7 +297,7 @@ async fn streamed_install_replaces_state_and_survives_restart() {
 
 #[tokio::test]
 async fn refused_transfers_leave_the_old_state() {
-    let _serial = INSTALLS.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = INSTALLS.lock().await;
     let root = scratch();
     let (_leader, meta, data) = leader(&root.path().join("a"), 40).await;
     let follower_root = root.path().join("b");
@@ -370,7 +370,7 @@ async fn refused_transfers_leave_the_old_state() {
 
 #[tokio::test]
 async fn failed_swaps_keep_the_old_store_live_and_durable() {
-    let _serial = INSTALLS.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = INSTALLS.lock().await;
     let root = scratch();
     let (_leader, meta, data) = leader(&root.path().join("a"), 40).await;
     let follower_root = root.path().join("b");
