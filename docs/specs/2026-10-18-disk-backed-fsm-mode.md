@@ -4,7 +4,9 @@
 
 Status: decisions frozen before implementation of ech0 #186 (step 1 of the
 long-term capacity plan, parent ech0 #184). Streaming snapshots for this mode
-are ech0 #190 and are not implemented here.
+(ech0 #190) are specified and implemented in
+[2026-10-19-disk-fsm-streaming-snapshot.md](./2026-10-19-disk-fsm-streaming-snapshot.md);
+the #190 notes below record the plan at freeze time.
 
 ## Goal
 

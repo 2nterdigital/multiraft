@@ -34,7 +34,8 @@
 | [2026-10-17-slot-admit-first-implementation.md](./plans/2026-10-17-slot-admit-first-implementation.md) | [2026-10-17-slot-admit-first-implementation.zh-CN.md](./plans/2026-10-17-slot-admit-first-implementation.zh-CN.md) | 当前最高执行优先级：真实 Admit → persist/delivery → 必要公平/热点隔离；T0–T7、M1–M3，非自动部署 |
 | [2026-10-16-slot-multiraft-foundation.md](./specs/2026-10-16-slot-multiraft-foundation.md) | [2026-10-16-slot-multiraft-foundation.zh-CN.md](./specs/2026-10-16-slot-multiraft-foundation.zh-CN.md) | 固定 Slot MultiRaft 底座：合同、路由、恢复与边界 |
 | [2026-10-16-slot-channel-fair-admission.md](./specs/2026-10-16-slot-channel-fair-admission.md) | [2026-10-16-slot-channel-fair-admission.zh-CN.md](./specs/2026-10-16-slot-channel-fair-admission.zh-CN.md) | 有界 Channel 公平准入、混合负载验证与后续热点隔离（规划） |
-| [2026-10-18-disk-backed-fsm-mode.md](./specs/2026-10-18-disk-backed-fsm-mode.md) | [2026-10-18-disk-backed-fsm-mode.zh-CN.md](./specs/2026-10-18-disk-backed-fsm-mode.zh-CN.md) | 落盘状态机模式：每 Slot 独立 FSM RocksDB、applied index 同 batch 提交、重启恢复；流式快照后续 |
+| [2026-10-18-disk-backed-fsm-mode.md](./specs/2026-10-18-disk-backed-fsm-mode.md) | [2026-10-18-disk-backed-fsm-mode.zh-CN.md](./specs/2026-10-18-disk-backed-fsm-mode.zh-CN.md) | 落盘状态机模式：每 Slot 独立 FSM RocksDB、applied index 同 batch 提交、重启恢复 |
+| [2026-10-19-disk-fsm-streaming-snapshot.md](./specs/2026-10-19-disk-fsm-streaming-snapshot.md) | [2026-10-19-disk-fsm-streaming-snapshot.zh-CN.md](./specs/2026-10-19-disk-fsm-streaming-snapshot.zh-CN.md) | 落盘模式流式快照：每 Slot checkpoint、gRPC 分块传输、暂存校验、崩溃安全替换、日志压缩；无 64 MiB 上限 |
 
 ## 对照 / 定位
 

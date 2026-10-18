@@ -3,7 +3,9 @@
 **English:** [2026-10-18-disk-backed-fsm-mode.md](./2026-10-18-disk-backed-fsm-mode.md)
 
 状态：ech0 #186（长期容量计划第 1 步，父票 ech0 #184）开工前冻结的决定。
-该模式的流式快照属于 ech0 #190，本文不实现。
+该模式的流式快照（ech0 #190）的规格与实现见
+[2026-10-19-disk-fsm-streaming-snapshot.zh-CN.md](./2026-10-19-disk-fsm-streaming-snapshot.zh-CN.md)；
+下文关于 #190 的说明记录的是冻结时的计划。
 
 ## 目标
 

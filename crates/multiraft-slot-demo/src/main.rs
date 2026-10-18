@@ -75,6 +75,19 @@ struct Slot {
     slot: u32,
 }
 #[derive(Deserialize)]
+struct Bulk {
+    key: String,
+    count: usize,
+    bytes: usize,
+    #[serde(default = "default_concurrency")]
+    concurrency: usize,
+    #[serde(default)]
+    seed: u64,
+}
+fn default_concurrency() -> usize {
+    8
+}
+#[derive(Deserialize)]
 struct GateRequest {
     command_id: Option<String>,
     #[serde(default)]
@@ -177,6 +190,49 @@ async fn compact(State(app): State<App>, Json(request): Json<Slot>) -> Json<Valu
         },
     )
 }
+/// Test-only: start a background writer that proposes `count` blob commands
+/// to the key's slot (disk mode), `concurrency` at a time. Each command makes
+/// the FSM generate and store `bytes` (at most 4 MiB) incompressible bytes.
+/// Failed proposals are retried (a retried command may apply twice; callers
+/// read the resulting byte count from the FSM). Progress is visible in reads.
+async fn bulk(State(app): State<App>, Json(request): Json<Bulk>) -> Json<Value> {
+    if !app.controls || !app.disk {
+        return Json(error(
+            "bulk writes need --test-controls and --fsm-storage disk",
+        ));
+    }
+    let concurrency = request.concurrency.clamp(1, 64);
+    let limit = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let handle = app.handle.clone();
+    tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..request.count {
+            let Ok(permit) = limit.clone().acquire_owned().await else {
+                return;
+            };
+            let handle = handle.clone();
+            let key = request.key.clone();
+            let command = fsm::blob_command(
+                request.seed.wrapping_mul(1_000_003) ^ i as u64,
+                request.bytes.min(fsm::MAX_BLOB_BYTES as usize) as u32,
+            );
+            tasks.spawn(async move {
+                let _permit = permit;
+                let give_up = Instant::now() + Duration::from_secs(300);
+                while handle
+                    .propose(key.as_bytes(), command.clone(), deadline(30_000))
+                    .await
+                    .is_err()
+                    && Instant::now() < give_up
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+    });
+    Json(json!({"ok":true,"started":request.count}))
+}
 async fn gate(State(app): State<App>, Json(request): Json<GateRequest>) -> Json<Value> {
     if !app.controls {
         return Json(error("test controls disabled"));
@@ -255,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/read", post(read))
         .route("/compact", post(compact))
         .route("/gate", post(gate))
+        .route("/bulk", post(bulk))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(args.admin).await?;
     axum::serve(listener, router)

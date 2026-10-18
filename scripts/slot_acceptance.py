@@ -60,6 +60,8 @@ class Run:
         self.stop_signal = None
         self.cleaning = False
         self.fsm_storage = 'image'
+        self.extra_args = []
+        self.data_tag = None
         ports = free_ports(9)
         self.admin = dict(zip(range(1, 4), ports[6:]))
         self.placement = dict(cluster_id='slot-acceptance-' + uuid.uuid4().hex, slot_count=slot_count, group_id_base=100,
@@ -142,17 +144,21 @@ class Run:
             time.sleep(.1)
         raise AssertionError(f'{label} timed out; last={last!r}')
 
-    def start(self, node, layout=None):
+    def data_dir(self, node):
+        tag = self.data_tag or self.fsm_storage
+        return self.output / (f'data-{node}' if tag == 'image' else f'{tag}-data-{node}')
+
+    def start(self, node, layout=None, env=None):
         self.checkpoint()
         assert node not in self.processes
         log_path = self.output / f'node-{node}-{time.time_ns()}.log'
         log = log_path.open('wb')
-        data = f'data-{node}' if self.fsm_storage == 'image' else f'{self.fsm_storage}-data-{node}'
-        command = [self.binary, '--layout', str(layout or self.layout_path), '--node-id', str(node), '--data-dir', str(self.output / data), '--admin', f'127.0.0.1:{self.admin[node]}', '--test-controls', '--fsm-storage', self.fsm_storage]
+        command = [self.binary, '--layout', str(layout or self.layout_path), '--node-id', str(node), '--data-dir', str(self.data_dir(node)), '--admin', f'127.0.0.1:{self.admin[node]}', '--test-controls', '--fsm-storage', self.fsm_storage] + self.extra_args
         try:
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                                       env=dict(os.environ, **env) if env else None)
             self.processes[node] = process
-            self.records.append(dict(node=node, pid=process.pid, command=command, log=str(log_path)))
+            self.records.append(dict(node=node, pid=process.pid, command=command, log=str(log_path), env=env))
         finally:
             log.close()
         self.checkpoint()
@@ -412,7 +418,10 @@ class Run:
 
     def local_view(self, node, key):
         response = self.api(node, '/read', dict(key=key, local=True))
-        assert response.get('ok') and response['result']['storage'] == 'disk', response
+        if not response.get('ok'):
+            # Transient (e.g. reads gated during a snapshot install); poll retries ValueError.
+            raise ValueError(f'local read refused: {response}')
+        assert response['result']['storage'] == 'disk', response
         return dict(response['result'], applied=response['applied'])
 
     def disk_converged(self, label, expected, calls):
@@ -452,11 +461,10 @@ class Run:
             changed = self.write(follower, key, f'disk-{slot}', 99)
             assert changed.get('ok') and changed['effects'] == dict(effect, accepted=False), changed
             expected[key], calls[key] = 3, 3
-        # No whole-image provider: compaction is refused and nothing is snapshotted.
-        refused = self.api(1, '/compact', dict(slot=0))
-        assert not refused.get('ok'), refused
         self.disk_converged('disk replicas converge', expected, calls)
-        self.passed('disk_fsm_RF3_forward_exact_effects_idempotency_and_no_whole_image_snapshot', refused_compaction=refused)
+        # Compaction publishes a RocksDB checkpoint (never a whole image) and purges the log.
+        compacted = self.compact_disk(1, 0)
+        self.passed('disk_fsm_RF3_forward_exact_effects_idempotency_and_checkpoint_compaction', compacted=compacted)
         slot, key = next(iter(self.keys.items()))
         leader = self.leader(slot)
         self.stop(leader, kill=True)
@@ -506,6 +514,156 @@ class Run:
             self.stop(n)
         self.passed('disk_fsm_clean_cold_restart_suffix_and_original_dedup_effects')
 
+    def compact_disk(self, node, slot):
+        # A replica still applying a backlog holds its FSM lock; the reservation
+        # can miss its deadline (Unavailable) or find a build running (Busy).
+        result = self.poll(f'node {node} slot {slot} compaction accepted',
+                           lambda: (r if (r := self.api(node, '/compact', dict(slot=slot))).get('ok') or r.get('error') not in ('Unavailable', 'Busy') else None), 120)
+        assert result.get('ok'), result
+        def done():
+            storage = self.api(node, '/status')['slots'][slot]['storage']
+            if storage is None:
+                return None  # The status call's own 1 s budget expired on a busy node.
+            snapshot = storage['snapshot']
+            if storage['progress'] == 'CompletedObserved' and snapshot and storage['purged'] != 'None':
+                assert snapshot['id'].startswith('disk-v1-'), storage
+                return storage
+            return None
+        return self.poll(f'node {node} slot {slot} disk compaction complete', done, 120)
+
+    def blob_view(self, node, key):
+        view = self.local_view(node, key)
+        return dict(blobs=view['blobs'], applied=view['applied']['index'] if view['applied'] else None, opened=view['opened_index'])
+
+    def bulk(self, node, key, total_bytes, seed, blob=4 * 1024 * 1024):
+        """Start the demo's background blob writer, then wait on the FSM's byte counter."""
+        start = self.blob_view(node, key)['blobs']['bytes']
+        began = time.monotonic()
+        count = -(-total_bytes // blob)
+        result = self.api(node, '/bulk', dict(key=key, count=count, bytes=blob, concurrency=8, seed=seed))
+        assert result.get('ok'), result
+        done = self.poll('bulk writes applied', lambda: (b if (b := self.blob_view(node, key)['blobs']['bytes']) - start >= count * blob else None), 1800)
+        return dict(bytes=done - start, seconds=round(time.monotonic() - began, 1))
+
+    def pid_node(self, pid):
+        return next(n for n, p in self.processes.items() if p.pid == pid)
+
+    def rss_kib(self, pids):
+        out = subprocess.run(['ps', '-o', 'pid=,rss=', '-p', ','.join(str(p) for p in pids)], capture_output=True, text=True).stdout
+        return {int(pid): int(rss) for pid, rss in (line.split() for line in out.strip().splitlines())}
+
+    def sample_rss(self, nodes, until, seconds):
+        """Poll `until()` while sampling every node's RSS every 50 ms; return (result, peaks MiB, samples)."""
+        peaks, samples, deadline = {}, 0, time.monotonic() + seconds
+        while True:
+            pids = {self.processes[n].pid: n for n in nodes if n in self.processes}
+            for pid, kib in self.rss_kib(pids).items():
+                peaks[pids[pid]] = max(peaks.get(pids[pid], 0), kib)
+            samples += 1
+            if samples % 4 == 0:
+                try:
+                    result = until()
+                    if result:
+                        return result, {n: round(k / 1024, 1) for n, k in sorted(peaks.items())}, samples
+                except (OSError, ValueError, KeyError):
+                    pass
+            assert time.monotonic() < deadline, f'catch-up timed out; peaks={peaks}'
+            time.sleep(.05)
+
+    def workspace(self, node, group):
+        return self.data_dir(node) / 'fsm-rocksdb' / f'group-{group}.snapshots'
+
+    def disk_snapshot(self, snapshot_bytes=1024 ** 3):
+        """Streaming disk snapshot: a replica down while GB-scale data is written and the
+        log compacted catches up by snapshot within bounded memory; a SIGKILL during the
+        transfer and an abort between the install renames both leave its old state."""
+        self.ensure_layout()
+        self.fsm_storage, self.data_tag = 'disk', 'disk-snapshot'
+        self.extra_args = ['--per-slot-requests', '32', '--global-requests', '64']
+        for n in (1, 2, 3):
+            self.start(n)
+        self.ready((1, 2, 3))
+        slot, key = next(iter(self.keys.items()))
+        group = self.layout['group_id_base'] + slot
+        leader = self.leader(slot)
+        victim = next(n for n in (1, 2, 3) if n != leader)
+        others = tuple(n for n in (1, 2, 3) if n != victim)
+        ws = self.workspace(victim, group)
+        result = self.write(leader, key, 'snap-0', 5)
+        assert result.get('ok'), result
+        self.poll('victim applied the first write', lambda: self.local_view(victim, key)['value'] == 5)
+
+        def lag(total_bytes, seed):
+            """Stop the victim, write to the Slot, compact both live replicas."""
+            before = self.blob_view(victim, key)
+            self.stop(victim)
+            written = self.bulk(leader, key, total_bytes, seed)
+            self.poll('live replicas applied the writes', lambda: len({json.dumps(self.blob_view(n, key)['blobs']) for n in others}) == 1, 300)
+            compactions = {n: self.compact_disk(n, slot) for n in others}
+            return before, written, compactions, self.blob_view(leader, key)
+
+        def caught(target):
+            return lambda: (v if (v := self.blob_view(victim, key))['blobs'] == target['blobs'] and v['applied'] >= target['applied'] else None)
+
+        # (1)+(2) Full catch-up by streamed snapshot; sample every node's RSS throughout.
+        before, written, compactions, target = lag(snapshot_bytes, seed=1)
+        size = compactions[leader]['snapshot']['bytes']
+        assert size >= snapshot_bytes, compactions
+        baseline = {n: round(k / 1024, 1) for n, k in ((self.pid_node(p), k) for p, k in self.rss_kib([self.processes[n].pid for n in others]).items())}
+        started = time.monotonic()
+        self.start(victim)
+        view, peaks, samples = self.sample_rss((1, 2, 3), caught(target), 900)
+        seconds = round(time.monotonic() - started, 1)
+        assert (ws / 'installed').exists(), 'caught up by snapshot install'
+        assert before['applied'] <= view['opened'] < target['applied'], (before, view, target)
+        sender = self.leader(slot, others)
+        assert all(peak <= 256 for peak in peaks.values()), peaks
+        self.passed('disk_snapshot_lagging_replica_catches_up_by_streamed_checkpoint', written=written,
+                    snapshot_bytes=size, catch_up_seconds=seconds, rss_peak_mib=peaks, rss_before_mib=baseline,
+                    sender=sender, receiver=victim,
+                    rss_samples=samples, view=view)
+        self.stop(victim)
+        self.start(victim)
+        self.ready((victim,))
+        self.poll('restart after catch-up recovers the installed store', caught(target), 60)
+        self.passed('disk_snapshot_restart_after_install_recovers_installed_state')
+
+        # (3a) Receiver SIGKILLed mid-transfer: it reopens its old store, then catches up.
+        before, _, compactions, target = lag(snapshot_bytes // 4, seed=2)
+        threshold = min(64 * 1024 * 1024, compactions[leader]['snapshot']['bytes'] // 8)
+        self.start(victim)
+        def staged():
+            return sum(f.stat().st_size for d in ws.glob('staging-*') for f in d.iterdir())
+        partial = self.poll('transfer in progress', lambda: (b if (b := staged()) > threshold else None), 300)
+        self.stop(victim, kill=True)
+        self.start(victim)
+        self.ready((victim,))
+        reopened = self.blob_view(victim, key)
+        assert before['applied'] <= reopened['opened'] < target['applied'], (before, reopened, target)
+        self.poll('catch-up after the killed transfer', caught(target), 600)
+        self.passed('disk_snapshot_receiver_killed_mid_transfer_reopens_old_state_then_catches_up',
+                    partial_staged_bytes=partial, reopened_at=reopened['opened'], old_applied=before['applied'])
+
+        # (3b) Abort between the two install renames: restart rolls back to the old store.
+        before, _, _, target = lag(min(64 * 1024 * 1024, snapshot_bytes // 8), seed=3)
+        process = self.start(victim, env={'MULTIRAFT_TEST_DISK_INSTALL_FAULT': 'abort_after_retire'})
+        code = self.poll('install aborted between renames', lambda: process.poll(), 600)
+        assert code != 0, code
+        self.processes.pop(victim)
+        live = self.data_dir(victim) / 'fsm-rocksdb' / f'group-{group}'
+        retired = [p.name for p in ws.glob('retired-*')]
+        assert not live.exists() and retired, (live, retired)
+        self.start(victim)
+        self.ready((victim,))
+        rolled_back = self.blob_view(victim, key)
+        assert before['applied'] <= rolled_back['opened'] < target['applied'], (before, rolled_back, target)
+        assert not list(ws.glob('retired-*')), 'rollback consumed the retired store'
+        self.poll('catch-up after rollback', caught(target), 600)
+        self.passed('disk_snapshot_abort_mid_swap_rolls_back_then_catches_up', exit_code=code, retired=retired,
+                    reopened_at=rolled_back['opened'], old_applied=before['applied'])
+        for n in (1, 2, 3):
+            self.stop(n)
+
     def finish(self, error=None):
         self.cleaning = True
         try:
@@ -538,7 +696,8 @@ def main(argv=None):
     parser.add_argument('--layout-tool', help='slot-layout generator; defaults to the sibling of --binary')
     parser.add_argument('--slot-count', type=int, default=4)
     parser.add_argument('--output-dir', type=Path)
-    parser.add_argument('--case', choices=('all', 'normal', 'recovery', 'fingerprint', 'disk'), default='all')
+    parser.add_argument('--case', choices=('all', 'normal', 'recovery', 'fingerprint', 'disk', 'disk-snapshot'), default='all')
+    parser.add_argument('--snapshot-mib', type=int, default=1024, help='data written to one Slot for --case disk-snapshot')
     args = parser.parse_args(argv)
     output = args.output_dir or Path('.tmp/slot-foundation') / ('acceptance-' + uuid.uuid4().hex)
     run = Run(args.binary, output, args.layout_tool, args.slot_count)
@@ -565,6 +724,9 @@ def main(argv=None):
             run.checkpoint()
         if args.case == 'disk':
             run.disk()
+            run.checkpoint()
+        if args.case == 'disk-snapshot':
+            run.disk_snapshot(args.snapshot_mib * 1024 * 1024)
             run.checkpoint()
     except BaseException as exc:
         import traceback

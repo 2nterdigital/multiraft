@@ -25,9 +25,20 @@ macOS 从源码构建 RocksDB 时可能需要将 `LIBCLANG_PATH`、`DYLD_LIBRARY
 `--output-dir PATH` 必须是尚不存在的目录，默认在 `.tmp/slot-foundation/`
 创建唯一目录。`--case normal`、`--case recovery` 或 `--case fingerprint` 可分别运行三个独立场景集；`--case all` 运行全部三组。
 `--case disk` 运行独立的[落盘状态机](./specs/2026-10-18-disk-backed-fsm-mode.zh-CN.md)场景（`--fsm-storage disk`，使用新的 `disk-data-N` 目录，不包含在 `all` 中）：
-精确效果与幂等、压缩被拒绝且没有整块快照、被 SIGKILL 的 leader 重新打开其 RocksDB 状态、三节点同时 SIGKILL 后冷重启，
+精确效果与幂等、压缩发布 RocksDB checkpoint（从不生成整块快照）并裁剪日志、被 SIGKILL 的 leader 重新打开其 RocksDB 状态、三节点同时 SIGKILL 后冷重启，
 以及正常关停后的冷重启与新提交后缀。每个节点上值和 apply 次数必须一致，FSM 中存的 applied index 必须等于 bridge 的
 applied index，且各节点该 index 相同。其他用例传入默认的整块模式 `--fsm-storage image`，行为不变。
+
+`--case disk-snapshot` 运行[落盘流式快照](./specs/2026-10-19-disk-fsm-streaming-snapshot.zh-CN.md)场景（使用新的
+`disk-snapshot-data-N` 目录，不包含在 `all` 中）。`--snapshot-mib N`（默认 1024）指定 follower 停机期间写入一个 Slot 的数据量。
+仅测试用的 `/bulk` 端点提议小命令，每个副本的 FSM 据此生成相同的、不可压缩的 4 MiB 行，因此 FSM（以及快照）达到 GB 级，
+而 Raft 日志保持很小；RocksDB Raft 日志用 JSON 编码条目，经日志写入 GB 级载荷在本脚本中慢得不可行。两个存活副本先压缩
+（checkpoint 加裁剪），然后被停的 follower 重启，必须通过快照安装追上（工作区中的 `installed` 标记、相同的 blob 计数、
+SHA-256 链与最新几行）。从 follower 启动到追上，每 50 ms 采样三个进程的 RSS，每个峰值都不得超过 256 MiB。随后：追上后立即
+重启；再一轮中接收端在暂存传输时被 SIGKILL，必须以旧 applied index 重新打开，然后追上；最后一轮用
+`MULTIRAFT_TEST_DISK_INSTALL_FAULT=abort_after_retire` 让接收端在两次安装改名之间中止（活目录缺失、存在 `retired-*`），
+之后正常重启必须回滚到旧库，然后追上。请使用 release 构建运行（`cargo build --release -p multiraft-slot-demo`）。
+记录的运行见[流式快照规格](./specs/2026-10-19-disk-fsm-streaming-snapshot.zh-CN.md#记录的运行)。
 
 Python 标准库脚本通过 `Popen` 启动三个真实 OS 进程，分别持有不同 PID、
 loopback Raft／应用 RPC／管理端口和数据目录。候选端口同时保留，启动前释放；
