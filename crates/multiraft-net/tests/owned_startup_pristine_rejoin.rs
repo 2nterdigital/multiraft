@@ -179,12 +179,48 @@ fn decode(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().expect("u64 value"))
 }
 
-/// Propose `from..=to` in order through a confirmed leader.
+/// Test budget for retrying OpenRaft's normal transient errors.
+const RETRY_BUDGET: Duration = Duration::from_secs(20);
+
+/// Propose `from..=to` in order through a confirmed leader. A retryable error
+/// (see [`retryable`]) re-resolves the leader and proposes the same value
+/// again: `Bytes` sets its value, so a duplicate apply of `n` is harmless and
+/// `n + 1` is only proposed after `n` was acknowledged.
 async fn propose_range(live: &[RuntimeHandle<Bytes>], group: u64, from: u64, to: u64) {
-    let leader = leader(live, group).await;
+    let until = Instant::now() + RETRY_BUDGET;
+    let mut target = leader(live, group).await;
     for n in from..=to {
-        let applied = leader.propose(group, value(n), deadline()).await.unwrap();
-        assert_eq!(decode(&applied.effects), n);
+        loop {
+            match target.propose(group, value(n), deadline().min(until)).await {
+                Ok(applied) => {
+                    assert_eq!(decode(&applied.effects), n);
+                    break;
+                }
+                Err(error) if retryable(&error) && Instant::now() < until => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    target = leader(live, group).await;
+                }
+                Err(error) => panic!("propose {n} to group {group}: {error:?}"),
+            }
+        }
+    }
+}
+
+/// Linearizable value through a confirmed leader, retrying transient errors.
+async fn leader_value(live: &[RuntimeHandle<Bytes>], group: u64) -> u64 {
+    let until = Instant::now() + RETRY_BUDGET;
+    loop {
+        let target = leader(live, group).await;
+        match target
+            .read_linearizable(group, deadline().min(until), |fsm| fsm.value.clone())
+            .await
+        {
+            Ok(bytes) => return decode(&bytes),
+            Err(error) if retryable(&error) && Instant::now() < until => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("leader read of group {group}: {error:?}"),
+        }
     }
 }
 
@@ -314,16 +350,8 @@ async fn wiped_voter_rejoins_via_native_snapshot_without_initialize() {
     );
 
     let all = cluster.live(&[1, 2, 3]);
+    assert_eq!(leader_value(&all, GROUP).await, N + M);
     let authority = leader(&all, GROUP).await.clone();
-    assert_eq!(
-        decode(
-            &authority
-                .read_linearizable(GROUP, deadline(), |fsm| fsm.value.clone())
-                .await
-                .unwrap()
-        ),
-        N + M
-    );
 
     // Stop the remaining non-leader survivor: the rejoined victim must now be
     // part of every commit quorum.
@@ -399,16 +427,7 @@ async fn forbidden_persisted_groups_cold_restart_without_initialize() {
         assert!(!g.fallback);
     }
     let all = cluster.live(&[1, 2, 3]);
-    assert_eq!(
-        decode(
-            &leader(&all, GROUP)
-                .await
-                .read_linearizable(GROUP, deadline(), |fsm| fsm.value.clone())
-                .await
-                .unwrap()
-        ),
-        5
-    );
+    assert_eq!(leader_value(&all, GROUP).await, 5);
     for id in 1..=3 {
         assert_eq!(
             capture.count(mark, "multiraft::startup", id, GROUP, "initialize_dispatch"),

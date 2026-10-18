@@ -250,6 +250,24 @@ pub fn reusable(root: &Path, peers: &[(u64, SocketAddr)]) {
         TcpListener::bind(address).unwrap();
     }
 }
+/// OpenRaft's normal transient outcomes while a leader is elected or changes:
+/// no leader yet or a stale one (`NotLeader`), a ReadIndex that could not reach
+/// a quorum in one heartbeat interval or did not finish in time, and a request
+/// whose deadline passed. Tests retry these within their own budget; production
+/// code never does. For writes `Deadline` and `NotLeader` leave the outcome
+/// unknown, so only idempotent test writes (the set-value [`Bytes`]) may retry.
+pub fn retryable(error: &RuntimeError) -> bool {
+    use multiraft_core::ReadIndexFailure;
+    matches!(
+        error,
+        RuntimeError::Source(MultiRaftError::NotLeader { .. })
+            | RuntimeError::Source(MultiRaftError::ReadIndex(
+                ReadIndexFailure::QuorumUnavailable { .. } | ReadIndexFailure::Deadline
+            ))
+            | RuntimeError::Deadline { .. }
+    )
+}
+
 pub async fn leader(handles: &[RuntimeHandle<Bytes>], group: u64) -> &RuntimeHandle<Bytes> {
     let nodes: Vec<_> = handles.iter().map(RuntimeHandle::node_id).collect();
     let index = confirmed_leader(&nodes, group, |index, until| {
@@ -276,16 +294,22 @@ where
         for (index, outcome) in outcomes.iter().enumerate() {
             let probe = &probe;
             pending.push(async move {
+                let mut attempts = 0_u32;
                 loop {
-                    *outcome.lock().unwrap() = String::from("pending");
+                    // Never start a probe at or after the shared deadline: its
+                    // admission would fail with `Deadline` and race the outer
+                    // timeout. Park instead so the probes diagnostic is reported.
+                    if Instant::now() >= until {
+                        std::future::pending::<()>().await;
+                    }
+                    attempts += 1;
+                    let last = std::mem::take(&mut *outcome.lock().unwrap());
+                    *outcome.lock().unwrap() = format!("probing #{attempts}; previous: {last}");
                     match probe(index, until).await {
                         Ok(()) => return index,
-                        Err(error @ RuntimeError::Source(MultiRaftError::NotLeader { .. }))
-                        | Err(
-                            error @ RuntimeError::Source(MultiRaftError::ReadIndex(
-                                multiraft_core::ReadIndexFailure::QuorumUnavailable { .. },
-                            )),
-                        ) => *outcome.lock().unwrap() = format!("{error:?}"),
+                        Err(error) if retryable(&error) => {
+                            *outcome.lock().unwrap() = format!("#{attempts}: {error:?}")
+                        }
                         Err(error) => panic!(
                             "unexpected leader read: group={group} node={} error={error:?}",
                             nodes[index]
@@ -353,4 +377,25 @@ async fn confirmed_leader_retries_while_another_read_is_pending() {
     .expect("a pending read must not prevent another node's next ReadIndex attempt");
     assert_eq!(confirmed, 1);
     assert_eq!(*calls.lock().unwrap(), [1, 2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn confirmed_leader_reports_probes_instead_of_panicking_at_the_deadline() {
+    // Every probe runs until the shared deadline and then fails its admission,
+    // as a real read does when `until` passes; the helper must report the
+    // probes diagnostic rather than panic on the Deadline error.
+    let outcome = tokio::spawn(confirmed_leader(&[1, 2], 7, |_, until| async move {
+        tokio::time::sleep_until(until).await;
+        Err(RuntimeError::Deadline {
+            phase: multiraft_net::RuntimePhase::Admission,
+            outcome_unknown: false,
+        })
+    }))
+    .await;
+    let panic = outcome.expect_err("no node confirmed").into_panic();
+    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        message.starts_with("leader read timed out: group=7 probes="),
+        "{message}"
+    );
 }

@@ -144,8 +144,16 @@ async fn start_staggered(
         .collect()
 }
 
-/// Write once to every slot through `owner`; retry only proven-undispatched refusals.
-async fn write_every_slot(layout: &ClusterLayout, owner: &SlotNodeOwner<Counter>) {
+/// Write once to every slot through `owner`, moving each counter to `expected`.
+///
+/// `Unavailable` is a slot-level refusal before dispatch and is retried. A
+/// native `NotLeader` (OpenRaft `ForwardToLeader`) leaves the write outcome
+/// unknown: the entry may already be in the log (leader step-down, or log
+/// purge after a snapshot install). The counter is additive, so the write is
+/// first settled by a linearizable read, which a leader serves only after
+/// committing an entry of its own term; it is retried only if it did not land.
+/// `Unknown` is never retried.
+async fn write_every_slot(layout: &ClusterLayout, owner: &SlotNodeOwner<Counter>, expected: u64) {
     let handle = owner.handle();
     let until = Instant::now() + Duration::from_secs(20);
     for slot in 0..SLOTS {
@@ -154,14 +162,41 @@ async fn write_every_slot(layout: &ClusterLayout, owner: &SlotNodeOwner<Counter>
             match handle.propose(&k, vec![1], until).await {
                 Ok(applied) => {
                     assert_eq!(applied.slot, SlotId(slot));
+                    assert_eq!(applied.effects, expected.to_be_bytes(), "slot {slot}");
                     break;
                 }
-                Err(e @ (RuntimeError::NotLeader { .. } | RuntimeError::Unavailable)) => {
+                Err(e @ RuntimeError::Unavailable) => {
                     assert!(Instant::now() < until, "slot {slot} never served: {e}");
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
+                Err(e @ RuntimeError::NotLeader { .. }) => {
+                    assert!(Instant::now() < until, "slot {slot} never served: {e}");
+                    match read_slot(&handle, &k, slot, until).await {
+                        v if v == expected => break,
+                        v if v + 1 == expected => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        v => panic!("slot {slot}: counter {v}, expected {expected}"),
+                    }
+                }
                 Err(e) => panic!("slot {slot}: {e}"),
             }
+        }
+    }
+}
+/// Linearizable counter value of one slot, retrying OpenRaft's normal
+/// transient read errors (no leader yet, stale leader, quorum not reached).
+async fn read_slot(handle: &SlotHandle<Counter>, k: &[u8], slot: u32, until: Instant) -> u64 {
+    loop {
+        match handle.read_linearizable(k, &[], until).await {
+            Ok(value) => {
+                return u64::from_be_bytes(value.as_slice().try_into().expect("counter bytes"))
+            }
+            Err(e @ (RuntimeError::NotLeader { .. } | RuntimeError::Unavailable)) => {
+                assert!(Instant::now() < until, "slot {slot} never served: {e}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("slot {slot}: {e}"),
         }
     }
 }
@@ -170,19 +205,11 @@ async fn read_every_slot(layout: &ClusterLayout, owner: &SlotNodeOwner<Counter>,
     let until = Instant::now() + Duration::from_secs(20);
     for slot in 0..SLOTS {
         let k = key(layout, slot);
-        loop {
-            match handle.read_linearizable(&k, &[], until).await {
-                Ok(value) => {
-                    assert_eq!(value, expected.to_be_bytes(), "slot {slot}");
-                    break;
-                }
-                Err(e @ (RuntimeError::NotLeader { .. } | RuntimeError::Unavailable)) => {
-                    assert!(Instant::now() < until, "slot {slot} never served: {e}");
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(e) => panic!("slot {slot}: {e}"),
-            }
-        }
+        assert_eq!(
+            read_slot(&handle, &k, slot, until).await,
+            expected,
+            "slot {slot}"
+        );
     }
 }
 async fn shutdown_all(owners: BTreeMap<u64, SlotNodeOwner<Counter>>) {
@@ -372,7 +399,7 @@ async fn fresh_start_in_any_node_order_forms_all_slots_from_preferred_initialize
             assert_eq!(report.groups.len(), SLOTS as usize);
         }
         assert_fresh_initialization(&layout, &reports(&owners, &layout));
-        write_every_slot(&layout, &owners[&order[2]]).await;
+        write_every_slot(&layout, &owners[&order[2]], 1).await;
         read_every_slot(&layout, &owners[&order[1]], 1).await;
         shutdown_all(owners).await;
     }
@@ -398,12 +425,12 @@ async fn absent_preferred_initializer_falls_back_after_grace_and_forms_every_slo
         );
     }
     // Two of three voters form and serve every slot, including node 3's.
-    write_every_slot(&layout, &owners[&1]).await;
+    write_every_slot(&layout, &owners[&1], 1).await;
     // The late preferred initializer joins without disturbing formed groups.
     let late = try_start(&layout, 3, &dirs[&3], grace(200)).await.unwrap();
     owners.insert(3, late);
     read_every_slot(&layout, &owners[&3], 1).await;
-    write_every_slot(&layout, &owners[&3]).await;
+    write_every_slot(&layout, &owners[&3], 2).await;
     read_every_slot(&layout, &owners[&2], 2).await;
     shutdown_all(owners).await;
 }
@@ -413,7 +440,7 @@ async fn cold_restart_recovers_persisted_slots_without_initialize() {
     let layout = layout();
     let dirs: BTreeMap<_, _> = (1..=3).map(|n| (n, directory())).collect();
     let owners = start_staggered(&layout, &dirs, &[1, 2, 3], Duration::ZERO, grace(200)).await;
-    write_every_slot(&layout, &owners[&1]).await;
+    write_every_slot(&layout, &owners[&1], 1).await;
     shutdown_all(owners).await;
     for (node, dir) in &dirs {
         let probed = probe_untouched(&config(&layout, *node, dir, SlotStartupPlan::default()));
@@ -444,7 +471,7 @@ async fn wiped_node_rejoins_forbidden_without_initialize_and_serves_after_catch_
     let layout = layout();
     let dirs: BTreeMap<_, _> = (1..=3).map(|n| (n, directory())).collect();
     let mut owners = start_staggered(&layout, &dirs, &[1, 2, 3], Duration::ZERO, grace(200)).await;
-    write_every_slot(&layout, &owners[&1]).await;
+    write_every_slot(&layout, &owners[&1], 1).await;
     let wiped = owners.remove(&3).unwrap();
     assert!(
         wiped
@@ -453,7 +480,7 @@ async fn wiped_node_rejoins_forbidden_without_initialize_and_serves_after_catch_
             .complete
     );
     // Progress the wiped node never saw.
-    write_every_slot(&layout, &owners[&2]).await;
+    write_every_slot(&layout, &owners[&2], 2).await;
     std::fs::remove_dir_all(&dirs[&3]).unwrap();
     let rejoin = forbidden_everywhere(grace(200));
     let probed = probe_untouched(&config(&layout, 3, &dirs[&3], rejoin.clone()));
@@ -486,7 +513,7 @@ async fn wiped_node_rejoins_forbidden_without_initialize_and_serves_after_catch_
             .await
             .complete
     );
-    write_every_slot(&layout, &owners[&3]).await;
+    write_every_slot(&layout, &owners[&3], 3).await;
     read_every_slot(&layout, &owners[&2], 3).await;
     shutdown_all(owners).await;
 }
