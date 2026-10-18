@@ -12,8 +12,8 @@ pub struct NativeSmOptions {
     pub build_budget: Arc<Semaphore>,
 }
 
-pub(super) struct NativeRuntime {
-    options: NativeSmOptions,
+pub(in crate::sm_bridge) struct NativeRuntime {
+    pub(in crate::sm_bridge) options: NativeSmOptions,
     closing: std::sync::atomic::AtomicBool,
     group_budget: Arc<Semaphore>,
     transition: tokio::sync::Mutex<()>,
@@ -21,12 +21,58 @@ pub(super) struct NativeRuntime {
     pending: std::sync::Mutex<Option<Capture>>,
 }
 
-struct Capture {
-    meta: SnapshotMetaOf<TypeConfig>,
+pub(in crate::sm_bridge) struct Capture {
+    pub(in crate::sm_bridge) meta: SnapshotMetaOf<TypeConfig>,
     data: Vec<u8>,
     _permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
     already_durable: bool,
     completion: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Disk mode: the captured checkpoint, published by the builder.
+    disk: Option<crate::disk_snapshot::TempCheckpoint>,
+}
+
+type BuildPermits = (OwnedSemaphorePermit, OwnedSemaphorePermit);
+
+impl Capture {
+    pub(in crate::sm_bridge) fn disk(
+        meta: SnapshotMetaOf<TypeConfig>,
+        checkpoint: crate::disk_snapshot::TempCheckpoint,
+        permits: BuildPermits,
+    ) -> Self {
+        Self {
+            meta,
+            data: Vec::new(),
+            _permits: Some(permits),
+            already_durable: false,
+            completion: None,
+            disk: Some(checkpoint),
+        }
+    }
+
+    /// Tell a reserved compaction that its build finished.
+    pub(in crate::sm_bridge) fn complete(&mut self) {
+        if let Some(sender) = self.completion.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+impl NativeRuntime {
+    /// Node-wide, then per-Group heavy build admission.
+    pub(in crate::sm_bridge) fn admit(&self) -> Result<BuildPermits, CaptureRefusal> {
+        let node = self
+            .options
+            .build_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CaptureRefusal::Busy)?;
+        let group = self
+            .group_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CaptureRefusal::Busy)?;
+        Ok((node, group))
+    }
 }
 
 /// Disposable observation of one reserved native build, never persisted intent.
@@ -87,6 +133,7 @@ impl<S: StateMachine> StateMachineStore<S> {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             native.pending.lock().unwrap().take();
         }
+        self.disk_rt.incoming.lock().unwrap().take();
     }
 
     pub(super) fn native_is_closing(&self) -> bool {
@@ -101,6 +148,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         let _work = self.validation.work.clone().acquire_owned().await;
         if let Some(native) = &self.native {
             let _transition = native.transition.lock().await;
+            let _disk = self.disk_rt.transition.lock().await;
             let _application = self.inner.lock().await;
         }
     }
@@ -112,8 +160,9 @@ impl<S: StateMachine> StateMachineStore<S> {
     }
 
     pub(super) async fn prepare_builder(&self, force: bool) -> Option<SnapshotBuilder<S>> {
-        if self.disk {
-            // No whole-image provider, not even a reused catalog checkpoint.
+        if self.disk && (self.native.is_none() || !self.disk_snapshots_supported().await) {
+            // Disk snapshots need the durable native runtime (NativeDurable)
+            // and an FSM implementing the DiskState snapshot hooks.
             return force.then(|| SnapshotBuilder {
                 store: self.clone(),
                 capture: Some(Err(super::disk::unsupported("snapshot"))),
@@ -169,6 +218,7 @@ impl<S: StateMachine> StateMachineStore<S> {
                             _permits: None,
                             already_durable: true,
                             completion: None,
+                            disk: None,
                         });
                     }
                 }
@@ -221,20 +271,9 @@ impl<S: StateMachine> StateMachineStore<S> {
 
     async fn capture_native(&self, native: &NativeRuntime) -> Result<Capture, NativeCaptureError> {
         if self.disk {
-            // Streaming disk snapshots are a separate provider (#190).
-            return Err(NativeCaptureError::Refused(CaptureRefusal::Unsupported));
+            return self.capture_disk(native).await;
         }
-        let node_permit = native
-            .options
-            .build_budget
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| NativeCaptureError::Refused(CaptureRefusal::Busy))?;
-        let group_permit = native
-            .group_budget
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| NativeCaptureError::Refused(CaptureRefusal::Busy))?;
+        let (node_permit, group_permit) = native.admit().map_err(NativeCaptureError::Refused)?;
         let _transition = native.transition.lock().await;
         let inner = self.inner.lock().await;
         self.validation.readable().map_err(NativeCaptureError::Io)?;
@@ -285,11 +324,16 @@ impl<S: StateMachine> StateMachineStore<S> {
             _permits: Some((node_permit, group_permit)),
             already_durable: false,
             completion: None,
+            disk: None,
         })
     }
 
     /// Read validated provider facts without allocating the full application image.
+    /// Disk mode: the published disk checkpoint (`size` = its total file bytes).
     pub async fn native_snapshot_info(&self) -> io::Result<Option<crate::NativeSnapshotInfo>> {
+        if self.disk {
+            return self.disk_snapshot_info().await;
+        }
         let Some(native) = self.native.clone() else {
             return Ok(None);
         };
@@ -307,6 +351,9 @@ impl<S: StateMachine> StateMachineStore<S> {
     pub(super) async fn load_native_snapshot(
         &self,
     ) -> io::Result<Option<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>>> {
+        if self.disk {
+            return self.load_disk_snapshot().await;
+        }
         let native = self.native.as_ref().unwrap().clone();
         let group = self.group_id;
         tokio::task::spawn_blocking(move || {
@@ -342,6 +389,9 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
             return self.store.build_legacy_snapshot().await;
         };
         let mut captured = capture?;
+        if let Some(checkpoint) = captured.disk.take() {
+            return self.store.publish_disk(captured, checkpoint).await;
+        }
         if captured.already_durable {
             if let Some(sender) = captured.completion.take() {
                 let _ = sender.send(());

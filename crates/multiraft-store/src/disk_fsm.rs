@@ -5,6 +5,8 @@
 //! shared Raft-log engine. The reserved `multiraft_meta` column family holds the
 //! schema, Group and application-format markers and the applied record; every
 //! other column family belongs to the application.
+mod checkpoint;
+
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -50,8 +52,11 @@ impl DiskFsmOptions {
 
 /// One Group's FSM database. Dropping it closes the database.
 pub struct DiskFsmDb {
-    db: DB,
-    sync_writes: bool,
+    /// `None` only after an install failed and the old store could not reopen.
+    db: Option<DB>,
+    path: PathBuf,
+    group: GroupId,
+    options: DiskFsmOptions,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -72,22 +77,25 @@ impl DiskFsmDb {
 
     /// Open or create the database, failing closed on any marker or column
     /// family mismatch, or on a nonempty directory that is not a database.
+    /// An install swap interrupted by a crash is finished or undone first.
     pub fn open(
         path: impl AsRef<Path>,
         group: GroupId,
         options: DiskFsmOptions,
     ) -> io::Result<Self> {
         let path = path.as_ref();
-        let mut names = BTreeSet::from(["default".to_owned(), DISK_FSM_META_CF.to_owned()]);
-        for name in &options.column_families {
-            if name.is_empty() || name == DISK_FSM_META_CF {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid application column family",
-                ));
-            }
-            names.insert(name.clone());
-        }
+        crate::disk_snapshot::recover_swap(path, &Self::workspace_path(path)?)?;
+        let db = Self::open_db(path, group, &options)?;
+        Ok(Self {
+            db: Some(db),
+            path: path.to_owned(),
+            group,
+            options,
+        })
+    }
+
+    fn open_db(path: &Path, group: GroupId, options: &DiskFsmOptions) -> io::Result<DB> {
+        let names = column_families(options)?;
         let existing = path.join("CURRENT").try_exists()?;
         if !existing {
             match std::fs::read_dir(path) {
@@ -104,7 +112,7 @@ impl DiskFsmDb {
                 Err(error) => return Err(error),
             }
         }
-        let mut db_options = options.db_options;
+        let mut db_options = options.db_options.clone();
         db_options.create_if_missing(!existing);
         db_options.create_missing_column_families(!existing);
         if existing {
@@ -119,67 +127,25 @@ impl DiskFsmDb {
             }
         }
         let db = DB::open_cf(&db_options, path, &names).map_err(db_error)?;
-        let store = Self {
-            db,
-            sync_writes: options.sync_writes,
-        };
-        store.check_markers(group, &options.app_format, &names)?;
-        Ok(store)
+        check_markers(&db, group, &options.app_format, &names, false)?;
+        Ok(db)
     }
 
-    fn check_markers(
-        &self,
-        group: GroupId,
-        app_format: &[u8],
-        names: &BTreeSet<String>,
-    ) -> io::Result<()> {
-        let meta = self.meta()?;
-        let group_bytes = group.to_be_bytes();
-        match self.db.get_cf(meta, SCHEMA_KEY).map_err(db_error)? {
-            Some(schema) if schema == SCHEMA => {
-                let stored_group = self.db.get_cf(meta, GROUP_KEY).map_err(db_error)?;
-                if stored_group.as_deref() != Some(&group_bytes[..]) {
-                    return Err(invalid("FSM database belongs to another group"));
-                }
-                let stored_format = self.db.get_cf(meta, APP_FORMAT_KEY).map_err(db_error)?;
-                if stored_format.as_deref() != Some(app_format) {
-                    return Err(invalid("FSM database has another application format"));
-                }
-                Ok(())
-            }
-            Some(_) => Err(invalid("unknown disk FSM schema")),
-            None => {
-                // Only a database left empty by an interrupted creation may be initialized.
-                for name in names {
-                    let cf = self
-                        .db
-                        .cf_handle(name)
-                        .ok_or_else(|| invalid("missing FSM column family"))?;
-                    if let Some(row) = self.db.iterator_cf(cf, IteratorMode::Start).next() {
-                        row.map_err(db_error)?;
-                        return Err(invalid("missing disk FSM schema in nonempty database"));
-                    }
-                }
-                let mut batch = WriteBatch::default();
-                batch.put_cf(meta, SCHEMA_KEY, SCHEMA);
-                batch.put_cf(meta, GROUP_KEY, group_bytes);
-                batch.put_cf(meta, APP_FORMAT_KEY, app_format);
-                let mut write = WriteOptions::default();
-                write.set_sync(true);
-                self.db.write_opt(batch, &write).map_err(db_error)
-            }
-        }
-    }
-
-    fn meta(&self) -> io::Result<&ColumnFamily> {
+    fn live(&self) -> io::Result<&DB> {
         self.db
-            .cf_handle(DISK_FSM_META_CF)
-            .ok_or_else(|| invalid("missing FSM meta column family"))
+            .as_ref()
+            .ok_or_else(|| io::Error::other("FSM database closed by a failed snapshot install"))
     }
 
     /// Read access. All writes must go through [`Self::commit`].
+    ///
+    /// # Panics
+    /// After a snapshot install failed and the previous store could not be
+    /// reopened; the Group has already stopped with a storage error then.
     pub fn db(&self) -> &DB {
-        &self.db
+        self.db
+            .as_ref()
+            .expect("FSM database closed by a failed snapshot install")
     }
 
     /// An application column family declared at open (or `default`).
@@ -190,21 +156,90 @@ impl DiskFsmDb {
                 "reserved FSM column family",
             ));
         }
-        self.db
+        self.live()?
             .cf_handle(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown FSM column family"))
     }
 
     /// The record stored by the last [`Self::commit`], for [`multiraft_fsm::DiskState::durable_applied`].
     pub fn applied_record(&self) -> io::Result<Option<Vec<u8>>> {
-        self.db.get_cf(self.meta()?, APPLIED_KEY).map_err(db_error)
+        let db = self.live()?;
+        db.get_cf(meta_cf(db)?, APPLIED_KEY).map_err(db_error)
     }
 
     /// Write `batch` and `applied` in one atomic RocksDB write.
     pub fn commit(&self, mut batch: WriteBatch, applied: &AppliedState) -> io::Result<()> {
-        batch.put_cf(self.meta()?, APPLIED_KEY, applied.record());
+        let db = self.live()?;
+        batch.put_cf(meta_cf(db)?, APPLIED_KEY, applied.record());
         let mut write = WriteOptions::default();
-        write.set_sync(self.sync_writes);
-        self.db.write_opt(batch, &write).map_err(db_error)
+        write.set_sync(self.options.sync_writes);
+        db.write_opt(batch, &write).map_err(db_error)
+    }
+}
+
+fn column_families(options: &DiskFsmOptions) -> io::Result<BTreeSet<String>> {
+    let mut names = BTreeSet::from(["default".to_owned(), DISK_FSM_META_CF.to_owned()]);
+    for name in &options.column_families {
+        if name.is_empty() || name == DISK_FSM_META_CF {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid application column family",
+            ));
+        }
+        names.insert(name.clone());
+    }
+    Ok(names)
+}
+
+fn meta_cf(db: &DB) -> io::Result<&ColumnFamily> {
+    db.cf_handle(DISK_FSM_META_CF)
+        .ok_or_else(|| invalid("missing FSM meta column family"))
+}
+
+/// Check the schema, Group and format markers. A writable open initializes the
+/// markers of a database left empty by an interrupted creation; a read-only
+/// inspection (`read_only`) fails instead.
+fn check_markers(
+    db: &DB,
+    group: GroupId,
+    app_format: &[u8],
+    names: &BTreeSet<String>,
+    read_only: bool,
+) -> io::Result<()> {
+    let meta = meta_cf(db)?;
+    let group_bytes = group.to_be_bytes();
+    match db.get_cf(meta, SCHEMA_KEY).map_err(db_error)? {
+        Some(schema) if schema == SCHEMA => {
+            let stored_group = db.get_cf(meta, GROUP_KEY).map_err(db_error)?;
+            if stored_group.as_deref() != Some(&group_bytes[..]) {
+                return Err(invalid("FSM database belongs to another group"));
+            }
+            let stored_format = db.get_cf(meta, APP_FORMAT_KEY).map_err(db_error)?;
+            if stored_format.as_deref() != Some(app_format) {
+                return Err(invalid("FSM database has another application format"));
+            }
+            Ok(())
+        }
+        Some(_) => Err(invalid("unknown disk FSM schema")),
+        None if read_only => Err(invalid("missing disk FSM schema")),
+        None => {
+            // Only a database left empty by an interrupted creation may be initialized.
+            for name in names {
+                let cf = db
+                    .cf_handle(name)
+                    .ok_or_else(|| invalid("missing FSM column family"))?;
+                if let Some(row) = db.iterator_cf(cf, IteratorMode::Start).next() {
+                    row.map_err(db_error)?;
+                    return Err(invalid("missing disk FSM schema in nonempty database"));
+                }
+            }
+            let mut batch = WriteBatch::default();
+            batch.put_cf(meta, SCHEMA_KEY, SCHEMA);
+            batch.put_cf(meta, GROUP_KEY, group_bytes);
+            batch.put_cf(meta, APP_FORMAT_KEY, app_format);
+            let mut write = WriteOptions::default();
+            write.set_sync(true);
+            db.write_opt(batch, &write).map_err(db_error)
+        }
     }
 }
