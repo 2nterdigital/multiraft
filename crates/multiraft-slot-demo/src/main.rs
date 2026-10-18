@@ -121,10 +121,16 @@ async fn read(State(app): State<App>, Json(request): Json<Read>) -> Json<Value> 
     Json(
         match app
             .handle
-            .read_linearizable(request.key.as_bytes(), &query, deadline(request.timeout_ms))
+            .read_linearizable_with_applied(
+                request.key.as_bytes(),
+                &query,
+                deadline(request.timeout_ms),
+            )
             .await
         {
-            Ok(bytes) => json!({"ok":true,"result":serde_json::from_slice::<Value>(&bytes).ok()}),
+            Ok(view) => {
+                json!({"ok":true,"result":serde_json::from_slice::<Value>(&view.value).ok(),"applied":{"term":view.applied.term,"node_id":view.applied.node_id,"index":view.applied.index}})
+            }
             Err(e) => error(e),
         },
     )

@@ -1,7 +1,10 @@
 //! One application-RPC hop. Compatibility fingerprints are not authentication.
 use crate::limits::{MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES};
 use crate::runtime::Shared;
-use crate::{ManifestDigest, NodeId, RuntimeError, SlotApplied, SlotId, SlotStateMachine};
+use crate::{
+    LinearizableView, ManifestDigest, NodeId, ObservedLogId, RuntimeError, SlotApplied, SlotId,
+    SlotStateMachine,
+};
 use bincode::Options;
 use multiraft_net::application_rpc::{
     ApplicationRpcHandler, RpcCall, RpcContext, RpcDispatch, RpcErrorKind, RpcFuture,
@@ -32,6 +35,9 @@ enum Operation {
     SlotHint,
     Write(Vec<u8>),
     Read(Vec<u8>),
+    // Appended so older variants keep their encoding; a peer that predates it
+    // rejects the request as invalid instead of misreading it.
+    ReadWithApplied(Vec<u8>),
 }
 #[derive(Serialize, Deserialize)]
 struct Reply {
@@ -44,6 +50,27 @@ enum Value {
     Hint(Option<NodeId>),
     Applied(SlotApplied),
     Read(Vec<u8>),
+    ReadWithApplied { value: Vec<u8>, applied: WireLogId },
+}
+/// `ObservedLogId` on the wire; the public type stays free of serde.
+#[derive(Serialize, Deserialize)]
+struct WireLogId {
+    term: u64,
+    node_id: NodeId,
+    index: u64,
+}
+fn read_value(view: LinearizableView<Vec<u8>>, with_applied: bool) -> Value {
+    if !with_applied {
+        return Value::Read(view.value);
+    }
+    Value::ReadWithApplied {
+        value: view.value,
+        applied: WireLogId {
+            term: view.applied.term,
+            node_id: view.applied.node_id,
+            index: view.applied.index,
+        },
+    }
 }
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
@@ -131,15 +158,19 @@ impl<S: SlotStateMachine> ApplicationRpcHandler for Handler<S> {
                             .await
                             .map(Value::Applied)
                     }
-                    Operation::Read(query) => {
-                        if query.len() > MAX_QUERY_BYTES {
-                            return Err(RuntimeError::PayloadTooLarge);
-                        }
-                        shared
-                            .local_query(slot, request.key.len(), &query, context.deadline)
-                            .await
-                            .map(Value::Read)
+                    Operation::Read(query) | Operation::ReadWithApplied(query)
+                        if query.len() > MAX_QUERY_BYTES =>
+                    {
+                        Err(RuntimeError::PayloadTooLarge)
                     }
+                    Operation::Read(query) => shared
+                        .local_query(slot, request.key.len(), &query, context.deadline)
+                        .await
+                        .map(|view| read_value(view, false)),
+                    Operation::ReadWithApplied(query) => shared
+                        .local_query(slot, request.key.len(), &query, context.deadline)
+                        .await
+                        .map(|view| read_value(view, true)),
                 }
             }
             .await;
@@ -281,28 +312,51 @@ pub(crate) async fn route_read<S: SlotStateMachine>(
     query: Vec<u8>,
     deadline: Instant,
 ) -> Result<Vec<u8>, RuntimeError> {
+    match route_query(shared, slot, key, query, deadline, false).await? {
+        Value::Read(v) if v.len() <= MAX_EFFECTS_BYTES => Ok(v),
+        _ => Err(RuntimeError::Unavailable),
+    }
+}
+pub(crate) async fn route_read_with_applied<S: SlotStateMachine>(
+    shared: &Arc<Shared<S>>,
+    slot: SlotId,
+    key: Vec<u8>,
+    query: Vec<u8>,
+    deadline: Instant,
+) -> Result<LinearizableView<Vec<u8>>, RuntimeError> {
+    match route_query(shared, slot, key, query, deadline, true).await? {
+        Value::ReadWithApplied { value, applied } if value.len() <= MAX_EFFECTS_BYTES => {
+            Ok(LinearizableView {
+                value,
+                applied: ObservedLogId::new(applied.term, applied.node_id, applied.index),
+            })
+        }
+        _ => Err(RuntimeError::Unavailable),
+    }
+}
+async fn route_query<S: SlotStateMachine>(
+    shared: &Arc<Shared<S>>,
+    slot: SlotId,
+    key: Vec<u8>,
+    query: Vec<u8>,
+    deadline: Instant,
+    with_applied: bool,
+) -> Result<Value, RuntimeError> {
     shared.check(deadline)?;
     let _guard = shared
         .budget
         .acquire(slot, key.len() + query.len() + MAX_EFFECTS_BYTES)?;
     let target = destination(shared, slot, &key, deadline).await?;
     if target == shared.node_id {
-        return shared.execute_query(slot, &query, deadline).await;
+        let view = shared.execute_query(slot, &query, deadline).await?;
+        return Ok(read_value(view, with_applied));
     }
-    match remote(
-        shared,
-        target,
-        slot,
-        key,
-        Operation::Read(query),
-        deadline,
-        false,
-    )
-    .await?
-    {
-        Value::Read(v) if v.len() <= MAX_EFFECTS_BYTES => Ok(v),
-        _ => Err(RuntimeError::Unavailable),
-    }
+    let operation = if with_applied {
+        Operation::ReadWithApplied(query)
+    } else {
+        Operation::Read(query)
+    };
+    remote(shared, target, slot, key, operation, deadline, false).await
 }
 async fn remote<S: SlotStateMachine>(
     shared: &Shared<S>,

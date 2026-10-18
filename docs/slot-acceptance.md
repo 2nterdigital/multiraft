@@ -75,7 +75,10 @@ local demo as a production service. A gate has a 45-second safety bound; admin
 handlers use independent Tokio workers to release it. `/compact` reports
 submission only. `/status` reports local point observations, not quorum readiness. A local `/read`
 keeps the `result` schema and adds `applied` (term, node ID, index, or null),
-captured with the returned value under the same FSM lock.
+captured with the returned value under the same FSM lock. A linearizable `/read`
+also adds `applied` (never null): the index its value reflects, sampled under the
+same FSM lock after ReadIndex on the replica that served it, at least that of
+every write completed before the read.
 
 Every attempted HTTP operation and its raw response or transport error goes to
 `requests.jsonl`. Layouts, per-start child logs, retained data and `receipt.json`

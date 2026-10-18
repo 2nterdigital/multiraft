@@ -249,3 +249,133 @@ async fn legacy_stale_read_preserves_flag_and_result_shape_with_atomic_view() {
         node.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn linearizable_reads_pair_value_with_applied_id_under_one_lock() {
+    let mut config = RuntimeConfig::new(
+        ClusterConfig::for_test(1, &[1]),
+        vec![GroupConfig {
+            group_id: 7,
+            voters: vec![1],
+        }],
+    );
+    config.transport = RuntimeTransport::InProcess(SharedFabric::new());
+    let owner = NodeOwner::start(config, |_| Ok(IndexFsm::default()), deadline())
+        .await
+        .unwrap();
+    let handle = owner.handle();
+    tokio::time::timeout_at(deadline(), async {
+        loop {
+            match handle
+                .read_linearizable_with_applied(7, deadline(), |_| ())
+                .await
+            {
+                Ok(_) => break,
+                Err(RuntimeError::Source(MultiRaftError::NotLeader { .. })) => {
+                    tokio::task::yield_now().await
+                }
+                error => panic!("unexpected readiness: {error:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let first = handle.propose(7, vec![1], deadline()).await.unwrap();
+    let initial = handle
+        .read_linearizable_with_applied(7, deadline(), |fsm| fsm.index)
+        .await
+        .unwrap();
+    assert_eq!(initial.value, first.index);
+    assert_eq!(
+        initial.applied,
+        ObservedLogId::new(first.term, 1, first.index)
+    );
+    let direct = owner
+        .handle()
+        .read_linearizable(7, deadline(), |fsm| fsm.index)
+        .await
+        .unwrap();
+    assert_eq!(direct, first.index);
+    let writing = handle.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let writer_finished = finished.clone();
+    let writer = tokio::spawn(async move {
+        for _ in 0..128 {
+            writing.propose(7, vec![1], deadline()).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        writer_finished.store(true, Ordering::SeqCst);
+    });
+    let mut samples = 0;
+    let mut last = first.index;
+    tokio::time::timeout_at(deadline(), async {
+        while !finished.load(Ordering::SeqCst) {
+            let view = handle
+                .read_linearizable_with_applied(7, deadline(), |fsm| fsm.index)
+                .await
+                .unwrap();
+            // The value and the id come from one FSM view, and reads never regress.
+            assert_eq!(view.value, view.applied.index);
+            assert!(view.applied.index >= last);
+            last = view.applied.index;
+            samples += 1;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    writer.await.unwrap();
+    assert!(samples > 0);
+    let after = handle
+        .read_linearizable_with_applied(7, deadline(), |fsm| fsm.index)
+        .await
+        .unwrap();
+    assert_eq!(after.applied.index, first.index + 128);
+    assert!(matches!(
+        handle
+            .read_linearizable_with_applied(8, deadline(), |_| ())
+            .await,
+        Err(RuntimeError::Source(MultiRaftError::UnknownGroup(8)))
+    ));
+    owner.shutdown(deadline()).await.unwrap();
+    assert!(matches!(
+        handle
+            .read_linearizable_with_applied(7, deadline(), |_| ())
+            .await,
+        Err(RuntimeError::Closed)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiraft_linearizable_read_with_applied_matches_proposal() {
+    let node = SharedFabric::new()
+        .start_node_with_factory(
+            ClusterConfig::for_test(1, &[1]),
+            |_| Ok(IndexFsm::default()),
+        )
+        .await
+        .unwrap();
+    node.create_group(7, &[1]).await.unwrap();
+    tokio::time::timeout_at(deadline(), async {
+        loop {
+            match node.read_linearizable(7, |_| ()).await {
+                Ok(()) => break,
+                Err(MultiRaftError::NotLeader { .. }) => tokio::task::yield_now().await,
+                error => panic!("unexpected readiness: {error:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let applied = node.propose_with_effects(7, vec![1]).await.unwrap();
+    let view = node
+        .read_linearizable_with_applied_at(7, deadline(), |fsm| fsm.index)
+        .await
+        .unwrap();
+    assert_eq!(view.value, applied.index);
+    assert_eq!(
+        view.applied,
+        ObservedLogId::new(applied.term, 1, applied.index)
+    );
+    node.shutdown().await.unwrap();
+}

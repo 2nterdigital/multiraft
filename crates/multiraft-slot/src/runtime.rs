@@ -510,45 +510,51 @@ impl<S: SlotStateMachine> Shared<S> {
         key_bytes: usize,
         query: &[u8],
         deadline: Instant,
-    ) -> Result<Vec<u8>, RuntimeError> {
+    ) -> Result<crate::LinearizableView<Vec<u8>>, RuntimeError> {
         self.check(deadline)?;
         let _guard = self
             .budget
             .acquire(slot, key_bytes + query.len() + MAX_EFFECTS_BYTES)?;
         self.execute_query(slot, query, deadline).await
     }
+    /// The value and the applied id it reflects, sampled under one FSM lock
+    /// after this call's ReadIndex confirmation.
     pub(crate) async fn execute_query(
         self: &Arc<Self>,
         slot: SlotId,
         query: &[u8],
         deadline: Instant,
-    ) -> Result<Vec<u8>, RuntimeError> {
+    ) -> Result<crate::LinearizableView<Vec<u8>>, RuntimeError> {
         self.check(deadline)?;
         let group = self
             .layout
             .group_for_slot(slot)
             .map_err(|_| RuntimeError::InvalidRequest)?;
-        let result = std::panic::AssertUnwindSafe(self.native.read_linearizable(
+        let result = std::panic::AssertUnwindSafe(self.native.read_linearizable_with_applied(
             group,
             deadline,
             |s| s.query(group, query),
         ))
         .catch_unwind()
         .await;
-        let value = match result {
-            Ok(result) => result
-                .map_err(|e| native(e, false))?
-                .map_err(|_| RuntimeError::Application)?,
+        let view = match result {
+            Ok(result) => {
+                let view = result.map_err(|e| native(e, false))?;
+                crate::LinearizableView {
+                    value: view.value.map_err(|_| RuntimeError::Application)?,
+                    applied: view.applied,
+                }
+            }
             Err(_) => {
                 self.panicked.store(true, Ordering::Release);
                 self.begin_cleanup();
                 return Err(RuntimeError::TaskPanicked);
             }
         };
-        if value.len() > MAX_EFFECTS_BYTES {
+        if view.value.len() > MAX_EFFECTS_BYTES {
             return Err(RuntimeError::PayloadTooLarge);
         }
-        Ok(value)
+        Ok(view)
     }
 }
 async fn wait_write(
@@ -628,6 +634,23 @@ impl<S: SlotStateMachine> SlotHandle<S> {
         let slot = self.validate(key, query, MAX_QUERY_BYTES)?;
         let shared = self.shared()?;
         crate::rpc::route_read(&shared, slot, key.to_vec(), query.to_vec(), deadline).await
+    }
+    /// Linearizable read that also returns the applied log id the value
+    /// reflects, sampled under the same FSM lock on the replica that confirmed
+    /// the read (possibly a forwarded leader). Same authority as
+    /// [`Self::read_linearizable`]; the id is at or beyond its read point.
+    /// A forwarded read needs a destination that also has this API: a peer
+    /// built before it rejects the request with `InvalidRequest`.
+    pub async fn read_linearizable_with_applied(
+        &self,
+        key: &[u8],
+        query: &[u8],
+        deadline: Instant,
+    ) -> Result<crate::LinearizableView<Vec<u8>>, RuntimeError> {
+        let slot = self.validate(key, query, MAX_QUERY_BYTES)?;
+        let shared = self.shared()?;
+        crate::rpc::route_read_with_applied(&shared, slot, key.to_vec(), query.to_vec(), deadline)
+            .await
     }
     /// Value and applied watermark sampled atomically under the same FSM lock.
     /// This local view never establishes leader authority or quorum freshness.

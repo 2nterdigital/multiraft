@@ -219,9 +219,14 @@ class Run:
     def write(self, node, key, cid, delta=1, timeout_ms=5000):
         return self.api(node, '/write', dict(key=key, command_id=cid, delta=delta, timeout_ms=timeout_ms))
 
-    def read(self, node, key, expected, local=False):
+    def read(self, node, key, expected, local=False, applied_at_least=None):
         response = self.api(node, '/read', dict(key=key, local=local))
         assert response.get('ok') and response['result']['value'] == expected, response
+        if not local:
+            # A linearizable read carries the applied index its value reflects.
+            applied = response.get('applied')
+            assert isinstance(applied, dict) and isinstance(applied.get('index'), int), response
+            assert applied_at_least is None or applied['index'] >= applied_at_least, (applied_at_least, response)
         return response['result']
 
     def passed(self, name, **evidence):
@@ -249,7 +254,7 @@ class Run:
             assert retry.get('ok') and retry['effects'] == effect, retry
             changed = self.write(follower, key, f'first-{slot}', 99)
             assert changed.get('ok') and changed['effects'] == dict(effect, accepted=False), changed
-            self.read(follower, key, 3)
+            self.read(follower, key, 3, applied_at_least=changed['index'])
             expected[key] = 3
         self.passed('three_os_processes_durable_multislot_forward_exact_effects_and_idempotency', pids=[p.pid for p in self.processes.values()])
         # Gate only the actual leader; observe entry before relying on timeout.
