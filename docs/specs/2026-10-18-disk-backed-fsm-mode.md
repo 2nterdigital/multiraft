@@ -163,9 +163,14 @@ reopen the instance. ech0's composite FSM (#191) implements `DiskState` over
   engine* (log compaction debt) still affects every Slot on the node.
   See [RocksDB Write Stalls](https://github.com/facebook/rocksdb/wiki/Write-Stalls).
 - **Resources per Slot.** Each instance has its own WAL, memtables and file
-  handles. Consumers should pass a shared `Cache`/`WriteBufferManager` through
-  `DiskFsmOptions::db_options` and size `max_open_files` against the process
-  file limit (macOS defaults are low).
+  handles. Consumers should pass a shared `WriteBufferManager` and
+  `max_open_files` (sized against the process file limit; macOS defaults are
+  low) through `DiskFsmOptions::db_options`, and the shared block `Cache`
+  (block-based table options) and memtable sizes through
+  `DiskFsmOptions::cf_options`. Column-family settings in `db_options` do not
+  reach any column family; `cf_options` applies to every column family,
+  `multiraft_meta` included, and must not change key handling (comparator,
+  merge operator, compaction filter).
 - **Interrupted first creation.** A crash while RocksDB creates a new FSM
   instance (before `CURRENT`, or between column-family creations) leaves a
   directory that `open` rejects. No entry was applied yet. Remedy: delete that

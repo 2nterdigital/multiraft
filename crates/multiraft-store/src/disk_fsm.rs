@@ -12,7 +12,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use multiraft_fsm::{AppliedState, GroupId};
-use rocksdb::{ColumnFamily, IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB,
+};
 
 /// Reserved column family; applications cannot open or name it.
 pub const DISK_FSM_META_CF: &str = "multiraft_meta";
@@ -35,8 +37,17 @@ pub struct DiskFsmOptions {
     /// which is safe only while the Raft log keeps the entries after it.
     pub sync_writes: bool,
     /// Base RocksDB tuning (shared cache, write-buffer manager, file limits).
-    /// Creation flags are set by `open`.
+    /// Creation flags are set by `open`. Only database-wide settings (such as
+    /// the write-buffer manager) take effect here; column-family settings go
+    /// in [`Self::cf_options`].
     pub db_options: Options,
+    /// Column-family tuning applied to every column family, `default` and
+    /// `multiraft_meta` included: block-based table options with a shared
+    /// block cache, `write_buffer_size`, `max_write_buffer_number` and the
+    /// like. `None` keeps RocksDB defaults. It must not change how keys are
+    /// stored or kept (comparator, merge operator, compaction filter): the
+    /// meta column family uses it too, and the on-disk format stays fixed.
+    pub cf_options: Option<Options>,
 }
 
 impl DiskFsmOptions {
@@ -46,7 +57,17 @@ impl DiskFsmOptions {
             app_format: app_format.into(),
             sync_writes: true,
             db_options: Options::default(),
+            cf_options: None,
         }
+    }
+
+    /// One descriptor per column family in `names`, all with [`Self::cf_options`].
+    pub(crate) fn descriptors(&self, names: &BTreeSet<String>) -> Vec<ColumnFamilyDescriptor> {
+        let cf_options = self.cf_options.clone().unwrap_or_default();
+        names
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(name, cf_options.clone()))
+            .collect()
     }
 }
 
@@ -136,7 +157,8 @@ impl DiskFsmDb {
                 ));
             }
         }
-        let db = DB::open_cf(&db_options, path, &names).map_err(db_error)?;
+        let db = DB::open_cf_descriptors(&db_options, path, options.descriptors(&names))
+            .map_err(db_error)?;
         check_markers(&db, group, &options.app_format, &names, false)?;
         Ok(db)
     }

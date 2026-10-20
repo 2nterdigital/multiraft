@@ -125,8 +125,11 @@ applied 位置和 membership。
   Slot 的日志追加、vote 或心跳；但*共享日志引擎本身*的 stall（日志压缩欠账）仍影响
   本节点所有 Slot。见 [RocksDB Write Stalls](https://github.com/facebook/rocksdb/wiki/Write-Stalls)。
 - **每 Slot 的资源**：每个实例有自己的 WAL、memtable 和文件句柄。使用方应通过
-  `DiskFsmOptions::db_options` 传入共享的 `Cache`/`WriteBufferManager`，并按进程文件
-  句柄上限设置 `max_open_files`（macOS 默认值较低）。
+  `DiskFsmOptions::db_options` 传入共享的 `WriteBufferManager`，并按进程文件句柄上限
+  设置 `max_open_files`（macOS 默认值较低）；共享的块 `Cache`（block-based table
+  选项）与 memtable 大小通过 `DiskFsmOptions::cf_options` 传入。`db_options` 中的列族
+  级设置不会作用于任何列族；`cf_options` 作用于全部列族（含 `multiraft_meta`），不得
+  改变键的处理方式（comparator、merge operator、compaction filter）。
 - **首次创建被中断**：RocksDB 创建新 FSM 实例期间（`CURRENT` 写出之前，或各列族
   创建之间）崩溃，会留下 `open` 拒绝的目录；此时尚未 apply 任何条目。处理办法：删除
   该 Group 的 FSM 目录。

@@ -202,6 +202,65 @@ fn helper_creates_markers_and_fails_closed_on_foreign_databases() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
+/// Column-family value of `key` in the newest RocksDB OPTIONS file under `path`.
+fn persisted_cf_option(path: &Path, cf: &str, key: &str) -> Option<String> {
+    let newest = std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("OPTIONS-") && !name.ends_with(".dbtmp"))
+        .max()?;
+    let text = std::fs::read_to_string(path.join(newest)).unwrap();
+    let header = format!("[CFOptions \"{cf}\"]");
+    let section = text.split(&header).nth(1)?.split("\n[").next()?;
+    section.lines().find_map(|line| {
+        let (name, value) = line.trim().split_once('=')?;
+        (name == key).then(|| value.to_owned())
+    })
+}
+
+#[test]
+fn column_family_options_reach_application_column_families() {
+    use multiraft_store::rocksdb::{BlockBasedOptions, Cache, Options};
+    const CACHE: usize = 3 << 20;
+    const WRITE_BUFFER: usize = 5 << 20;
+    let root = scratch();
+    let tuned = db_path(root.path());
+    let mut table = BlockBasedOptions::default();
+    table.set_block_cache(&Cache::new_lru_cache(CACHE));
+    let mut cf_options = Options::default();
+    cf_options.set_block_based_table_factory(&table);
+    cf_options.set_write_buffer_size(WRITE_BUFFER);
+    let mut with_cf = options();
+    with_cf.cf_options = Some(cf_options);
+    let capacity = |db: &DiskFsmDb, cf: &str| {
+        db.db()
+            .property_int_value_cf(db.cf(cf).unwrap(), "rocksdb.block-cache-capacity")
+            .unwrap()
+    };
+
+    // Created and reopened with the options: every application CF uses them.
+    drop(DiskFsmDb::open(&tuned, GROUP, with_cf.clone()).unwrap());
+    let db = DiskFsmDb::open(&tuned, GROUP, with_cf.clone()).unwrap();
+    for cf in ["default", "calls"] {
+        assert_eq!(capacity(&db, cf), Some(CACHE as u64), "{cf}");
+        assert_eq!(
+            persisted_cf_option(&tuned, cf, "write_buffer_size"),
+            Some(WRITE_BUFFER.to_string()),
+            "{cf}"
+        );
+    }
+    drop(db);
+
+    // The same database still opens without them (format unchanged), and
+    // then falls back to RocksDB defaults.
+    let plain = DiskFsmDb::open(&tuned, GROUP, options()).unwrap();
+    assert_ne!(capacity(&plain, "calls"), Some(CACHE as u64));
+    assert_ne!(
+        persisted_cf_option(&tuned, "calls", "write_buffer_size"),
+        Some(WRITE_BUFFER.to_string())
+    );
+}
+
 #[tokio::test]
 async fn restart_recovers_applied_position_and_membership_without_replay() {
     let root = scratch();

@@ -57,7 +57,9 @@ impl DiskFsmDb {
                 "received checkpoint column families differ from the declared format",
             ));
         }
-        let db = DB::open_cf_for_read_only(&options, dir, &names, false).map_err(db_error)?;
+        let descriptors = self.options.descriptors(&names);
+        let db = DB::open_cf_descriptors_read_only(&options, dir, descriptors, false)
+            .map_err(db_error)?;
         check_markers(&db, self.group, &self.options.app_format, &names, true)?;
         db.get_cf(meta_cf(&db)?, APPLIED_KEY).map_err(db_error)
     }
