@@ -3,7 +3,8 @@ use super::*;
 use crate::read_observation::{ReadGuard, ReadObserver, ReadOutcome, ReadStage, TryReadError};
 
 impl<S: StateMachine> RuntimeHandle<S> {
-    /// One native ReadIndex then this invocation's local FSM query. No hidden retry.
+    /// Native ReadIndex then this invocation's local FSM query. A ReadIndex round
+    /// that misses its quorum is re-confirmed within `deadline`; nothing else retries.
     /// The synchronous query must be bounded. For fallible queries use `try_read_linearizable`.
     pub async fn read_linearizable<R>(
         &self,
@@ -17,7 +18,7 @@ impl<S: StateMachine> RuntimeHandle<S> {
     /// One native ReadIndex then this invocation's local FSM query, returning the
     /// value with the applied log id sampled under the same FSM lock. The id is
     /// what the value reflects and is at or beyond the confirmed read point.
-    /// No hidden retry; the synchronous query must be bounded.
+    /// Same ReadIndex retry as `read_linearizable`; the synchronous query must be bounded.
     pub async fn read_linearizable_with_applied<R>(
         &self,
         group: GroupId,

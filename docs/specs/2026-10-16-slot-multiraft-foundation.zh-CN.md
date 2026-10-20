@@ -83,7 +83,7 @@ handle.read_applied(slot, query, deadline) -> Result<AppliedView<Vec<u8>>, Runti
 owner.shutdown(deadline) -> ShutdownReport
 ```
 
-测试 FSM 可在 command bytes 内携带 command ID 并持久其对应结果；通用 Slot 层不自创业务 dedup 语义。Applied 对应精确 committed + applied proposal，不是最近观察到的组 index。`SlotApplied` 包含 slot/index/term/effects。线性化查询使用目标组原生 ReadIndex 并满足 apply 可见性，返回 bytes。`read_applied` 按 Slot 读取本地视图；value 与可选 `ObservedLogId {term, node_id, index}` 在同一 FSM 锁内采集，尚无 applied entry 时为 `None`；此读不路由，也不建立 quorum freshness。leader 观察只是 hint，不是 fence。
+测试 FSM 可在 command bytes 内携带 command ID 并持久其对应结果；通用 Slot 层不自创业务 dedup 语义。Applied 对应精确 committed + applied proposal，不是最近观察到的组 index。`SlotApplied` 包含 slot/index/term/effects。线性化查询使用目标组原生 ReadIndex 并满足 apply 可见性，返回 bytes。一轮原生 ReadIndex 只等待一个心跳间隔的 follower 确认；未凑齐 quorum（`QuorumUnavailable`）的一轮在调用方 deadline 允许时暂停 20 ms 后重新确认。失去 leader（`NotLeader`）、关闭、后端故障与 deadline 仍使读失败。`read_applied` 按 Slot 读取本地视图；value 与可选 `ObservedLogId {term, node_id, index}` 在同一 FSM 锁内采集，尚无 applied entry 时为 `None`；此读不路由，也不建立 quorum freshness。leader 观察只是 hint，不是 fence。
 
 `SlotStatus.local_recovery_ready` 只观察本地恢复 owner，不等待选主，也不证明 leader/quorum 可用；首次调用因此可能分类拒绝。不 hosted 该 Slot 的节点可对 voters 做有界只读 hint probe，并在同一 deadline 内为最终一次 application 操作留预算；写 dispatch 本身绝不重试。
 

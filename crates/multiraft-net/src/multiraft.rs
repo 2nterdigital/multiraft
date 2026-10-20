@@ -643,4 +643,6 @@ where
 }
 
 #[cfg(test)]
+mod read_quorum_tests;
+#[cfg(test)]
 mod tests;

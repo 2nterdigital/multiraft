@@ -5,6 +5,8 @@ use multiraft_core::{NativeFailure, ReadIndexFailure};
 use tokio::time::Instant;
 
 const READ_BOUND: Duration = Duration::from_secs(10);
+/// Pause before re-confirming a ReadIndex round that missed its quorum.
+const QUORUM_RETRY: Duration = Duration::from_millis(20);
 fn native_failure(error: openraft::error::Fatal<TypeConfig>) -> ReadIndexFailure {
     match error {
         openraft::error::Fatal::Stopped => ReadIndexFailure::Closed,
@@ -107,7 +109,20 @@ impl<S: StateMachine> MultiRaft<S> {
             let raft = self
                 .raft(group)
                 .ok_or(MultiRaftError::UnknownGroup(group))?;
-            confirm(&raft, deadline).await
+            // One ReadIndex round waits only one heartbeat interval for a
+            // quorum; a follower that answers a little later (busy applying
+            // or syncing) is not lost authority. Retry within this caller's
+            // budget; leadership loss and terminal failures still propagate.
+            loop {
+                match confirm(&raft, deadline).await {
+                    Err(MultiRaftError::ReadIndex(ReadIndexFailure::QuorumUnavailable {
+                        ..
+                    })) if Instant::now() + QUORUM_RETRY < deadline => {
+                        tokio::time::sleep(QUORUM_RETRY).await;
+                    }
+                    result => break result,
+                }
+            }
         }
         .await;
         stage.finish_source(&result);
