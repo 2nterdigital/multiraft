@@ -106,8 +106,8 @@ impl<S: StateMachine> RuntimeHandle<S> {
 
     /// Validate this opened Group's current local native recovery basis.
     ///
-    /// This bounded read-only probe performs no construction, initialization or
-    /// startup cleanup. A not-yet-recoverable result leaves the node running;
+    /// Requires the shared durable RocksDB log. This bounded read-only probe
+    /// performs no construction, initialization or startup cleanup. A not-yet-recoverable result leaves the node running;
     /// callers may retry within their original deadline. Application readiness
     /// still requires the caller's membership and applied-watermark checks.
     pub async fn validate_local_recovery_basis(
@@ -127,7 +127,16 @@ impl<S: StateMachine> RuntimeHandle<S> {
                     .await
                     .map_err(MultiRaftError::Other)
             })
-            .await
+            .await?;
+        // Synchronous bounded metadata/checksum reads cannot be preempted, but
+        // they must never publish a successful proof after the caller's budget.
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::Deadline {
+                phase: RuntimePhase::LocalStatus,
+                outcome_unknown: false,
+            });
+        }
+        Ok(())
     }
 
     /// Construct a Group, then bound only its native recovery wait.

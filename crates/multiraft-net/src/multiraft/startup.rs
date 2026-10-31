@@ -224,18 +224,21 @@ impl<S: StateMachine> MultiRaft<S> {
         // migration check can invoke snapshot startup cleanup and is unsuitable
         // for a live probe. After proving Persisted, open_native_log takes only
         // its non-mutating existing-namespace path.
-        let db = self.rocks_log_db.lock().unwrap().clone();
-        let provenance = if let Some(db) = db {
-            match db.lifecycle_receipt(group)? {
-                Some(receipt) => db.startup_provenance_generation(group, receipt.generation)?,
-                None => db.startup_provenance(group)?,
-            }
-        } else {
-            anyhow::ensure!(
-                self.config.log_storage_backend == LogStorageBackend::FileLog,
-                "RocksDB log owner has stopped"
-            );
-            FileLogStoreOf::startup_provenance(self.config.data_dir.join(format!("group-{group}")))?
+        // Reopening a live FileLog would create another writer. The shared
+        // RocksDB owner exposes safe metadata/read handles for this probe.
+        anyhow::ensure!(
+            self.config.log_storage_backend == LogStorageBackend::RocksDb,
+            "local recovery basis probe requires the shared RocksDB native log"
+        );
+        let db = self
+            .rocks_log_db
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("RocksDB log owner has stopped"))?;
+        let provenance = match db.lifecycle_receipt(group)? {
+            Some(receipt) => db.startup_provenance_generation(group, receipt.generation)?,
+            None => db.startup_provenance(group)?,
         };
         anyhow::ensure!(
             provenance == StartupProvenance::Persisted,

@@ -143,6 +143,10 @@ async fn cold_recovery_replays_durable_log_and_ignores_declaration_voters() {
         )
         .await
         .unwrap();
+    handle
+        .validate_local_recovery_basis(7, deadline())
+        .await
+        .unwrap();
     let value = handle
         .try_read_applied(7, deadline(), |fsm| {
             Ok::<_, std::convert::Infallible>(fsm.value(7))
@@ -296,6 +300,21 @@ async fn native_snapshot_and_suffix_recover_before_app_validator_and_rejection_d
             drop(db);
         } else {
             result.unwrap();
+            // A live basis probe must preserve an in-flight native generation.
+            // Startup provenance cleanup would delete this separately owned stage.
+            let catalog = multiraft_store::SnapshotCatalog::new(root.path().join("snapshots"), 1);
+            let info = catalog.describe_native(7, 1024 * 1024).unwrap().unwrap();
+            let staged = catalog
+                .stage_native(7, &info.meta, b"in-flight", 1024 * 1024)
+                .unwrap();
+            let generations = root.path().join("snapshots/7/native-v1");
+            let count = std::fs::read_dir(&generations).unwrap().count();
+            handle
+                .validate_local_recovery_basis(7, deadline())
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_dir(&generations).unwrap().count(), count);
+            drop(staged);
             assert_eq!(
                 handle
                     .try_read_applied(7, deadline(), |fsm| Ok::<_, std::convert::Infallible>(
@@ -685,5 +704,38 @@ async fn local_basis_probe_rejects_memory_without_fencing_the_running_group() {
             .unwrap()
             .running
     );
+    owner.shutdown(deadline()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn not_yet_persisted_basis_can_be_probed_repeatedly_without_construction_or_fencing() {
+    let root = scratch();
+    let mut inputs = config(root.path());
+    inputs.cluster.role = multiraft_core::NodeRole::Standby;
+    inputs.cluster.snapshot_mode = SnapshotMode::Disabled;
+    inputs.groups = vec![group(7)];
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory_calls = calls.clone();
+    let owner = NodeOwner::start(
+        inputs,
+        move |_| {
+            factory_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CounterFsm::default())
+        },
+        deadline(),
+    )
+    .await
+    .unwrap();
+    let handle = owner.handle();
+    for _ in 0..2 {
+        assert!(handle
+            .validate_local_recovery_basis(7, deadline())
+            .await
+            .is_err());
+        let status = handle.local_group_status(7, deadline()).await.unwrap();
+        assert!(status.running);
+        assert_eq!(status.last_log_index, None);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     owner.shutdown(deadline()).await.unwrap();
 }
