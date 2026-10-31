@@ -16,7 +16,7 @@ mod native_control;
 mod type_config;
 pub use native_control::{
     ControlRejection, ControlReply, NativeControl, NativeLedger, OperationId, OperationRecord,
-    ReplacementSpec,
+    ReplacementSpec, TargetOpenReceipt, TerminalProof,
 };
 
 pub use config::ClusterConfig;
