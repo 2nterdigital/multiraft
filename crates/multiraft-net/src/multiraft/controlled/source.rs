@@ -82,7 +82,7 @@ impl<S: StateMachine> ControlledGroup<S> {
         deadline: tokio::time::Instant,
     ) -> Result<ControlledExecutor, ControlledError> {
         let this = self.clone();
-        let target = target.clone();
+        let target = target.with_source_stop(self.node()?.group_owner(self.group).stopping());
         self.node()?
             .controlled_run(self.group, deadline, move |node| async move {
                 this.checked_active()?;
@@ -221,7 +221,7 @@ impl<S: StateMachine> ControlledGroup<S> {
     ) -> Result<(), ControlledError> {
         let this = self.clone();
         let executor = executor.clone();
-        let target = target.clone();
+        let target = target.with_source_stop(self.node()?.group_owner(self.group).stopping());
         self.node()?
             .controlled_run(self.group, deadline, move |node| async move {
                 this.checked_active()?;
@@ -292,6 +292,8 @@ impl<S: StateMachine> ControlledGroup<S> {
         let group = self.group;
         let executor = executor.clone();
         let this = self.clone();
+        let stopping = self.node()?.group_owner(group).stopping();
+        let target = target.map(|target| target.with_source_stop(stopping.clone()));
         self.node()?
             .controlled_run(group, deadline, move |node| async move {
                 this.checked_active()?;
@@ -372,7 +374,7 @@ impl<S: StateMachine> ControlledGroup<S> {
     ) -> Result<ControlledTerminal, ControlledError> {
         let this = self.clone();
         let executor = executor.clone();
-        let target = target.clone();
+        let target = target.with_source_stop(self.node()?.group_owner(self.group).stopping());
         self.node()?
             .controlled_run(self.group, deadline, move |node| async move {
                 this.checked_active()?;

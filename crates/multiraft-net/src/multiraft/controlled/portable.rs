@@ -133,6 +133,7 @@ pub struct SourceTargetPort {
     identity: NativeTargetIdentity,
     specification: ReplacementSpec,
     transport: Arc<dyn NativeTargetTransport>,
+    stopping: Option<tokio::sync::watch::Receiver<bool>>,
 }
 impl std::fmt::Debug for SourceTargetPort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -171,6 +172,7 @@ impl SourceTargetPort {
             identity,
             specification,
             transport,
+            stopping: None,
         })
     }
     pub fn identity(&self) -> &NativeTargetIdentity {
@@ -178,6 +180,11 @@ impl SourceTargetPort {
     }
     pub fn specification(&self) -> &ReplacementSpec {
         &self.specification
+    }
+    pub(super) fn with_source_stop(&self, stopping: tokio::sync::watch::Receiver<bool>) -> Self {
+        let mut port = self.clone();
+        port.stopping = Some(stopping);
+        port
     }
     pub(super) fn validate_source<S: StateMachine>(
         &self,

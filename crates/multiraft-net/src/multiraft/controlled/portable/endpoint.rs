@@ -8,6 +8,19 @@ use multiraft_store::{
 use openraft::{storage::RaftStateMachine, vote::RaftLeaderId};
 use tokio::sync::{mpsc, Notify};
 
+fn classify_error(error: &ControlledError) -> NativeTargetOutcome {
+    match error {
+        ControlledError::Deadline {
+            outcome_unknown: true,
+        }
+        | ControlledError::Closed => NativeTargetOutcome::Unknown,
+        ControlledError::Deadline {
+            outcome_unknown: false,
+        } => NativeTargetOutcome::Unsent,
+        ControlledError::TargetOutcome { outcome, .. } => *outcome,
+        _ => NativeTargetOutcome::Rejected,
+    }
+}
 struct Installation {
     scope: NativeTargetScope,
     header: NativeSeedHeader,
@@ -15,7 +28,7 @@ struct Installation {
     sender: mpsc::Sender<ChunkResult>,
     next: u64,
     last: Option<(u64, Vec<u8>)>,
-    outcome: Arc<Mutex<Option<Result<(), String>>>>,
+    outcome: Arc<Mutex<Option<Result<(), NativeTargetTransportError>>>>,
     changed: Arc<Notify>,
 }
 /// Dispatcher bound to one locally reserved native target, served only over authenticated channels.
@@ -119,20 +132,7 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
         };
         let (outcome, observation, error) = match result {
             Ok((outcome, observation)) => (outcome, observation, None),
-            Err(error) => (
-                if matches!(
-                    error,
-                    ControlledError::Deadline {
-                        outcome_unknown: true
-                    } | ControlledError::Closed
-                ) {
-                    NativeTargetOutcome::Unknown
-                } else {
-                    NativeTargetOutcome::Rejected
-                },
-                None,
-                Some(error.to_string()),
-            ),
+            Err(error) => (classify_error(&error), None, Some(error.to_string())),
         };
         serde_json::to_vec(&NativeTargetReply {
             scope: request.scope,
@@ -189,7 +189,10 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                         let notified = changed.notified();
                         let result = outcome.lock().expect("seed outcome lock poisoned").clone();
                         if let Some(result) = result {
-                            result.map_err(ControlledError::Native)?;
+                            result.map_err(|error| ControlledError::TargetOutcome {
+                                outcome: error.outcome,
+                                message: error.message,
+                            })?;
                             break;
                         }
                         notified.await;
@@ -220,7 +223,10 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                     let notified = changed.notified();
                     let result = outcome.lock().expect("seed outcome lock poisoned").clone();
                     if let Some(result) = result {
-                        result.map_err(ControlledError::Native)?;
+                        result.map_err(|error| ControlledError::TargetOutcome {
+                            outcome: error.outcome,
+                            message: error.message,
+                        })?;
                         break;
                     }
                     notified.await;
@@ -325,7 +331,10 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                     )
                     .await
                     .map(|_| ())
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| NativeTargetTransportError {
+                        outcome: classify_error(&error),
+                        message: error.to_string(),
+                    });
                 *saved_outcome.lock().expect("seed outcome lock poisoned") = Some(result);
                 saved_changed.notify_waiters();
             })

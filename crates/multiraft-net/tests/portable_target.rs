@@ -297,3 +297,116 @@ async fn abandoning_install_waiter_does_not_cancel_source_owned_transfer_or_targ
         node.shutdown().await.unwrap();
     }
 }
+
+struct StalledTransport {
+    peer: (u64, Option<[u8; 32]>),
+    entered: Arc<tokio::sync::Notify>,
+}
+impl NativeTargetTransport for StalledTransport {
+    fn peer(&self) -> (u64, Option<[u8; 32]>) {
+        self.peer
+    }
+    fn exchange(
+        &self,
+        _bytes: Vec<u8>,
+    ) -> authority::StartupAuthorityFuture<'_, Result<Vec<u8>, NativeTargetTransportError>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_target_exchange_cannot_hold_source_shutdown_after_waiter_loss() {
+    let root = cluster::scratch("portable-source-stop-");
+    let mut session = Session::fresh(root.as_path()).await;
+    let (leader, spec, target) = session.reserve(false).await;
+    let endpoint = NativeTargetEndpoint::new(target, spec.clone()).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let port = SourceTargetPort::new(
+        endpoint.identity().clone(),
+        spec.clone(),
+        Arc::new(StalledTransport {
+            peer: endpoint.peer(),
+            entered: entered.clone(),
+        }),
+    )
+    .unwrap();
+    let source = session.group(leader).clone();
+    let waiter =
+        tokio::spawn(async move { source.begin_with_port(spec, 1, &port, deadline()).await });
+    tokio::time::timeout(std::time::Duration::from_secs(20), entered.notified())
+        .await
+        .unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        session.nodes[leader].shutdown(),
+    )
+    .await
+    .expect("source stop must interrupt transport held by an owned native command")
+    .unwrap();
+    for (index, node) in session.nodes.iter().enumerate() {
+        if index != leader {
+            node.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_stop_leaves_actual_pending_target_application_owned() {
+    let root = cluster::scratch("portable-target-owned-after-source-stop-");
+    let mut session = Session::fresh(root.as_path()).await;
+    let (leader, spec, executor) = session.prepare(false).await;
+    let gate = root.join("node-4/application-gate");
+    std::fs::create_dir_all(&gate).unwrap();
+    std::fs::write(gate.join("armed"), b"pause native target application").unwrap();
+    session.nodes[leader]
+        .propose(GROUP, b"pending-opaque-application".to_vec())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !gate.join("entered").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let port = session.group(3).target_port(spec).unwrap();
+    let outcome = session
+        .group(leader)
+        .enter_joint_with_port(
+            &executor,
+            &port,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+        )
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(multiraft_net::ControlledError::Deadline {
+                outcome_unknown: true
+            })
+        ),
+        "source command waits for actual target apply: {outcome:?}"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        session.nodes[leader].shutdown(),
+    )
+    .await
+    .expect("source stop interrupts its target transport waiter")
+    .unwrap();
+    assert!(
+        !gate.join("release").exists(),
+        "target application was still blocked during source shutdown"
+    );
+    std::fs::write(gate.join("release"), b"complete target durable native work").unwrap();
+    cluster::wait_payloads(&session.nodes[3], &[b"pending-opaque-application".to_vec()]).await;
+    for (index, node) in session.nodes.iter().enumerate() {
+        if index != leader {
+            node.shutdown().await.unwrap();
+        }
+    }
+}

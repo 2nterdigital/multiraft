@@ -20,11 +20,22 @@ impl SourceTargetPort {
             command: command.clone(),
         };
         let bytes = serde_json::to_vec(&request).map_err(std::io::Error::other)?;
-        let bytes = self.transport.exchange(bytes).await.map_err(|error| {
-            ControlledError::TargetOutcome {
-                outcome: error.outcome,
-                message: error.message,
+        let exchange = self.transport.exchange(bytes);
+        let bytes = if let Some(mut stopping) = self.stopping.clone() {
+            if *stopping.borrow() {
+                return Err(ControlledError::Closed);
             }
+            tokio::select! {
+                biased;
+                _ = stopping.changed() => return Err(ControlledError::Closed),
+                reply = exchange => reply,
+            }
+        } else {
+            exchange.await
+        }
+        .map_err(|error| ControlledError::TargetOutcome {
+            outcome: error.outcome,
+            message: error.message,
         })?;
         if bytes.len() > 6 * multiraft_store::disk_snapshot::MAX_MANIFEST_BYTES {
             return Err(ControlledError::Rejected(
