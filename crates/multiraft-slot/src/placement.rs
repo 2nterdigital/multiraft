@@ -14,6 +14,11 @@ use crate::config::{
 use crate::router::BUCKET_COUNT;
 use crate::SlotError;
 
+mod incremental;
+pub use incremental::{
+    plan_incremental, CurrentPlacement, IncrementalPlacement, IncrementalTarget, ReplicaReplacement,
+};
+
 /// Replication factor of generated layouts. Fixed in this format.
 pub const REPLICATION_FACTOR: usize = 3;
 
@@ -76,6 +81,45 @@ pub fn contiguous_bucket_table(slot_count: u32) -> Result<Vec<u32>, SlotError> {
 /// [`SlotError::Config`] for duplicate node ids or addresses, zero weights,
 /// fewer than [`REPLICATION_FACTOR`] nodes, or any layout validation failure.
 pub fn plan(input: &PlacementInput) -> Result<ClusterLayout, SlotError> {
+    let nodes = validated_nodes(input)?;
+    let buckets = contiguous_bucket_table(input.slot_count)?;
+    let mut replicas = vec![0_u64; nodes.len()];
+    let mut preferences = vec![0_u64; nodes.len()];
+    let mut slots = Vec::with_capacity(input.slot_count as usize);
+    for ordinal in 0..input.slot_count {
+        let mut order: Vec<usize> = (0..nodes.len()).collect();
+        order.sort_by(|&a, &b| {
+            // replicas[a] / weight[a] vs replicas[b] / weight[b], without floats.
+            let left = u128::from(replicas[a]) * u128::from(nodes[b].weight);
+            let right = u128::from(replicas[b]) * u128::from(nodes[a].weight);
+            left.cmp(&right)
+                .then_with(|| {
+                    stable_tie(ordinal, &nodes[a], nodes.len()).cmp(&stable_tie(
+                        ordinal,
+                        &nodes[b],
+                        nodes.len(),
+                    ))
+                })
+                .then_with(|| nodes[a].node_id.cmp(&nodes[b].node_id))
+        });
+        let chosen = &order[..REPLICATION_FACTOR];
+        for &index in chosen {
+            replicas[index] += 1;
+        }
+        let leader = preferred_leader(ordinal, chosen, &nodes, &mut preferences);
+        let mut voters: Vec<NodeId> = chosen.iter().map(|&index| nodes[index].node_id).collect();
+        voters.sort_unstable();
+        slots.push(SlotAssignment {
+            slot: SlotId(ordinal),
+            voters,
+            preferred_initializer: nodes[leader].node_id,
+            soft_preferred_leader: nodes[leader].node_id,
+        });
+    }
+    validated_layout(input, &nodes, buckets, slots)
+}
+
+fn validated_nodes(input: &PlacementInput) -> Result<Vec<PlacementNode>, SlotError> {
     let invalid = |message: &str| SlotError::Config(message.to_owned());
     if input.nodes.len() < REPLICATION_FACTOR {
         return Err(invalid("placement needs at least 3 nodes for RF 3"));
@@ -102,47 +146,44 @@ pub fn plan(input: &PlacementInput) -> Result<ClusterLayout, SlotError> {
     if nodes.iter().any(|node| node.weight == 0) {
         return Err(invalid("node weight must be >= 1"));
     }
-    let buckets = contiguous_bucket_table(input.slot_count)?;
-    let count = nodes.len() as u128;
-    let tie = |ordinal: u32, node: &PlacementNode| {
-        (u128::from(ordinal) + 1 + u128::from(node.node_id)) % count
-    };
-    let mut replicas = vec![0_u64; nodes.len()];
-    let mut preferences = vec![0_u64; nodes.len()];
-    let mut slots = Vec::with_capacity(input.slot_count as usize);
-    for ordinal in 0..input.slot_count {
-        let mut order: Vec<usize> = (0..nodes.len()).collect();
-        order.sort_by(|&a, &b| {
-            // replicas[a] / weight[a] vs replicas[b] / weight[b], without floats.
-            let left = u128::from(replicas[a]) * u128::from(nodes[b].weight);
-            let right = u128::from(replicas[b]) * u128::from(nodes[a].weight);
-            left.cmp(&right)
-                .then_with(|| tie(ordinal, &nodes[a]).cmp(&tie(ordinal, &nodes[b])))
+    Ok(nodes)
+}
+
+fn stable_tie(ordinal: u32, node: &PlacementNode, count: usize) -> u128 {
+    (u128::from(ordinal) + 1 + u128::from(node.node_id)) % count as u128
+}
+
+fn preferred_leader(
+    ordinal: u32,
+    chosen: &[usize],
+    nodes: &[PlacementNode],
+    preferences: &mut [u64],
+) -> usize {
+    let leader = *chosen
+        .iter()
+        .min_by(|&&a, &&b| {
+            preferences[a]
+                .cmp(&preferences[b])
+                .then_with(|| {
+                    stable_tie(ordinal, &nodes[a], nodes.len()).cmp(&stable_tie(
+                        ordinal,
+                        &nodes[b],
+                        nodes.len(),
+                    ))
+                })
                 .then_with(|| nodes[a].node_id.cmp(&nodes[b].node_id))
-        });
-        let chosen = &order[..REPLICATION_FACTOR];
-        for &index in chosen {
-            replicas[index] += 1;
-        }
-        let leader = *chosen
-            .iter()
-            .min_by(|&&a, &&b| {
-                preferences[a]
-                    .cmp(&preferences[b])
-                    .then_with(|| tie(ordinal, &nodes[a]).cmp(&tie(ordinal, &nodes[b])))
-                    .then_with(|| nodes[a].node_id.cmp(&nodes[b].node_id))
-            })
-            .unwrap_or(&chosen[0]);
-        preferences[leader] += 1;
-        let mut voters: Vec<NodeId> = chosen.iter().map(|&index| nodes[index].node_id).collect();
-        voters.sort_unstable();
-        slots.push(SlotAssignment {
-            slot: SlotId(ordinal),
-            voters,
-            preferred_initializer: nodes[leader].node_id,
-            soft_preferred_leader: nodes[leader].node_id,
-        });
-    }
+        })
+        .unwrap_or(&chosen[0]);
+    preferences[leader] += 1;
+    leader
+}
+
+fn validated_layout(
+    input: &PlacementInput,
+    nodes: &[PlacementNode],
+    buckets: Vec<u32>,
+    slots: Vec<SlotAssignment>,
+) -> Result<ClusterLayout, SlotError> {
     ClusterLayout::new(LayoutConfig {
         cluster_id: input.cluster_id.clone(),
         format_version: FORMAT_VERSION,
