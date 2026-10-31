@@ -53,7 +53,8 @@ pub struct StartupBinding {
 /// Exact native committed/applied terminal evidence, verified by the controlled runtime.
 ///
 /// Implementations must validate the full native operation, final single voter config,
-/// complete committed/applied membership identity and target durable Opened receipt. A
+/// complete committed/applied membership identity, native terminal barrier and target
+/// durable Opened receipt. `native_record.terminal` must be present and match this proof. A
 /// management status, local stop, effective-only config, or source acknowledgement is
 /// insufficient. The adapter accepts this only from the trusted native proof verifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

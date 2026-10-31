@@ -23,7 +23,7 @@ fn membership(index: u64, voters: &[u64]) -> StoredMembership {
     )
 }
 fn provision(path: &Path) -> FileAuthority {
-    FileAuthority::provision(
+    let authority = FileAuthority::provision(
         path,
         StartupCatalog {
             group_id: 7,
@@ -34,7 +34,9 @@ fn provision(path: &Path) -> FileAuthority {
             admissions: vec![],
             completed: vec![],
         },
-    )
+    );
+    authority.consume_target(binding().target).unwrap();
+    authority
 }
 fn request(node_id: u64, generation: u64, nonce: u8) -> StartupRequest {
     StartupRequest {
@@ -70,6 +72,17 @@ fn terminal(binding: &StartupBinding) -> StartupTerminalProof {
         native_record: OperationRecord {
             specification: binding.specification.clone(),
             executor_epoch: 2,
+            terminal: Some(multiraft_core::TerminalProof {
+                configuration: membership(8, &[2, 3, 4]),
+                barrier: log_id::<multiraft_core::TypeConfig>(1, 1, 9),
+                target_open: multiraft_core::TargetOpenReceipt {
+                    operation: binding.specification.operation,
+                    target_node: 4,
+                    generation: 40,
+                    applied: log_id::<multiraft_core::TypeConfig>(1, 1, 8),
+                    receipt: binding.target.consumption_id.clone(),
+                },
+            }),
         },
         committed_membership: membership(8, &[2, 3, 4]),
         applied_membership: membership(8, &[2, 3, 4]),
@@ -212,9 +225,17 @@ async fn effective_only_or_wrong_operation_or_unconsumed_generation_cannot_final
     wrong_operation.native_record.specification.operation.nonce = [8; 16];
     let mut wrong_target = proof.clone();
     wrong_target.target_opened.generation = 41;
+    let mut no_native_terminal = proof.clone();
+    no_native_terminal.native_record.terminal = None;
     let mut wrong_log = proof;
     wrong_log.applied_log = log_id::<multiraft_core::TypeConfig>(2, 2, 8);
-    for invalid in [unapplied, wrong_operation, wrong_target, wrong_log] {
+    for invalid in [
+        unapplied,
+        wrong_operation,
+        wrong_target,
+        wrong_log,
+        no_native_terminal,
+    ] {
         assert_eq!(
             authority.terminal_handoff(invalid).await.unwrap(),
             StartupAuthorityResult::Rejected(StartupAuthorityRejection::InvalidProof)
@@ -257,4 +278,23 @@ fn independent_handles_linearize_source_start_against_binding() {
             other => panic!("unexpected raced outcome {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn caller_claimed_target_consumption_is_not_a_durable_receipt() {
+    let directory = directory();
+    let path = directory.path().join("catalog.json");
+    let authority = provision(&path);
+    let mut forged = binding();
+    forged.target.consumption_id = b"not-in-durable-registry".to_vec();
+    assert_eq!(
+        authority.bind_active(forged).await.unwrap(),
+        StartupAuthorityResult::Rejected(StartupAuthorityRejection::IdentityConflict)
+    );
+    assert!(FileAuthority::open(&path)
+        .read(7)
+        .await
+        .unwrap()
+        .active_operation
+        .is_none());
 }

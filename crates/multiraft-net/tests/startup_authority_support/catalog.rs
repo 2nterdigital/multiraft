@@ -18,6 +18,7 @@ struct Denial {
 struct State {
     catalog: StartupCatalog,
     denials: Vec<Denial>,
+    consumed_targets: Vec<StartupTargetGeneration>,
 }
 
 pub struct FileAuthority {
@@ -39,6 +40,7 @@ impl FileAuthority {
             .save(&State {
                 catalog,
                 denials: vec![],
+                consumed_targets: vec![],
             })
             .unwrap();
         adapter
@@ -48,6 +50,30 @@ impl FileAuthority {
             path: path.to_owned(),
             lose_handoff_reply: AtomicBool::new(false),
         }
+    }
+    /// Fixture registry setup: durably consume an immutable target generation before binding.
+    pub fn consume_target(
+        &self,
+        target: StartupTargetGeneration,
+    ) -> Result<(), StartupAuthorityError> {
+        let _lock = self.lock()?;
+        let mut state = self.load()?;
+        if target.consumption_id.is_empty() {
+            return Err(error("empty consumption identity"));
+        }
+        if let Some(existing) = state
+            .consumed_targets
+            .iter()
+            .find(|entry| entry.node_id == target.node_id && entry.generation == target.generation)
+        {
+            return if existing == &target {
+                Ok(())
+            } else {
+                Err(error("consumption identity conflict"))
+            };
+        }
+        state.consumed_targets.push(target);
+        self.save(&state)
     }
     pub fn lose_next_handoff_reply(&self) {
         self.lose_handoff_reply.store(true, Ordering::SeqCst);
@@ -201,6 +227,7 @@ impl StartupAuthority for FileAuthority {
                     || !target.contains(&binding.target.node_id)
                     || old[0].intersection(target).count() != 2
                     || binding.target.generation != binding.specification.target_generation
+                    || !state.consumed_targets.contains(&binding.target)
                     || binding.target.consumption_id.is_empty()
                     || !catalog.authorized.contains_key(&binding.source)
                 {
@@ -237,6 +264,24 @@ impl StartupAuthority for FileAuthority {
                 let Some(binding) = &catalog.active_operation else {
                     return rejected(StartupAuthorityRejection::InvalidProof);
                 };
+                let Some(native) = &proof.native_record.terminal else {
+                    return rejected(StartupAuthorityRejection::InvalidProof);
+                };
+                let receipt = &native.target_open;
+                if native.configuration != proof.committed_membership
+                    || !covers_log(&proof.applied_log, &native.barrier)
+                    || receipt.operation != binding.specification.operation
+                    || receipt.target_node != binding.target.node_id
+                    || receipt.generation != binding.target.generation
+                    || receipt.receipt != binding.target.consumption_id
+                    || !native
+                        .configuration
+                        .log_id()
+                        .as_ref()
+                        .is_some_and(|id| covers_log(&receipt.applied, id))
+                {
+                    return rejected(StartupAuthorityRejection::InvalidProof);
+                }
                 let membership = &proof.committed_membership;
                 let configs = membership.membership().get_joint_config();
                 let valid_log = membership.log_id().as_ref().is_some_and(|id| {
@@ -282,4 +327,8 @@ impl StartupAuthority for FileAuthority {
             Ok(state.catalog)
         })
     }
+}
+
+fn covers_log(actual: &multiraft_core::typ::LogId, required: &multiraft_core::typ::LogId) -> bool {
+    actual.index() >= required.index() && (actual.index() != required.index() || actual == required)
 }
