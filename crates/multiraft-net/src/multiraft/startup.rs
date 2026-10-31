@@ -58,6 +58,11 @@ impl<S: StateMachine> MultiRaft<S> {
         members: &[NodeId],
         input_digest: Option<[u8; 32]>,
     ) -> Result<InitializeDisposition, MultiRaftError> {
+        if self.is_controlled_group(group)? {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "controlled group rejects legacy initialization"
+            )));
+        }
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;

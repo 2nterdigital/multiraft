@@ -21,11 +21,14 @@ impl Default for GroupOwner {
     }
 }
 impl GroupOwner {
-    pub(in crate::multiraft) fn close(&self) {
+    pub(in crate::multiraft) fn retire(&self) {
         self.stopped.send_replace(true);
-        self.commands.close();
         self.watchers.close();
         self.maintenance.close();
+    }
+    pub(in crate::multiraft) fn close(&self) {
+        self.retire();
+        self.commands.close();
     }
     pub(in crate::multiraft) fn stopping(&self) -> tokio::sync::watch::Receiver<bool> {
         self.stopped.subscribe()
@@ -64,13 +67,40 @@ impl<S: StateMachine> MultiRaft<S> {
         F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, ControlledError>> + Send + 'static,
     {
+        self.controlled_run_inner(group, deadline, false, operation)
+            .await
+    }
+    pub(super) async fn controlled_cleanup_run<T: Send + 'static, F, Fut>(
+        self: &Arc<Self>,
+        group: GroupId,
+        deadline: tokio::time::Instant,
+        operation: F,
+    ) -> Result<T, ControlledError>
+    where
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, ControlledError>> + Send + 'static,
+    {
+        self.controlled_run_inner(group, deadline, true, operation)
+            .await
+    }
+    async fn controlled_run_inner<T: Send + 'static, F, Fut>(
+        self: &Arc<Self>,
+        group: GroupId,
+        deadline: tokio::time::Instant,
+        cleanup: bool,
+        operation: F,
+    ) -> Result<T, ControlledError>
+    where
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, ControlledError>> + Send + 'static,
+    {
         let owner = self.group_owner(group);
         let guard = tokio::time::timeout_at(deadline, owner.serial.clone().lock_owned())
             .await
             .map_err(|_| ControlledError::Deadline {
                 outcome_unknown: false,
             })?;
-        if *owner.stopping().borrow()
+        if (!cleanup && *owner.stopping().borrow())
             || self
                 .snapshot_rt
                 .stopping
@@ -103,6 +133,20 @@ impl<S: StateMachine> MultiRaft<S> {
             .get(&group)
             .ok_or(ControlledError::Rejected("local core is not running"))?;
         Ok((app.raft.clone(), app.state_machine.clone()))
+    }
+    pub(in crate::multiraft) fn is_controlled_group(
+        &self,
+        group: GroupId,
+    ) -> Result<bool, MultiRaftError> {
+        let db = self
+            .rocks_log_db
+            .lock()
+            .expect("Raft log owner lock poisoned")
+            .clone();
+        db.map(|db| db.lifecycle_receipt(group))
+            .transpose()
+            .map(|receipt| receipt.flatten().is_some())
+            .map_err(|error| MultiRaftError::Other(error.into()))
     }
     pub(in crate::multiraft) fn controlled_db(
         &self,

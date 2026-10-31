@@ -4,6 +4,7 @@ use crate::controlled_startup::{StartupAdmission, StartupAuthority, StartupAutho
 use multiraft_core::{NativeLedger, OperationId, ReplacementSpec, TerminalProof};
 use std::sync::Weak;
 
+mod bootstrap;
 mod cleanup;
 mod open;
 mod owner;
@@ -37,6 +38,7 @@ pub struct ControlledGroup<S: StateMachine> {
     generation: u64,
     identity: Vec<u8>,
     authority: Arc<dyn StartupAuthority>,
+    target_specification: Option<ReplacementSpec>,
 }
 impl<S: StateMachine> Clone for ControlledGroup<S> {
     fn clone(&self) -> Self {
@@ -46,6 +48,7 @@ impl<S: StateMachine> Clone for ControlledGroup<S> {
             generation: self.generation,
             identity: self.identity.clone(),
             authority: self.authority.clone(),
+            target_specification: self.target_specification.clone(),
         }
     }
 }
@@ -125,6 +128,7 @@ impl<S: StateMachine> ControlledGroup<S> {
             generation: request.generation,
             identity: request.identity.clone(),
             authority,
+            target_specification: None,
         }
     }
     /// Observe the durable generation receipt without establishing consensus authority.
@@ -172,8 +176,10 @@ impl<S: StateMachine> ControlledGroup<S> {
         deadline: tokio::time::Instant,
     ) -> Result<NativeLedger, ControlledError> {
         let group = self.group;
+        let this = self.clone();
         self.node()?
             .controlled_run(group, deadline, move |node| async move {
+                this.checked_active()?;
                 let (raft, sm) = node.controlled_parts(group)?;
                 raft.ensure_linearizable(ReadPolicy::ReadIndex)
                     .await
@@ -188,8 +194,10 @@ impl<S: StateMachine> ControlledGroup<S> {
         deadline: tokio::time::Instant,
     ) -> Result<multiraft_core::typ::StoredMembership, ControlledError> {
         let group = self.group;
+        let this = self.clone();
         self.node()?
             .controlled_run(group, deadline, move |node| async move {
+                this.checked_active()?;
                 let (raft, _) = node.controlled_parts(group)?;
                 raft.ensure_linearizable(ReadPolicy::ReadIndex)
                     .await

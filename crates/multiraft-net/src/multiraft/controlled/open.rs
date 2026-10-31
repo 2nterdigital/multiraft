@@ -14,6 +14,28 @@ impl<S: StateMachine> MultiRaft<S> {
         authority: Arc<dyn StartupAuthority>,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledGroup<S>, ControlledError> {
+        self.controlled_require_storage()?;
+        let starting = specification.expected_start.membership();
+        let old: BTreeSet<_> = starting.voter_ids().collect();
+        let target: Vec<_> = specification
+            .target_voters
+            .difference(&old)
+            .copied()
+            .collect();
+        if identity.is_empty()
+            || specification.operation.sequence == 0
+            || specification.target_generation == 0
+            || target != [self.node_id]
+            || old.len() != 3
+            || specification.target_voters.len() != 3
+            || old.difference(&specification.target_voters).count() != 1
+            || starting.get_joint_config().len() != 1
+            || starting.learner_ids().next().is_some()
+        {
+            return Err(ControlledError::Rejected(
+                "invalid target replacement reservation",
+            ));
+        }
         use sha2::Digest;
         let specification_bytes = serde_json::to_vec(&specification)
             .map_err(|error| ControlledError::Native(error.to_string()))?;
@@ -25,20 +47,21 @@ impl<S: StateMachine> MultiRaft<S> {
         let identity = digest.finalize().to_vec();
         // Cleaned is a durable barrier: the old owner can perform no later mutation.
         self.ensure_node_log().await?;
-        if let Some(old) = self.controlled_db()?.lifecycle_receipt(group)? {
-            if old.stage == ControlledGroupStage::Cleaned
-                && old.generation.checked_add(1) == Some(specification.target_generation)
-            {
-                self.controlled_db()?.begin_rejoin(
-                    group,
-                    old.generation,
-                    specification.target_generation,
-                    &identity,
-                )?;
-                self.group_owners
-                    .lock()
-                    .expect("group owner lock poisoned")
-                    .insert(group, Arc::new(GroupOwner::default()));
+        {
+            let mut owners = self.group_owners.lock().expect("group owner lock poisoned");
+            let db = self.controlled_db()?;
+            if let Some(old) = db.lifecycle_receipt(group)? {
+                if old.stage == ControlledGroupStage::Cleaned
+                    && old.generation.checked_add(1) == Some(specification.target_generation)
+                {
+                    db.begin_rejoin(
+                        group,
+                        old.generation,
+                        specification.target_generation,
+                        &identity,
+                    )?;
+                    owners.insert(group, Arc::new(GroupOwner::default()));
+                }
             }
         }
         self.controlled_run(group, deadline, move |node| async move {
@@ -64,7 +87,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 specification.target_generation,
                 &identity,
             )?;
-            Ok(ControlledGroup::handle(
+            let mut handle = ControlledGroup::handle(
                 &node,
                 &ControlledOpen {
                     group_id: group,
@@ -75,7 +98,9 @@ impl<S: StateMachine> MultiRaft<S> {
                     },
                 },
                 authority,
-            ))
+            );
+            handle.target_specification = Some(specification);
+            Ok(handle)
         })
         .await
     }
@@ -109,6 +134,19 @@ impl<S: StateMachine> MultiRaft<S> {
         admission: StartupAdmission,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledGroup<S>, ControlledError> {
+        self.controlled_require_storage()?;
+        self.ensure_node_log().await?;
+        let replay = tokio::time::timeout_at(
+            deadline,
+            self.controlled_open_replay(&request, &authority, &admission),
+        )
+        .await
+        .map_err(|_| ControlledError::Deadline {
+            outcome_unknown: false,
+        })??;
+        if let Some(handle) = replay {
+            return Ok(handle);
+        }
         self.controlled_run(request.group_id, deadline, move |node| async move {
             node.controlled_require_storage()?;
             node.ensure_node_log().await?;
@@ -137,32 +175,63 @@ impl<S: StateMachine> MultiRaft<S> {
             }
             match &request.mode {
                 ControlledOpenMode::BootstrapNew { voters } => {
-                    if old.is_some() {
-                        return Ok(ControlledGroup::handle(&node, &request, authority));
+                    if let Some(existing) = &old {
+                        bootstrap::verify(&node, &request, voters)?;
+                        if !matches!(
+                            existing.stage,
+                            ControlledGroupStage::Reserved | ControlledGroupStage::Opening
+                        ) {
+                            return Ok(ControlledGroup::handle(&node, &request, authority));
+                        }
                     }
-                    if voters.len() != 3
-                        || !voters.contains(&node.node_id)
-                        || *voters != catalog.membership.membership().voter_ids().collect()
-                        || node.log_provenance(request.group_id)? != StartupProvenance::Pristine
-                        || multiraft_store::DiskFsmDb::group_path(
-                            &node.config.data_dir,
-                            request.group_id,
-                        )
-                        .exists()
-                        || node
-                            .config
-                            .data_dir
-                            .join("snapshots")
-                            .join(request.group_id.to_string())
+                    if old.is_none()
+                        && (voters.len() != 3
+                            || !voters.contains(&node.node_id)
+                            || *voters != catalog.membership.membership().voter_ids().collect()
+                            || node.log_provenance(request.group_id)?
+                                != StartupProvenance::Pristine
+                            || multiraft_store::DiskFsmDb::group_path(
+                                &node.config.data_dir,
+                                request.group_id,
+                            )
                             .exists()
+                            || node
+                                .config
+                                .data_dir
+                                .join("snapshots")
+                                .join(request.group_id.to_string())
+                                .exists())
                     {
                         return Err(ControlledError::Rejected(
                             "bootstrap requires a pristine exact-three admitted group",
                         ));
                     }
+                    bootstrap::persist(&node, &request, voters).await?;
                     db.reserve_controlled(request.group_id, request.generation, &request.identity)?;
                 }
                 ControlledOpenMode::Target { operation } => {
+                    let receipt = old.as_ref().ok_or(ControlledError::Rejected(
+                        "target generation is not reserved",
+                    ))?;
+                    if receipt.stage != ControlledGroupStage::Reserved {
+                        let known = catalog.active_operation.as_ref().is_some_and(|binding| {
+                            binding.specification.operation == *operation
+                                && binding.target.node_id == node.node_id
+                                && binding.target.generation == request.generation
+                                && binding.target.consumption_id == request.identity
+                        }) || catalog.completed.iter().any(|completed| {
+                            completed.native_record.specification.operation == *operation
+                                && completed.target_opened.node_id == node.node_id
+                                && completed.target_opened.generation == request.generation
+                                && completed.target_opened.consumption_id == request.identity
+                        });
+                        if !known {
+                            return Err(ControlledError::Rejected(
+                                "target replay operation identity mismatch",
+                            ));
+                        }
+                        return Ok(ControlledGroup::handle(&node, &request, authority));
+                    }
                     let binding = catalog
                         .active_operation
                         .as_ref()
@@ -209,6 +278,16 @@ impl<S: StateMachine> MultiRaft<S> {
                 }
             }
             if node.raft(request.group_id).is_some() {
+                if let ControlledOpenMode::BootstrapNew { voters } = &request.mode {
+                    bootstrap::reconcile(&node, &request, voters).await?;
+                    db.advance_controlled(
+                        request.group_id,
+                        request.generation,
+                        &request.identity,
+                        ControlledGroupStage::Opening,
+                        ControlledGroupStage::Opened,
+                    )?;
+                }
                 return Ok(ControlledGroup::handle(&node, &request, authority));
             }
             let root = node.config.data_dir.clone();
@@ -232,16 +311,15 @@ impl<S: StateMachine> MultiRaft<S> {
                     ControlledGroupStage::Opening,
                 )?;
             }
-            node.controlled_opening
-                .lock()
-                .expect("controlled opening lock poisoned")
-                .insert(request.group_id);
-            let opened = node.spawn_local_group(request.group_id).await;
-            node.controlled_opening
-                .lock()
-                .expect("controlled opening lock poisoned")
-                .remove(&request.group_id);
+            let opened = node.spawn_controlled_local_group(request.group_id).await;
             opened?;
+            node.wait_for_owned_recovery(request.group_id, Duration::from_secs(30))
+                .await?;
+            node.validate_recovered(request.group_id).await?;
+            node.ensure_recovery_running(request.group_id)?;
+            if let ControlledOpenMode::BootstrapNew { voters } = &request.mode {
+                bootstrap::reconcile(&node, &request, voters).await?;
+            }
             // The receipt follows real native construction, never an RPC waiter.
             db.advance_controlled(
                 request.group_id,
@@ -250,17 +328,75 @@ impl<S: StateMachine> MultiRaft<S> {
                 ControlledGroupStage::Opening,
                 ControlledGroupStage::Opened,
             )?;
-            if let ControlledOpenMode::BootstrapNew { voters } = &request.mode {
-                node.try_initialize(
-                    request.group_id,
-                    &voters.iter().copied().collect::<Vec<_>>(),
-                )
-                .await?;
-            }
             Ok(ControlledGroup::handle(&node, &request, authority))
         })
         .await
     }
+    async fn controlled_open_replay(
+        self: &Arc<Self>,
+        request: &ControlledOpen,
+        authority: &Arc<dyn StartupAuthority>,
+        admission: &StartupAdmission,
+    ) -> Result<Option<ControlledGroup<S>>, ControlledError> {
+        let Some(receipt) = self.controlled_db()?.lifecycle_receipt(request.group_id)? else {
+            return Ok(None);
+        };
+        if receipt.generation != request.generation || receipt.identity != request.identity {
+            return Err(ControlledError::Rejected(
+                "local generation identity mismatch",
+            ));
+        }
+        let replay = match &request.mode {
+            ControlledOpenMode::Target { .. } => receipt.stage != ControlledGroupStage::Reserved,
+            ControlledOpenMode::BootstrapNew { voters }
+                if !matches!(
+                    receipt.stage,
+                    ControlledGroupStage::Reserved | ControlledGroupStage::Opening
+                ) =>
+            {
+                bootstrap::verify(self, request, voters)?;
+                true
+            }
+            _ => false,
+        };
+        if !replay {
+            return Ok(None);
+        }
+        let catalog = authority.read(request.group_id).await?;
+        if admission.request.group_id != request.group_id
+            || admission.request.node_id != self.node_id
+            || admission.request.generation != request.generation
+            || !catalog.admissions.contains(admission)
+        {
+            return Err(ControlledError::Rejected(
+                "startup replay admission identity mismatch",
+            ));
+        }
+        if let ControlledOpenMode::Target { operation } = &request.mode {
+            let known = catalog.active_operation.as_ref().is_some_and(|binding| {
+                binding.specification.operation == *operation
+                    && binding.target.node_id == self.node_id
+                    && binding.target.generation == request.generation
+                    && binding.target.consumption_id == request.identity
+            }) || catalog.completed.iter().any(|completed| {
+                completed.native_record.specification.operation == *operation
+                    && completed.target_opened.node_id == self.node_id
+                    && completed.target_opened.generation == request.generation
+                    && completed.target_opened.consumption_id == request.identity
+            });
+            if !known {
+                return Err(ControlledError::Rejected(
+                    "target replay operation identity mismatch",
+                ));
+            }
+        }
+        Ok(Some(ControlledGroup::handle(
+            self,
+            request,
+            authority.clone(),
+        )))
+    }
+
     fn controlled_require_storage(&self) -> Result<(), ControlledError> {
         if self.config.data_dir.as_os_str().is_empty()
             || self.config.log_storage_backend != LogStorageBackend::RocksDb

@@ -6,6 +6,29 @@ impl<S: StateMachine> MultiRaft<S> {
         &self,
         group: GroupId,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
+        self.spawn_local_group_authorized(group, false).await
+    }
+    pub(super) async fn spawn_controlled_local_group(
+        &self,
+        group: GroupId,
+    ) -> Result<tokio::time::Instant, MultiRaftError> {
+        self.spawn_local_group_authorized(group, true).await
+    }
+    async fn spawn_local_group_authorized(
+        &self,
+        group: GroupId,
+        controlled_admission: bool,
+    ) -> Result<tokio::time::Instant, MultiRaftError> {
+        let _construction = self.controlled_construction.read().await;
+        if self
+            .snapshot_rt
+            .stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "native node is stopping"
+            )));
+        }
         self.ensure_node_log().await?;
         let controlled = self
             .controlled_db()
@@ -15,15 +38,9 @@ impl<S: StateMachine> MultiRaft<S> {
             .map_err(|error| MultiRaftError::Other(error.into()))?
             .flatten()
             .is_some();
-        if controlled
-            && !self
-                .controlled_opening
-                .lock()
-                .expect("controlled opening lock poisoned")
-                .contains(&group)
-        {
+        if controlled != controlled_admission {
             return Err(MultiRaftError::Other(anyhow::anyhow!(
-                "controlled group requires durable startup admission"
+                "controlled group requires its private durable startup path"
             )));
         }
         let membership_policy = if controlled {
