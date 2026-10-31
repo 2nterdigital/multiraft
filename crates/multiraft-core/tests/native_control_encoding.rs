@@ -40,3 +40,26 @@ fn begin_carries_exact_starting_configuration_and_target_generation() {
     let decoded: Request = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(decoded.control, request.control);
 }
+
+#[test]
+fn binary_legacy_application_layout_is_unchanged_and_cannot_carry_control() {
+    let historical = [3, 0, 0, 0, 0, 0, 0, 0, 97, 98, 99];
+    assert_eq!(
+        bincode::serialize(&Request::new(b"abc")).unwrap(),
+        historical
+    );
+    let decoded: Request = bincode::deserialize(&historical).unwrap();
+    assert_eq!(decoded.data, b"abc");
+    assert!(decoded.control.is_none());
+    let control = Request::native_control(NativeControl::Claim {
+        operation: OperationId {
+            sequence: 1,
+            nonce: [1; 16],
+        },
+        executor_epoch: 1,
+    });
+    assert!(
+        bincode::serialize(&control).is_err(),
+        "legacy binary transport must fail closed"
+    );
+}
