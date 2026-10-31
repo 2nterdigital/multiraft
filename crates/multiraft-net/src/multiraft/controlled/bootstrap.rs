@@ -279,3 +279,128 @@ pub(super) async fn recover_anchor<S: StateMachine>(
     )?;
     Ok(())
 }
+
+/// Locally sealed durable original Genesis basis; decoding remote facts cannot construct this proof.
+#[derive(Debug, Clone)]
+pub struct ManagedGenesisBasis {
+    group: GroupId,
+    node: NodeId,
+    generation: u64,
+    identity: Vec<u8>,
+    domain: Option<[u8; 32]>,
+    configuration: multiraft_core::typ::StoredMembership,
+    applied: multiraft_core::typ::LogId,
+}
+impl ManagedGenesisBasis {
+    /// Original local Group identity verified against its durable anchor.
+    pub fn group_id(&self) -> GroupId {
+        self.group
+    }
+    /// Actual native node identity owning this durable basis.
+    pub fn node_id(&self) -> NodeId {
+        self.node
+    }
+    /// Actual original local replica generation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    /// Persistent scope identity supplied at original controlled bootstrap.
+    pub fn identity(&self) -> &[u8] {
+        &self.identity
+    }
+    /// Real configured transport domain; absence remains absence rather than a fabricated identity.
+    pub fn domain(&self) -> Option<[u8; 32]> {
+        self.domain
+    }
+    /// Full original native membership, including configuration log identity and node metadata.
+    pub fn configuration(&self) -> &multiraft_core::typ::StoredMembership {
+        &self.configuration
+    }
+    /// Actual durable FSM applied position verified against native local log and vote coverage.
+    pub fn applied(&self) -> multiraft_core::typ::LogId {
+        self.applied
+    }
+}
+impl<S: StateMachine> ControlledGroup<S> {
+    pub(crate) async fn genesis_basis(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<ManagedGenesisBasis, ControlledError> {
+        let this = self.clone();
+        self.node()?
+            .controlled_run(self.group, deadline, move |node| async move {
+                this.checked_active()?;
+                let request = ControlledOpen {
+                    group_id: this.group,
+                    generation: this.generation,
+                    identity: this.identity.clone(),
+                    mode: ControlledOpenMode::Recover,
+                };
+                recover_anchor(&node, &request).await?;
+                let anchor: BootstrapAnchor = serde_json::from_slice(&std::fs::read(anchor_path(
+                    &node.config.data_dir,
+                    this.group,
+                ))?)
+                .map_err(std::io::Error::other)?;
+                let voters: BTreeSet<_> = anchor.intent.members.keys().copied().collect();
+                let configuration = &anchor.configuration;
+                let configs = configuration.membership().get_joint_config();
+                if voters.len() != 3
+                    || !voters.contains(&node.node_id)
+                    || anchor.intent != intent(&node, &request, &voters)
+                    || configs.len() != 1
+                    || configs[0] != voters
+                    || configuration.membership().learner_ids().next().is_some()
+                    || configuration.membership().nodes().count() != 3
+                    || anchor.intent.members.iter().any(|(id, metadata)| {
+                        configuration.membership().get_node(id) != Some(metadata)
+                    })
+                {
+                    return Err(ControlledError::Rejected(
+                        "bootstrap anchor differs from full original native identity",
+                    ));
+                }
+                let (raft, sm) = node.controlled_parts(this.group)?;
+                let actual = sm.inspect_controlled_applied().await?;
+                if actual.membership != anchor.configuration {
+                    return Err(ControlledError::Rejected(
+                        "Genesis basis requires the exact original native configuration",
+                    ));
+                }
+                let exact = actual.membership.clone();
+                let native = raft
+                    .with_raft_state(move |state| {
+                        state.membership_state.committed().as_ref() == &exact
+                            && state.membership_state.effective().as_ref() == &exact
+                    })
+                    .await
+                    .map_err(|error| ControlledError::Native(error.to_string()))?;
+                if !native {
+                    return Err(ControlledError::Rejected(
+                        "Genesis native membership is not uniformly original",
+                    ));
+                }
+                let mut log = node.open_native_log(this.group)?;
+                sm.check_disk_log_basis(&mut log).await?;
+                let state = log.get_log_state().await?;
+                if state
+                    .last_log_id
+                    .is_none_or(|last| !super::seed::covers(last, actual.applied))
+                {
+                    return Err(ControlledError::Rejected(
+                        "Genesis native log does not cover durable applied basis",
+                    ));
+                }
+                Ok(ManagedGenesisBasis {
+                    group: this.group,
+                    node: node.node_id,
+                    generation: this.generation,
+                    identity: this.identity,
+                    domain: node.config.raft_transport_fingerprint,
+                    configuration: actual.membership,
+                    applied: actual.applied,
+                })
+            })
+            .await
+    }
+}

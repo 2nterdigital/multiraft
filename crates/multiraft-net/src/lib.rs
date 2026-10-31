@@ -88,7 +88,7 @@ pub use multiraft::{
 };
 pub use multiraft::{
     ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,
-    ControlledSeed, ControlledTerminal,
+    ControlledSeed, ControlledTerminal, ManagedGenesisBasis,
 };
 pub use multiraft::{LocalAuthoritativeMembership, LocalAuthorityError};
 pub use multiraft_core::ObservationClosed;
@@ -119,7 +119,8 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
 }
 
 pub use runtime::{
-    GroupConfig, NodeOwner, ProposalReceipt, RuntimeConfig, RuntimeError, RuntimeHandle,
+    GroupConfig, ManagedControlError, ManagedControlledGroup, ManagedOperation,
+    ManagedTargetEndpoint, NodeOwner, ProposalReceipt, RuntimeConfig, RuntimeError, RuntimeHandle,
     RuntimePhase, RuntimeTransport,
 };
 
