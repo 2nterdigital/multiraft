@@ -406,3 +406,261 @@ async fn rf3_existing_group_recovers_from_local_native_history_without_live_peer
     );
     owner.shutdown(deadline()).await.unwrap();
 }
+
+/// Disk authority is opened by the factory; its snapshot is a native checkpoint,
+/// not a whole-image entry in SnapshotCatalog.
+struct InstalledDisk(multiraft_store::DiskFsmDb);
+impl InstalledDisk {
+    fn open(root: &Path) -> Self {
+        Self(
+            multiraft_store::DiskFsmDb::open(
+                multiraft_store::DiskFsmDb::group_path(root, 7),
+                7,
+                multiraft_store::DiskFsmOptions::new(b"strict-disk-v1".to_vec()),
+            )
+            .unwrap(),
+        )
+    }
+    fn value(&self) -> u64 {
+        self.0
+            .db()
+            .get_cf(self.0.cf("default").unwrap(), b"value")
+            .unwrap()
+            .map_or(0, |bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
+    }
+}
+impl multiraft_fsm::StateMachine for InstalledDisk {
+    type Error = std::io::Error;
+    fn apply(&mut self, _: u64, _: u64, _: &[u8]) -> Result<multiraft_fsm::ApplyOut, Self::Error> {
+        Err(std::io::Error::other("whole-image apply in disk mode"))
+    }
+    fn snapshot(&self, _: u64) -> Result<Vec<u8>, Self::Error> {
+        Err(std::io::Error::other("whole-image snapshot in disk mode"))
+    }
+    fn restore(&mut self, _: u64, _: &[u8]) -> Result<(), Self::Error> {
+        Err(std::io::Error::other("whole-image restore in disk mode"))
+    }
+    fn disk_state(&mut self) -> Option<&mut dyn multiraft_fsm::DiskState> {
+        Some(self)
+    }
+}
+impl multiraft_fsm::DiskState for InstalledDisk {
+    fn durable_applied(&self) -> std::io::Result<Option<Vec<u8>>> {
+        self.0.applied_record()
+    }
+    fn apply_durable(
+        &mut self,
+        _: u64,
+        _: u64,
+        data: Option<&[u8]>,
+        applied: &multiraft_fsm::AppliedState,
+    ) -> std::io::Result<multiraft_fsm::ApplyOut> {
+        let mut batch = multiraft_store::rocksdb::WriteBatch::default();
+        if let Some(data) = data {
+            batch.put_cf(self.0.cf("default")?, b"value", data);
+        }
+        self.0.commit(batch, applied)?;
+        Ok(multiraft_fsm::ApplyOut::default())
+    }
+    fn snapshot_workspace(&self) -> std::io::Result<std::path::PathBuf> {
+        self.0.snapshot_workspace()
+    }
+    fn checkpoint(&self, dir: &Path) -> std::io::Result<()> {
+        self.0.checkpoint(dir)
+    }
+    fn inspect_checkpoint(&self, dir: &Path) -> std::io::Result<Option<Vec<u8>>> {
+        self.0.inspect_checkpoint(dir)
+    }
+    fn install_checkpoint(&mut self, dir: &Path) -> std::io::Result<()> {
+        self.0.install_checkpoint(dir)
+    }
+}
+fn disk_store(root: &Path) -> multiraft_store::StateMachineStore<InstalledDisk> {
+    multiraft_store::StateMachineStore::with_native_options(
+        7,
+        InstalledDisk::open(root),
+        multiraft_store::NativeSmOptions {
+            catalog: Arc::new(multiraft_store::SnapshotCatalog::new(
+                root.join("snapshots"),
+                1,
+            )),
+            max_snapshot_bytes: 1024 * 1024,
+            build_budget: Arc::new(tokio::sync::Semaphore::new(1)),
+        },
+    )
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn installed_native_disk_checkpoint_recovers_without_a_saved_committed_record() {
+    use multiraft_core::{typ, Request, TypeConfig};
+    use openraft::vote::RaftLeaderIdExt;
+    use openraft::{
+        storage::{RaftLogStorage, RaftStateMachine},
+        RaftSnapshotBuilder,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    let source_root = scratch();
+    let mut source = disk_store(source_root.path());
+    let entries = vec![
+        typ::Entry {
+            log_id: typ::LogId::new(
+                openraft::alias::LeaderIdOf::<TypeConfig>::new_committed(1, 1),
+                0,
+            ),
+            payload: openraft::EntryPayload::Membership(
+                openraft::Membership::new(
+                    vec![BTreeSet::from([1, 2, 3])],
+                    BTreeMap::from([
+                        (1, openraft::BasicNode::default()),
+                        (2, openraft::BasicNode::default()),
+                        (3, openraft::BasicNode::default()),
+                    ]),
+                )
+                .unwrap(),
+            ),
+        },
+        typ::Entry {
+            log_id: typ::LogId::new(
+                openraft::alias::LeaderIdOf::<TypeConfig>::new_committed(1, 1),
+                1,
+            ),
+            payload: openraft::EntryPayload::Normal(Request::new(15_u64.to_be_bytes().to_vec())),
+        },
+    ];
+    source
+        .apply(futures::stream::iter(
+            entries.into_iter().map(|entry| Ok((entry, None))),
+        ))
+        .await
+        .unwrap();
+    let snapshot = source
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .unwrap();
+    let root = scratch();
+    let mut receiver = disk_store(root.path());
+    let manifest = snapshot.snapshot.into_inner();
+    let mut chunks =
+        multiraft_store::disk_snapshot::ChunkSource::open(manifest.clone(), 7).unwrap();
+    while let Some(chunk) = chunks.next_chunk().unwrap() {
+        receiver.receive_disk_chunk(chunk).await.unwrap();
+    }
+    receiver
+        .verify_disk_snapshot(&snapshot.meta, &manifest)
+        .await
+        .unwrap();
+    receiver
+        .install_snapshot(&snapshot.meta, std::io::Cursor::new(manifest))
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver.applied_state().await.unwrap().0,
+        snapshot.meta.last_log_id
+    );
+    drop(receiver);
+    drop(source);
+    // Match native install_full_snapshot: persist the vote and purge boundary,
+    // while SaveCommitted has not been dispatched for the installed snapshot.
+    {
+        let db = multiraft_store::RocksLogDb::<TypeConfig>::open(root.path().join("raft-rocksdb"))
+            .unwrap();
+        let mut log = db.group(7).unwrap();
+        log.save_vote(&typ::Vote::new_committed(1, 1))
+            .await
+            .unwrap();
+        log.purge(snapshot.meta.last_log_id.unwrap()).await.unwrap();
+        assert_eq!(log.read_committed().await.unwrap(), None);
+        assert_eq!(
+            log.get_log_state().await.unwrap().last_purged_log_id,
+            snapshot.meta.last_log_id
+        );
+    }
+    assert!(
+        multiraft_store::SnapshotCatalog::new(root.path().join("snapshots"), 1)
+            .describe_native(7, 1024 * 1024)
+            .unwrap()
+            .is_none()
+    );
+    let factory_root = root.path().to_owned();
+    let owner = NodeOwner::start(
+        config(root.path()),
+        move |_| Ok(InstalledDisk::open(&factory_root)),
+        deadline(),
+    )
+    .await
+    .unwrap();
+    let handle = owner.handle();
+    handle
+        .recover_existing_group(
+            GroupConfig {
+                group_id: 7,
+                voters: vec![99],
+            },
+            deadline(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        handle
+            .try_read_applied(7, deadline(), |fsm| Ok::<_, std::convert::Infallible>(
+                fsm.value()
+            ))
+            .await
+            .unwrap(),
+        15
+    );
+    owner.shutdown(deadline()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn purge_boundary_without_committed_record_or_disk_basis_still_rejects() {
+    use multiraft_core::{typ, TypeConfig};
+    use openraft::storage::RaftLogStorage;
+    use openraft::vote::RaftLeaderIdExt;
+    let root = scratch();
+    let boundary = typ::LogId::new(
+        openraft::alias::LeaderIdOf::<TypeConfig>::new_committed(1, 1),
+        1,
+    );
+    {
+        let db = multiraft_store::RocksLogDb::<TypeConfig>::open(root.path().join("raft-rocksdb"))
+            .unwrap();
+        let mut log = db.group(7).unwrap();
+        log.save_vote(&typ::Vote::new_committed(1, 1))
+            .await
+            .unwrap();
+        log.purge(boundary).await.unwrap();
+        assert_eq!(log.read_committed().await.unwrap(), None);
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory_calls = calls.clone();
+    let owner = NodeOwner::start(
+        config(root.path()),
+        move |_| {
+            factory_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CounterFsm::default())
+        },
+        deadline(),
+    )
+    .await
+    .unwrap();
+    let handle = owner.handle();
+    assert!(handle
+        .recover_existing_group(group(7), deadline())
+        .await
+        .is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(handle.local_group_status(7, deadline()).await.is_err());
+    let db =
+        multiraft_store::RocksLogDb::<TypeConfig>::open(root.path().join("raft-rocksdb")).unwrap();
+    let mut log = db.group(7).unwrap();
+    assert_eq!(
+        log.get_log_state().await.unwrap().last_purged_log_id,
+        Some(boundary)
+    );
+    assert_eq!(log.read_committed().await.unwrap(), None);
+    drop(owner);
+}

@@ -152,8 +152,11 @@ impl<S: StateMachine> MultiRaft<S> {
         });
         // A saved vote alone is not an initialized Group, even though provenance
         // correctly records that it must never be overwritten as pristine.
+        // Native snapshot installation may persist a purge boundary and disk
+        // checkpoint without SaveCommitted. Only the post-factory gate can read
+        // that application-owned basis; a purge marker alone never passes it.
         anyhow::ensure!(
-            committed.is_some() || snapshot_membership,
+            committed.is_some() || snapshot_membership || state.last_purged_log_id.is_some(),
             "strict recovery requires committed native membership or checkpoint"
         );
         let vote = log
