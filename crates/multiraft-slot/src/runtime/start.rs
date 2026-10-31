@@ -49,6 +49,8 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
     /// Candidate startup owns both listeners, creates no Groups and refuses business calls.
     /// Genesis is a one-time empty-directory operation. Existing source identities can only
     /// recover; interrupted genesis and old manifest formats require explicit operator recovery.
+    /// Genesis completion requires every local Group's committed genesis membership to be
+    /// applied locally within the original startup budget.
     /// The caller must authenticate the directory and authorize the data-space creation fact.
     ///
     /// # Errors
@@ -211,6 +213,18 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
                 }
             }
         };
+        if strict
+            .as_ref()
+            .is_some_and(|s| s.disposition == SlotStartupDisposition::Genesis)
+        {
+            if let Err(error) =
+                super::genesis::wait_for_basis(&native_owner.handle(), &layout, &startup, deadline)
+                    .await
+            {
+                let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(error);
+            }
+        }
         let shared = Arc::new(Shared {
             native: native_owner.handle(),
             budget: Budget::new(config.limits, layout.slot_count()),

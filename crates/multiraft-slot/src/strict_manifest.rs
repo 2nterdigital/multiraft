@@ -146,7 +146,7 @@ pub(crate) fn prepare(
     io(io(File::open(dir))?.sync_all())
 }
 
-/// Complete only after native genesis startup and both listener owners are assembled.
+/// Complete only after the local committed genesis basis and both listener owners are ready.
 pub(crate) fn complete(
     dir: &Path,
     layout: &ClusterLayout,

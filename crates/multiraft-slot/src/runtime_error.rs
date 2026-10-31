@@ -46,9 +46,9 @@ pub enum RuntimeError {
     Maintenance(MaintenanceFailure),
     #[error("slot task panicked; runtime fenced")]
     TaskPanicked,
-    /// Native preference startup failed and the partially started node was
-    /// released. Local-only: `SlotNodeOwner::start` returns it; it is never
-    /// produced by an application RPC. `cause` is the bounded native failure
+    /// Local native startup or strict Genesis basis validation failed and the
+    /// partially started node was released. Local-only: Slot owner startup returns
+    /// it; application RPC never produces it. `cause` is the bounded native failure
     /// text including its source chain.
     #[error("slot startup failed: slot={slot:?} phase={phase} outcome_unknown={outcome_unknown}: {cause}")]
     StartupFailed {

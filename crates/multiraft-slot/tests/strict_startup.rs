@@ -552,3 +552,119 @@ async fn source_restart_restores_a_durable_native_snapshot_without_bootstrap() {
     assert!(owner.shutdown(deadline()).await.complete);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn successful_rf3_genesis_is_immediately_recoverable_for_every_owned_slot() {
+    let layout = layout();
+    let dirs: Vec<_> = (0..3).map(|_| directory()).collect();
+    let make_startup = |node| StrictSlotStartup {
+        disposition: SlotStartupDisposition::Genesis,
+        identity: SlotLocalIdentity {
+            data_space_id: 77,
+            data_dir_uuid: [node as u8; 16],
+            protocol_version: SLOT_PROTOCOL_VERSION,
+            compatibility_digest: [9; 32],
+        },
+        directory: TrustedSlotDirectory {
+            version: 1,
+            data_space_id: 77,
+            genesis_digest: layout.digest(),
+            nodes: layout.nodes().to_vec(),
+        },
+    };
+    let start = |node: u64, dir: PathBuf, plan: StrictSlotStartup| {
+        let mut config = SlotNodeConfig::new(layout.clone(), node, dir);
+        config.native.heartbeat_interval_ms = 30;
+        config.native.election_timeout_min_ms = 120;
+        config.native.election_timeout_max_ms = 240;
+        config.startup.bootstrap_grace = Duration::from_millis(100);
+        SlotNodeOwner::start_strict(config, plan, |_| Ok(DurableCounter::default()), deadline())
+    };
+    let (a, b, c) = tokio::join!(
+        start(1, dirs[0].clone(), make_startup(1)),
+        start(2, dirs[1].clone(), make_startup(2)),
+        start(3, dirs[2].clone(), make_startup(3))
+    );
+    let (a, b, c) = (a.unwrap(), b.unwrap(), c.unwrap());
+    assert!(a.shutdown(deadline()).await.complete);
+    // Once node 1 is closed, peer shutdown cannot repair its local recovery evidence.
+    assert!(b.shutdown(deadline()).await.complete);
+    assert!(c.shutdown(deadline()).await.complete);
+    let mut recover = make_startup(1);
+    recover.disposition = SlotStartupDisposition::RecoverExisting;
+    let restarted = start(1, dirs[0].clone(), recover).await;
+    assert!(
+        restarted.is_ok(),
+        "successful genesis must permit immediate local recovery without peers: {:?}",
+        restarted.as_ref().err()
+    );
+    let restarted = restarted.unwrap();
+    for group in &restarted.startup_report().groups {
+        assert_eq!(group.initialization, InitializeDisposition::NotDispatched);
+        assert_eq!(group.provenance, Some(StartupProvenance::Persisted));
+    }
+    for slot in 0..12 {
+        let applied = restarted
+            .handle()
+            .read_applied(SlotId(slot), &[], deadline())
+            .await
+            .unwrap();
+        assert!(
+            applied.applied.is_some(),
+            "slot{slot} must retain its actual native applied membership"
+        );
+        assert_eq!(applied.value, 0_u64.to_be_bytes());
+    }
+    assert!(restarted.shutdown(deadline()).await.complete);
+    for dir in dirs {
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn genesis_cannot_seal_complete_before_local_memberships_are_committed_and_applied() {
+    let layout = layout();
+    let dir = directory();
+    let plan = StrictSlotStartup {
+        disposition: SlotStartupDisposition::Genesis,
+        identity: SlotLocalIdentity {
+            data_space_id: 77,
+            data_dir_uuid: [1; 16],
+            protocol_version: SLOT_PROTOCOL_VERSION,
+            compatibility_digest: [9; 32],
+        },
+        directory: TrustedSlotDirectory {
+            version: 1,
+            data_space_id: 77,
+            genesis_digest: layout.digest(),
+            nodes: layout.nodes().to_vec(),
+        },
+    };
+    let mut config = SlotNodeConfig::new(layout, 1, &dir);
+    config.startup.bootstrap_grace = Duration::from_millis(100);
+    let result = SlotNodeOwner::start_strict(
+        config,
+        plan,
+        |_| Ok(DurableCounter::default()),
+        Instant::now() + Duration::from_millis(600),
+    )
+    .await;
+    assert!(
+        matches!(&result,Err(RuntimeError::StartupFailed {phase,..}) if phase=="genesis_basis"),
+        "unproven Genesis must fail at its local basis barrier: {:?}",
+        result.as_ref().err()
+    );
+    let accepted = result.is_ok();
+    if let Ok(owner) = result {
+        assert!(owner.shutdown(deadline()).await.complete);
+    }
+    assert!(
+        !accepted,
+        "RF3 without quorum must not report successful durable Genesis completion"
+    );
+    assert!(
+        !dir.join(".strict-slot.genesis-complete").exists(),
+        "incomplete genesis must remain explicitly pending"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
