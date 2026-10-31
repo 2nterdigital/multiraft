@@ -133,6 +133,68 @@ async fn completion_requires_exact_applied_uniform_and_survives_checkpoint_witho
     apply(
         &mut store,
         7,
+        EntryPayload::Normal(Request::native_control(match complete.clone() {
+            NativeControl::Complete {
+                operation,
+                executor_epoch,
+                mut target_open,
+            } => {
+                target_open.applied = LogId::new(LeaderIdOf::<TypeConfig>::new_committed(2, 1), 5);
+                NativeControl::Complete {
+                    operation,
+                    executor_epoch,
+                    target_open,
+                }
+            }
+            _ => unreachable!(),
+        })),
+    )
+    .await;
+    assert!(
+        store
+            .controlled_ledger()
+            .await
+            .unwrap()
+            .current
+            .unwrap()
+            .terminal
+            .is_none(),
+        "a newer term cannot hide a target behind the final configuration index"
+    );
+    apply(
+        &mut store,
+        8,
+        EntryPayload::Normal(Request::native_control(match complete.clone() {
+            NativeControl::Complete {
+                operation,
+                executor_epoch,
+                mut target_open,
+            } => {
+                target_open.applied = LogId::new(LeaderIdOf::<TypeConfig>::new_committed(2, 1), 7);
+                NativeControl::Complete {
+                    operation,
+                    executor_epoch,
+                    target_open,
+                }
+            }
+            _ => unreachable!(),
+        })),
+    )
+    .await;
+    assert!(
+        store
+            .controlled_ledger()
+            .await
+            .unwrap()
+            .current
+            .unwrap()
+            .terminal
+            .is_none(),
+        "target application cannot come from a term after the Complete barrier"
+    );
+    apply(
+        &mut store,
+        9,
         EntryPayload::Normal(Request::native_control(complete)),
     )
     .await;
@@ -148,7 +210,7 @@ async fn completion_requires_exact_applied_uniform_and_survives_checkpoint_witho
         proof.configuration,
         StoredMembership::new(Some(id(6)), final_membership)
     );
-    assert_eq!(proof.barrier, id(7));
+    assert_eq!(proof.barrier, id(9));
     let checkpoint = root.path().join("checkpoint");
     store
         .try_with_fsm(|disk| disk.db.checkpoint(&checkpoint))
@@ -159,7 +221,7 @@ async fn completion_requires_exact_applied_uniform_and_survives_checkpoint_witho
     let mut restored = open(&checkpoint);
     apply(
         &mut restored,
-        8,
+        10,
         EntryPayload::Normal(Request::native_control(NativeControl::Claim {
             operation: specification.operation,
             executor_epoch: 99,
@@ -185,7 +247,7 @@ async fn completion_requires_exact_applied_uniform_and_survives_checkpoint_witho
     next.target_voters = BTreeSet::from([1, 4, 5]);
     apply(
         &mut restored,
-        9,
+        11,
         EntryPayload::Normal(Request::native_control(NativeControl::Begin {
             specification: next.clone(),
             executor_epoch: 1,
@@ -194,7 +256,7 @@ async fn completion_requires_exact_applied_uniform_and_survives_checkpoint_witho
     .await;
     apply(
         &mut restored,
-        10,
+        12,
         EntryPayload::Normal(Request::native_control(NativeControl::Begin {
             specification,
             executor_epoch: 1,
@@ -379,5 +441,37 @@ async fn whole_image_state_machine_refuses_typed_native_control() {
         result.unwrap_err().kind(),
         io::ErrorKind::Unsupported,
         "unsupported whole-image mode must reject before application dispatch"
+    );
+}
+
+#[tokio::test]
+async fn direct_apply_refuses_mixed_control_before_durable_mutation() {
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/223-ledger");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let root = tempfile::tempdir_in(scratch).unwrap();
+    let mut store = open(root.path());
+    let request = Request {
+        data: vec![1],
+        control: Some(NativeControl::Claim {
+            operation: OperationId {
+                sequence: 1,
+                nonce: [1; 16],
+            },
+            executor_epoch: 1,
+        }),
+    };
+    let result = store
+        .apply(stream::iter([Ok((
+            Entry {
+                log_id: id(0),
+                payload: EntryPayload::Normal(request),
+            },
+            None,
+        ))]))
+        .await;
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    assert!(
+        store.applied_state().await.unwrap().0.is_none(),
+        "invalid direct request must not advance durable applied state"
     );
 }
