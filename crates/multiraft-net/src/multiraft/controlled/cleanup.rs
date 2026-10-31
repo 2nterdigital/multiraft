@@ -13,7 +13,7 @@ impl<S: StateMachine> ControlledGroup<S> {
         let this = self.clone();
         let terminal = terminal.clone();
         self.node()?
-            .controlled_run(self.group, deadline, move |node| async move {
+            .controlled_cleanup_run(self.group, deadline, move |node| async move {
                 if terminal.group != this.group
                     || terminal.source != node.node_id
                     || terminal.source_generation != this.generation
@@ -31,11 +31,13 @@ impl<S: StateMachine> ControlledGroup<S> {
                 }
                 let db = node.controlled_db()?;
                 let receipt = this.checked_receipt()?;
-                if receipt.stage == ControlledGroupStage::Cleaned {
-                    return Ok(());
-                }
                 let proof = serde_json::to_vec(&terminal.proof)
                     .map_err(|error| ControlledError::Native(error.to_string()))?;
+                if receipt.stage == ControlledGroupStage::Cleaned
+                    && receipt.terminal_proof.as_ref() == Some(&proof)
+                {
+                    return Ok(());
+                }
                 if receipt.stage == ControlledGroupStage::Opened {
                     db.retire(this.group, this.generation, &proof)?;
                 }
@@ -48,7 +50,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                     return Err(ControlledError::Rejected("retirement identity mismatch"));
                 }
                 let owner = node.group_owner(this.group);
-                owner.close();
+                owner.retire();
                 let app = node
                     .groups
                     .lock()
@@ -86,6 +88,10 @@ impl<S: StateMachine> ControlledGroup<S> {
                         .await
                         .map_err(|error| ControlledError::Native(error.to_string()))?;
                 }
+                node.leader_watch_groups
+                    .lock()
+                    .expect("leader watcher lock poisoned")
+                    .remove(&this.group);
                 node.construction_recovery
                     .lock()
                     .expect("construction basis lock poisoned")

@@ -28,6 +28,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 if this.group != target.group
                     || specification.target_generation != target.generation
                     || target_receipt.stage != ControlledGroupStage::Reserved
+                    || target.target_specification.as_ref() != Some(&specification)
                 {
                     return Err(ControlledError::Rejected(
                         "target is not the reserved replacement generation",
@@ -224,9 +225,11 @@ impl<S: StateMachine> ControlledGroup<S> {
     pub async fn enter_joint(
         &self,
         executor: &ControlledExecutor,
+        target: &Self,
         deadline: tokio::time::Instant,
     ) -> Result<(), ControlledError> {
-        self.membership_step(executor, false, deadline).await
+        self.membership_step(executor, Some(target.clone()), false, deadline)
+            .await
     }
     /// Append exactly the final uniform step, dropping the excluded source entirely.
     pub async fn finalize_uniform(
@@ -234,11 +237,12 @@ impl<S: StateMachine> ControlledGroup<S> {
         executor: &ControlledExecutor,
         deadline: tokio::time::Instant,
     ) -> Result<(), ControlledError> {
-        self.membership_step(executor, true, deadline).await
+        self.membership_step(executor, None, true, deadline).await
     }
     async fn membership_step(
         &self,
         executor: &ControlledExecutor,
+        target: Option<Self>,
         finalize: bool,
         deadline: tokio::time::Instant,
     ) -> Result<(), ControlledError> {
@@ -293,6 +297,22 @@ impl<S: StateMachine> ControlledGroup<S> {
                             "joint step requires the opened learner and original voters",
                         ));
                     }
+                    if guard.committed != guard.effective {
+                        return Err(ControlledError::Rejected(
+                            "learner configuration is not committed",
+                        ));
+                    }
+                    let target = target.as_ref().ok_or(ControlledError::Rejected(
+                        "target application witness missing",
+                    ))?;
+                    target_receipt_at(
+                        &node,
+                        group,
+                        target,
+                        &record.specification,
+                        &guard.committed,
+                    )
+                    .await?;
                     raft.change_membership_guarded(
                         record.specification.target_voters,
                         false,
@@ -316,53 +336,125 @@ impl<S: StateMachine> ControlledGroup<S> {
         let this = self.clone();
         let executor = executor.clone();
         let target = target.clone();
-        self.node()?.controlled_run(self.group, deadline, move |node| async move {
-            this.checked_active()?;
-            let (raft, sm) = node.controlled_parts(this.group)?;
-            // A terminal retry reads the original immutable proof; it never reopens a target.
-            raft.ensure_linearizable(ReadPolicy::ReadIndex).await.map_err(|error| ControlledError::Native(error.to_string()))?;
-            let ledger = sm.controlled_ledger().await?;
-            let mut record = ledger.current.ok_or(ControlledError::Rejected("no native operation"))?;
-            if record.specification.operation != executor.operation || record.executor_epoch != executor.epoch { return Err(ControlledError::Rejected("stale executor")); }
-            if record.terminal.is_none() {
-                checked_executor(&raft, &sm, &executor, node.node_id).await?;
-                let guard = membership_guard(&raft, &executor).await?;
-                let membership = guard.committed.membership();
-                if guard.committed != guard.effective || membership.get_joint_config().len() != 1 || membership.voter_ids().collect::<BTreeSet<_>>() != record.specification.target_voters || membership.learner_ids().next().is_some() { return Err(ControlledError::Rejected("exact final configuration is not committed")); }
-                let target_node = target.node()?;
-                let target_receipt = target.checked_receipt()?;
-                if target.group != this.group || target.generation != record.specification.target_generation || target_receipt.stage != ControlledGroupStage::Opened { return Err(ControlledError::Rejected("target receipt is not durably opened")); }
-                let (_, mut target_sm) = target_node.controlled_parts(target.group)?;
-                let mut stopping = node.group_owner(this.group).stopping();
-                let applied = loop {
-                    let (applied, membership) = target_sm.applied_state().await.map_err(|error| ControlledError::Native(error.to_string()))?;
-                    if membership == guard.committed {
-                        if let Some(applied) = applied.filter(|applied| Some(*applied) >= *guard.committed.log_id()) { break applied; }
+        self.node()?
+            .controlled_run(self.group, deadline, move |node| async move {
+                this.checked_active()?;
+                let (raft, sm) = node.controlled_parts(this.group)?;
+                // A terminal retry reads the original immutable proof; it never reopens a target.
+                raft.ensure_linearizable(ReadPolicy::ReadIndex)
+                    .await
+                    .map_err(|error| ControlledError::Native(error.to_string()))?;
+                let ledger = sm.controlled_ledger().await?;
+                let mut record = ledger
+                    .current
+                    .ok_or(ControlledError::Rejected("no native operation"))?;
+                if record.specification.operation != executor.operation
+                    || record.executor_epoch != executor.epoch
+                {
+                    return Err(ControlledError::Rejected("stale executor"));
+                }
+                if record.terminal.is_none() {
+                    checked_executor(&raft, &sm, &executor, node.node_id).await?;
+                    let guard = membership_guard(&raft, &executor).await?;
+                    let membership = guard.committed.membership();
+                    if guard.committed != guard.effective
+                        || membership.get_joint_config().len() != 1
+                        || membership.voter_ids().collect::<BTreeSet<_>>()
+                            != record.specification.target_voters
+                        || membership.learner_ids().next().is_some()
+                    {
+                        return Err(ControlledError::Rejected(
+                            "exact final configuration is not committed",
+                        ));
                     }
-                    if *stopping.borrow_and_update() { return Err(ControlledError::Closed); }
-                    tokio::select! { _ = stopping.changed() => return Err(ControlledError::Closed), _ = tokio::time::sleep(Duration::from_millis(20)) => {} }
+                    let target_open = target_receipt_at(
+                        &node,
+                        this.group,
+                        &target,
+                        &record.specification,
+                        &guard.committed,
+                    )
+                    .await?;
+                    let ledger = write_control(
+                        &raft,
+                        &sm,
+                        executor.leader,
+                        NativeControl::Complete {
+                            operation: executor.operation,
+                            executor_epoch: executor.epoch,
+                            target_open,
+                        },
+                    )
+                    .await?;
+                    record = ledger
+                        .current
+                        .ok_or(ControlledError::Rejected("native terminal record missing"))?;
+                }
+                let proof = record
+                    .terminal
+                    .clone()
+                    .ok_or(ControlledError::Rejected("native terminal proof missing"))?;
+                let old: BTreeSet<_> = record
+                    .specification
+                    .expected_start
+                    .membership()
+                    .voter_ids()
+                    .collect();
+                let source = *old
+                    .difference(&record.specification.target_voters)
+                    .next()
+                    .ok_or(ControlledError::Rejected("excluded source missing"))?;
+                let catalog = this.authority.read(this.group).await?;
+                let source_generation = catalog
+                    .active_operation
+                    .as_ref()
+                    .filter(|binding| binding.specification == record.specification)
+                    .map(|binding| binding.source_generation)
+                    .or_else(|| {
+                        catalog
+                            .completed
+                            .iter()
+                            .find(|completed| completed.native_record == record)
+                            .map(|completed| completed.source_generation)
+                    })
+                    .ok_or(ControlledError::Rejected("source generation proof missing"))?;
+                let handoff = StartupTerminalProof {
+                    source_generation,
+                    group_id: this.group,
+                    native_record: record.clone(),
+                    committed_membership: proof.configuration.clone(),
+                    applied_membership: proof.configuration.clone(),
+                    applied_log: proof.barrier,
+                    target_opened: StartupTargetGeneration {
+                        node_id: proof.target_open.target_node,
+                        generation: proof.target_open.generation,
+                        consumption_id: proof.target_open.receipt.clone(),
+                    },
                 };
-                // Authenticate again after the application wait; terminal cannot overtake opening.
-                if target.checked_receipt()?.stage != ControlledGroupStage::Opened { return Err(ControlledError::Rejected("target generation retired during completion")); }
-                let target_open = TargetOpenReceipt { operation: executor.operation, target_node: target_node.node_id, generation: target.generation, applied, receipt: target.identity.clone() };
-                let ledger = write_control(&raft, &sm, executor.leader, NativeControl::Complete { operation: executor.operation, executor_epoch: executor.epoch, target_open }).await?;
-                record = ledger.current.ok_or(ControlledError::Rejected("native terminal record missing"))?;
-            }
-            let proof = record.terminal.clone().ok_or(ControlledError::Rejected("native terminal proof missing"))?;
-            let old: BTreeSet<_> = record.specification.expected_start.membership().voter_ids().collect();
-            let source = *old.difference(&record.specification.target_voters).next().ok_or(ControlledError::Rejected("excluded source missing"))?;
-            let catalog = this.authority.read(this.group).await?;
-            let source_generation = catalog.active_operation.as_ref().filter(|binding| binding.specification == record.specification).map(|binding| binding.source_generation)
-                .or_else(|| catalog.completed.iter().find(|completed| completed.native_record == record).map(|completed| completed.source_generation))
-                .ok_or(ControlledError::Rejected("source generation proof missing"))?;
-            let handoff = StartupTerminalProof { source_generation, group_id: this.group, native_record: record.clone(), committed_membership: proof.configuration.clone(), applied_membership: proof.configuration.clone(), applied_log: proof.barrier, target_opened: StartupTargetGeneration { node_id: proof.target_open.target_node, generation: proof.target_open.generation, consumption_id: proof.target_open.receipt.clone() } };
-            match this.authority.terminal_handoff(handoff.clone()).await? {
-                StartupAuthorityResult::Applied(actual) if actual == handoff => {}
-                StartupAuthorityResult::Unknown if this.authority.read(this.group).await?.completed.contains(&handoff) => {}
-                _ => return Err(ControlledError::Rejected("terminal startup handoff is unconfirmed")),
-            }
-            Ok(ControlledTerminal { group: this.group, source, source_generation, proof, specification: record.specification })
-        }).await
+                match this.authority.terminal_handoff(handoff.clone()).await? {
+                    StartupAuthorityResult::Applied(actual) if actual == handoff => {}
+                    StartupAuthorityResult::Unknown
+                        if this
+                            .authority
+                            .read(this.group)
+                            .await?
+                            .completed
+                            .contains(&handoff) => {}
+                    _ => {
+                        return Err(ControlledError::Rejected(
+                            "terminal startup handoff is unconfirmed",
+                        ))
+                    }
+                }
+                Ok(ControlledTerminal {
+                    group: this.group,
+                    source,
+                    source_generation,
+                    proof,
+                    specification: record.specification,
+                })
+            })
+            .await
     }
     pub(super) fn checked_active(&self) -> Result<(), ControlledError> {
         if self.checked_receipt()?.stage != ControlledGroupStage::Opened {
@@ -458,5 +550,72 @@ async fn write_control<S: StateMachine>(
         ControlReply::Rejected(_) => Err(ControlledError::Rejected(
             "native ledger rejected operation or executor",
         )),
+    }
+}
+
+async fn target_receipt_at<S: StateMachine>(
+    source: &Arc<MultiRaft<S>>,
+    group: GroupId,
+    target: &ControlledGroup<S>,
+    specification: &ReplacementSpec,
+    configuration: &multiraft_core::typ::StoredMembership,
+) -> Result<TargetOpenReceipt, ControlledError> {
+    let target_node = target.node()?;
+    let old: BTreeSet<_> = specification
+        .expected_start
+        .membership()
+        .voter_ids()
+        .collect();
+    let added: Vec<_> = specification
+        .target_voters
+        .difference(&old)
+        .copied()
+        .collect();
+    if target.group != group
+        || target.generation != specification.target_generation
+        || added != [target_node.node_id]
+        || target.checked_receipt()?.stage != ControlledGroupStage::Opened
+    {
+        return Err(ControlledError::Rejected(
+            "target generation is not durably opened",
+        ));
+    }
+    let (target_raft, mut target_sm) = target_node.controlled_parts(target.group)?;
+    let mut stopping = source.group_owner(group).stopping();
+    let mut target_stopping = target_node.group_owner(target.group).stopping();
+    loop {
+        if *stopping.borrow_and_update()
+            || *target_stopping.borrow_and_update()
+            || target_raft
+                .metrics()
+                .borrow_watched()
+                .running_state
+                .is_err()
+        {
+            return Err(ControlledError::Closed);
+        }
+        let (applied, membership) = target_sm
+            .applied_state()
+            .await
+            .map_err(|error| ControlledError::Native(error.to_string()))?;
+        if membership == *configuration {
+            if let Some(applied) =
+                applied.filter(|applied| Some(*applied) >= *configuration.log_id())
+            {
+                if target.checked_receipt()?.stage != ControlledGroupStage::Opened {
+                    return Err(ControlledError::Rejected(
+                        "target generation retired during application wait",
+                    ));
+                }
+                return Ok(TargetOpenReceipt {
+                    operation: specification.operation,
+                    target_node: target_node.node_id,
+                    generation: target.generation,
+                    applied,
+                    receipt: target.identity.clone(),
+                });
+            }
+        }
+        tokio::select! { _ = stopping.changed() => return Err(ControlledError::Closed), _ = target_stopping.changed() => return Err(ControlledError::Closed), _ = tokio::time::sleep(Duration::from_millis(20)) => {} }
     }
 }

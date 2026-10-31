@@ -252,6 +252,9 @@ impl GrpcRouter {
             .insert(group);
     }
 
+    pub(crate) fn controlled_groups(&self) -> Arc<RwLock<BTreeSet<GroupId>>> {
+        self.controlled_groups.clone()
+    }
     pub fn self_id(&self) -> NodeId {
         self.self_id
     }

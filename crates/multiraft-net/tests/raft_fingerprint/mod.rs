@@ -28,7 +28,10 @@ impl StateMachine for Noop {
 fn service(expected: Option<[u8; 32]>) -> RaftServiceImpl<Noop> {
     RaftServiceImpl {
         groups: Arc::new(Mutex::new(BTreeMap::new())),
-        fingerprint: expected,
+        protocol: IngressProtocol {
+            fingerprint: expected,
+            ..Default::default()
+        },
         snapshot_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         tasks: Arc::new(crate::multiraft::tasks::OwnedTasks::default()),
         accepting: Arc::new(std::sync::atomic::AtomicBool::new(true)),

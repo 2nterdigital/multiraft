@@ -39,7 +39,7 @@ impl<S: StateMachine> MultiRaft<S> {
             tasks,
             control_slot: tokio::sync::Semaphore::new(1),
             group_owners: Mutex::new(BTreeMap::new()),
-            controlled_opening: Mutex::new(BTreeSet::new()),
+            controlled_construction: tokio::sync::RwLock::new(()),
             leader_watch_groups: Mutex::new(BTreeSet::new()),
             fsm_releases: Mutex::new(Vec::new()),
             construction_recovery: Mutex::new(BTreeMap::new()),
@@ -88,7 +88,10 @@ impl<S: StateMachine> MultiRaft<S> {
 
         let groups_for_server = groups.clone();
         let snapshot_cap = config.max_snapshot_bytes;
-        let fingerprint = config.raft_transport_fingerprint;
+        let protocol = crate::grpc::server::IngressProtocol {
+            fingerprint: config.raft_transport_fingerprint,
+            controlled_groups: grpc_router.controlled_groups(),
+        };
         let bind = config
             .transport
             .as_ref()
@@ -101,13 +104,13 @@ impl<S: StateMachine> MultiRaft<S> {
         let service_tasks = ingress_tasks.clone();
         let service_accepting = ingress_accepting.clone();
         tasks.spawn_result(async move {
-            GrpcServer::serve_owned_bound(
+            GrpcServer::serve_owned_protocol(
                 listener,
                 groups_for_server,
                 snapshot_cap,
                 service_tasks,
                 service_accepting,
-                fingerprint,
+                protocol,
                 async move {
                     let _ = stopped.await;
                 },
@@ -128,7 +131,7 @@ impl<S: StateMachine> MultiRaft<S> {
             tasks,
             control_slot: tokio::sync::Semaphore::new(1),
             group_owners: Mutex::new(BTreeMap::new()),
-            controlled_opening: Mutex::new(BTreeSet::new()),
+            controlled_construction: tokio::sync::RwLock::new(()),
             leader_watch_groups: Mutex::new(BTreeSet::new()),
             fsm_releases: Mutex::new(Vec::new()),
             construction_recovery: Mutex::new(BTreeMap::new()),

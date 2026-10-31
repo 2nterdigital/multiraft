@@ -77,12 +77,36 @@ impl GrpcServer {
         fingerprint: Option<[u8; 32]>,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
+        Self::serve_owned_protocol(
+            listener,
+            groups,
+            cap,
+            tasks,
+            accepting,
+            IngressProtocol {
+                fingerprint,
+                ..Default::default()
+            },
+            shutdown,
+        )
+        .await
+    }
+
+    pub(crate) async fn serve_owned_protocol<S: StateMachine + 'static>(
+        listener: tokio::net::TcpListener,
+        groups: GroupMap<S>,
+        cap: usize,
+        tasks: std::sync::Arc<crate::multiraft::tasks::OwnedTasks>,
+        accepting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        protocol: IngressProtocol,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(cap > 0 && cap <= 64 * 1024 * 1024, "invalid snapshot cap");
         let incoming = TcpListenerStream::new(listener);
         let wire_limit = (cap + 1024 * 1024).max(4 * 1024 * 1024);
         let svc = RaftServiceServer::new(RaftServiceImpl {
             groups,
-            fingerprint,
+            protocol,
             tasks,
             accepting,
             snapshot_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -98,9 +122,16 @@ impl GrpcServer {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct IngressProtocol {
+    pub(crate) fingerprint: Option<[u8; 32]>,
+    pub(crate) controlled_groups:
+        std::sync::Arc<std::sync::RwLock<std::collections::BTreeSet<multiraft_core::GroupId>>>,
+}
+
 pub(crate) struct RaftServiceImpl<S: StateMachine> {
     pub(crate) groups: GroupMap<S>,
-    fingerprint: Option<[u8; 32]>,
+    protocol: IngressProtocol,
     snapshot_slots: std::sync::Arc<tokio::sync::Semaphore>,
     tasks: std::sync::Arc<crate::multiraft::tasks::OwnedTasks>,
     accepting: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -109,11 +140,23 @@ pub(crate) struct RaftServiceImpl<S: StateMachine> {
 #[tonic::async_trait]
 impl<S: StateMachine + 'static> RaftService for RaftServiceImpl<S> {
     async fn call(&self, request: Request<RaftRequest>) -> Result<Response<RaftResponse>, Status> {
-        super::fingerprint::validate(request.metadata(), self.fingerprint)?;
+        super::fingerprint::validate(request.metadata(), self.protocol.fingerprint)?;
         if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Status::unavailable("native ingress is closed"));
         }
         let request = request.into_inner();
+        if request.path == "/raft/append"
+            && self
+                .protocol
+                .controlled_groups
+                .read()
+                .expect("controlled ingress lock poisoned")
+                .contains(&request.group_id)
+        {
+            return Err(Status::failed_precondition(
+                "controlled group requires append JSON v1",
+            ));
+        }
         if request.path == "/raft/snapshot" {
             let permit = self
                 .snapshot_slots
@@ -133,11 +176,11 @@ impl<S: StateMachine + 'static> RaftService for RaftServiceImpl<S> {
             let mut response = result
                 .await
                 .map_err(|_| Status::internal("native snapshot task stopped"))??;
-            super::fingerprint::insert(response.metadata_mut(), self.fingerprint);
+            super::fingerprint::insert(response.metadata_mut(), self.protocol.fingerprint);
             return Ok(response);
         }
         let mut response = demux_raft_call(&self.groups, request).await?;
-        super::fingerprint::insert(response.metadata_mut(), self.fingerprint);
+        super::fingerprint::insert(response.metadata_mut(), self.protocol.fingerprint);
         Ok(response)
     }
 }

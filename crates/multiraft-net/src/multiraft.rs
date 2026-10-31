@@ -215,7 +215,7 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     tasks: tasks::OwnedTasks,
     control_slot: tokio::sync::Semaphore,
     group_owners: Mutex<BTreeMap<GroupId, Arc<controlled::GroupOwner>>>,
-    controlled_opening: Mutex<BTreeSet<GroupId>>,
+    controlled_construction: tokio::sync::RwLock<()>,
     leader_watch_groups: Mutex<BTreeSet<GroupId>>,
     fsm_releases: Mutex<Vec<multiraft_store::StateMachineRelease>>,
     // Immutable native storage basis captured before successful Group construction.

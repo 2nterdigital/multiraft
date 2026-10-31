@@ -65,6 +65,7 @@ impl<S: StateMachine> MultiRaft<S> {
         if let NetBackend::Grpc { router } = &self.net {
             router.close();
         }
+        let construction = self.controlled_construction.write().await;
         let rafts: Vec<(GroupId, Raft<S>, StateMachineStore<S>)> = self
             .groups
             .lock()
@@ -72,6 +73,7 @@ impl<S: StateMachine> MultiRaft<S> {
             .iter()
             .map(|(&group_id, group)| (group_id, group.raft.clone(), group.state_machine.clone()))
             .collect();
+        drop(construction);
         tracing::info!(target: "multiraft::recovery", operation = "node_shutdown", phase = "start",
             node_id = self.node_id, group_count = rafts.len() as u64, "shutting down Multi-Raft node");
         let mut first_error = None;
