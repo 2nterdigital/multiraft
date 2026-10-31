@@ -428,7 +428,7 @@ async fn current_leader<S: StateMachine>(
     }
     Ok(metrics.vote.leader_id().to_committed())
 }
-async fn checked_executor<S: StateMachine>(
+pub(super) async fn checked_executor<S: StateMachine>(
     raft: &Raft<S>,
     sm: &StateMachineStore<S>,
     executor: &ControlledExecutor,

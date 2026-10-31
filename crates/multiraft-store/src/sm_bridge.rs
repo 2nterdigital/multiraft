@@ -6,6 +6,7 @@ mod disk;
 mod native;
 mod release;
 mod validation;
+pub use disk::ControlledCheckpointState;
 pub use native::{NativeBuildReservation, NativeCaptureError, NativeSmOptions, SnapshotBuilder};
 pub use release::{StateMachineRelease, WeakStateMachineStore};
 pub use validation::ValidationOptions;

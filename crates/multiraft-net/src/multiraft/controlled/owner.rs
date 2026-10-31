@@ -128,11 +128,69 @@ impl<S: StateMachine> MultiRaft<S> {
         &self,
         group: GroupId,
     ) -> Result<(Raft<S>, StateMachineStore<S>), ControlledError> {
-        let groups = self.groups.lock().expect("native group lock poisoned");
-        let app = groups
+        if let Some(app) = self
+            .groups
+            .lock()
+            .expect("native group lock poisoned")
             .get(&group)
-            .ok_or(ControlledError::Rejected("local core is not running"))?;
-        Ok((app.raft.clone(), app.state_machine.clone()))
+        {
+            return Ok((app.raft.clone(), app.state_machine.clone()));
+        }
+        if let Some(app) = self
+            .quarantined_groups
+            .lock()
+            .expect("quarantined group lock poisoned")
+            .get(&group)
+        {
+            return Ok((app.raft.clone(), app.state_machine.clone()));
+        }
+        Err(ControlledError::Rejected("local core is not running"))
+    }
+    pub(super) async fn controlled_wait_ready(
+        &self,
+        group: GroupId,
+    ) -> Result<(), ControlledError> {
+        let (raft, sm) = self.controlled_parts(group)?;
+        let target = self
+            .construction_recovery
+            .lock()
+            .expect("construction basis lock poisoned")
+            .get(&group)
+            .copied()
+            .ok_or(ControlledError::Rejected(
+                "native constructor basis missing",
+            ))?;
+        raft.wait(Some(Duration::from_secs(30)))
+            .applied_index_at_least(
+                target.map(|id| id.index),
+                "quarantined durable constructor basis applied",
+            )
+            .await
+            .map_err(|error| ControlledError::Native(error.to_string()))?;
+        self.validate_recovered_store(group, sm).await?;
+        raft.metrics()
+            .borrow_watched()
+            .running_state
+            .clone()
+            .map_err(|error| ControlledError::Native(error.to_string()))
+    }
+    pub(super) fn publish_controlled_group(&self, group: GroupId) -> Result<(), ControlledError> {
+        let app = self
+            .quarantined_groups
+            .lock()
+            .expect("quarantined group lock poisoned")
+            .remove(&group);
+        if let Some(app) = app {
+            let raft = app.raft.clone();
+            self.groups
+                .lock()
+                .expect("native group lock poisoned")
+                .insert(group, app);
+            raft.runtime_config().elect(true);
+            self.spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
+            self.spawn_standby_throttle_watch(group, raft, self.standby_throttle.clone());
+        }
+        Ok(())
     }
     pub(in crate::multiraft) fn is_controlled_group(
         &self,

@@ -6,8 +6,10 @@ impl<S: StateMachine> MultiRaft<S> {
         self.snapshot_rt
             .validation_closed
             .store(true, std::sync::atomic::Ordering::Release);
-        for group in self.groups.lock().unwrap().values() {
-            group.state_machine.cancel_pending_validation();
+        for registry in [&self.groups, &self.quarantined_groups] {
+            for group in registry.lock().unwrap().values() {
+                group.state_machine.cancel_pending_validation();
+            }
         }
     }
 
@@ -73,6 +75,14 @@ impl<S: StateMachine> MultiRaft<S> {
             .iter()
             .map(|(&group_id, group)| (group_id, group.raft.clone(), group.state_machine.clone()))
             .collect();
+        let quarantined: Vec<_> = self
+            .quarantined_groups
+            .lock()
+            .expect("quarantined group lock poisoned")
+            .iter()
+            .map(|(&group_id, group)| (group_id, group.raft.clone(), group.state_machine.clone()))
+            .collect();
+        let rafts: Vec<_> = rafts.into_iter().chain(quarantined).collect();
         drop(construction);
         tracing::info!(target: "multiraft::recovery", operation = "node_shutdown", phase = "start",
             node_id = self.node_id, group_count = rafts.len() as u64, "shutting down Multi-Raft node");
@@ -130,6 +140,10 @@ impl<S: StateMachine> MultiRaft<S> {
             .await
             .map_err(|error| MultiRaftError::Other(error.into()))?;
         self.groups.lock().unwrap().clear();
+        self.quarantined_groups
+            .lock()
+            .expect("quarantined group lock poisoned")
+            .clear();
         self.construction_recovery.lock().unwrap().clear();
         drop(rafts);
         // Core shutdown does not join the SM worker. Successful stop promises that

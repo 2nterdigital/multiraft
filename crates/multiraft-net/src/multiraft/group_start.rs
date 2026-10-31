@@ -6,18 +6,21 @@ impl<S: StateMachine> MultiRaft<S> {
         &self,
         group: GroupId,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
-        self.spawn_local_group_authorized(group, false).await
+        self.spawn_local_group_authorized(group, false, false).await
     }
     pub(super) async fn spawn_controlled_local_group(
         &self,
         group: GroupId,
+        quarantine: bool,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
-        self.spawn_local_group_authorized(group, true).await
+        self.spawn_local_group_authorized(group, true, quarantine)
+            .await
     }
     async fn spawn_local_group_authorized(
         &self,
         group: GroupId,
         controlled_admission: bool,
+        quarantine: bool,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
         let _construction = self.controlled_construction.read().await;
         if self
@@ -91,6 +94,7 @@ impl<S: StateMachine> MultiRaft<S> {
             "starting local Raft group"
         );
         let config = Config {
+            enable_elect: !quarantine,
             heartbeat_interval: self.config.heartbeat_interval_ms,
             election_timeout_min: self.config.election_timeout_min_ms,
             election_timeout_max: self.config.election_timeout_max_ms,
@@ -376,7 +380,12 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         let registered_at;
         {
-            let mut g = self.groups.lock().unwrap();
+            let destination = if quarantine {
+                &self.quarantined_groups
+            } else {
+                &self.groups
+            };
+            let mut g = destination.lock().unwrap();
             g.insert(
                 group,
                 GroupApp {
@@ -389,8 +398,10 @@ impl<S: StateMachine> MultiRaft<S> {
             registered_at = tokio::time::Instant::now();
         }
 
-        self.spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
-        self.spawn_standby_throttle_watch(group, raft, self.standby_throttle.clone());
+        if !quarantine {
+            self.spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
+            self.spawn_standby_throttle_watch(group, raft, self.standby_throttle.clone());
+        }
         tracing::info!(
             target: "multiraft::recovery",
             operation = "group_start",

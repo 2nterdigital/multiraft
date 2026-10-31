@@ -9,6 +9,7 @@ mod cleanup;
 mod durable_record;
 mod open;
 mod owner;
+mod seed;
 mod source;
 mod storage_owner;
 mod terminal;
@@ -62,6 +63,25 @@ impl<S: StateMachine> std::fmt::Debug for ControlledGroup<S> {
         f.debug_struct("ControlledGroup")
             .field("group", &self.group)
             .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A sealed fresh native checkpoint containing the current operation's committed Begin.
+/// Its descriptor owns no file lease; a removed source checkpoint fails closed on delivery.
+#[derive(Clone)]
+pub struct ControlledSeed {
+    specification: ReplacementSpec,
+    record: multiraft_core::OperationRecord,
+    vote: multiraft_core::typ::Vote,
+    meta: multiraft_core::typ::SnapshotMeta,
+    manifest: Vec<u8>,
+}
+impl std::fmt::Debug for ControlledSeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlledSeed")
+            .field("operation", &self.specification.operation)
+            .field("cut", &self.meta.last_log_id)
             .finish_non_exhaustive()
     }
 }
@@ -157,12 +177,13 @@ impl<S: StateMachine> ControlledGroup<S> {
     /// Consume this reserved target using its exact durable identity and operation binding.
     pub async fn open_target(
         &self,
-        operation: OperationId,
+        seed: ControlledSeed,
         admission: StartupAdmission,
         deadline: tokio::time::Instant,
     ) -> Result<Self, ControlledError> {
+        let operation = seed.specification.operation;
         self.node()?
-            .open_controlled_group(
+            .open_controlled_group_inner(
                 ControlledOpen {
                     group_id: self.group,
                     generation: self.generation,
@@ -171,6 +192,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 },
                 self.authority.clone(),
                 admission,
+                Some(seed),
                 deadline,
             )
             .await
