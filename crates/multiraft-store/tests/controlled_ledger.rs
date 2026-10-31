@@ -402,6 +402,9 @@ async fn controlled_checkpoint_inspection_reads_the_published_database_not_live_
             .executor_epoch,
         9
     );
+    let actual_live = store.inspect_controlled_applied().await.unwrap();
+    assert_eq!(actual_live.applied, id(2));
+    assert_eq!(actual_live.ledger.current.unwrap().executor_epoch, 9);
     let mut descriptor =
         multiraft_store::disk_snapshot::DiskManifest::decode(snapshot.snapshot.get_ref(), 7)
             .unwrap();
@@ -495,6 +498,59 @@ async fn controlled_checkpoint_inspection_reads_the_published_database_not_live_
             .await
             .is_err(),
         "actual checkpoint applied record must match metadata"
+    );
+}
+
+#[tokio::test]
+async fn actual_applied_inspection_accepts_bootstrap_v1_and_rejects_pristine_or_corrupt_disk() {
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/223-ledger");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let root = tempfile::tempdir_in(scratch).unwrap();
+    let mut store = open(root.path());
+    assert!(
+        store.inspect_controlled_applied().await.is_err(),
+        "pristine store has no durable native identity"
+    );
+    let membership = Membership::new(
+        vec![BTreeSet::from([1, 2, 3])],
+        BTreeMap::from_iter([1, 2, 3].map(|id| (id, openraft::BasicNode::default()))),
+    )
+    .unwrap();
+    apply(&mut store, 0, EntryPayload::Membership(membership.clone())).await;
+    apply(
+        &mut store,
+        1,
+        EntryPayload::Normal(Request::new(b"bootstrap application")),
+    )
+    .await;
+    let facts = store.inspect_controlled_applied().await.unwrap();
+    assert_eq!(facts.applied, id(1));
+    assert_eq!(
+        facts.membership,
+        StoredMembership::new(Some(id(0)), membership)
+    );
+    assert_eq!(
+        facts.ledger,
+        multiraft_core::NativeLedger::default(),
+        "v1 has no native operation ledger"
+    );
+    store
+        .try_with_fsm(|disk| {
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&disk.db.applied_record().unwrap().unwrap()).unwrap();
+            record["version"] = serde_json::json!(999);
+            disk.db
+                .commit(
+                    WriteBatch::default(),
+                    &AppliedState::new(1, 1, serde_json::to_vec(&record).unwrap()),
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    assert!(
+        store.inspect_controlled_applied().await.is_err(),
+        "fresh inspection cannot reuse the valid cached applied record after durable corruption"
     );
 }
 fn open(root: &Path) -> StateMachineStore<Disk> {
