@@ -10,6 +10,7 @@ pub struct DiskImage {
     db: DiskFsmDb,
     gate_root: PathBuf,
     seed_gate: PathBuf,
+    claimed_workspace: Option<PathBuf>,
 }
 
 impl DiskImage {
@@ -22,7 +23,13 @@ impl DiskImage {
             )?,
             gate_root: root.join("application-gate"),
             seed_gate: root.join("seed-install-gate").join(group.to_string()),
+            claimed_workspace: None,
         })
+    }
+
+    pub fn claim_snapshot_workspace(mut self, workspace: PathBuf) -> Self {
+        self.claimed_workspace = Some(workspace);
+        self
     }
 
     pub fn payloads(&self) -> io::Result<Vec<Vec<u8>>> {
@@ -104,7 +111,9 @@ impl DiskState for DiskImage {
     }
 
     fn snapshot_workspace(&self) -> io::Result<PathBuf> {
-        self.db.snapshot_workspace()
+        self.claimed_workspace
+            .clone()
+            .map_or_else(|| self.db.snapshot_workspace(), Ok)
     }
     fn checkpoint(&self, dir: &Path) -> io::Result<()> {
         self.db.checkpoint(dir)
