@@ -51,6 +51,7 @@ pub struct NativeTargetRequest {
 }
 /// Target-side native operations. No command accepts executor or cleanup authority from bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum NativeTargetCommand {
     Observe {
         configuration: Option<StoredMembership>,
@@ -221,6 +222,7 @@ impl<S: StateMachine> ControlledGroup<S> {
 
 /// A bounded actual checkpoint export. Dropping the receiver releases the source-owned lease.
 /// The source registry retains and joins blocking reads/destruction before source cleanup.
+#[derive(Debug)]
 pub struct NativeSeedExport {
     header: NativeSeedHeader,
     chunks: super::seed_stream::ChunkReceiver,

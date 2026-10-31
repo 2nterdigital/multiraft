@@ -20,11 +20,12 @@ impl SourceTargetPort {
             command: command.clone(),
         };
         let bytes = serde_json::to_vec(&request).map_err(std::io::Error::other)?;
-        let bytes = self
-            .transport
-            .exchange(bytes)
-            .await
-            .map_err(|error| ControlledError::Native(error.to_string()))?;
+        let bytes = self.transport.exchange(bytes).await.map_err(|error| {
+            ControlledError::TargetOutcome {
+                outcome: error.outcome,
+                message: error.message,
+            }
+        })?;
         if bytes.len() > 6 * multiraft_store::disk_snapshot::MAX_MANIFEST_BYTES {
             return Err(ControlledError::Rejected(
                 "native target reply exceeds bound",
@@ -43,11 +44,12 @@ impl SourceTargetPort {
         }
         match reply.outcome {
             NativeTargetOutcome::Durable | NativeTargetOutcome::InProgress => Ok(reply),
-            _ => Err(ControlledError::Native(format!(
-                "native target {:?}: {}",
-                reply.outcome,
-                reply.error.as_deref().unwrap_or("no durable result")
-            ))),
+            _ => Err(ControlledError::TargetOutcome {
+                outcome: reply.outcome,
+                message: reply
+                    .error
+                    .unwrap_or_else(|| "no durable result".to_owned()),
+            }),
         }
     }
     pub(in crate::multiraft::controlled) async fn observe(
@@ -64,9 +66,25 @@ impl SourceTargetPort {
                 },
             )
             .await?;
+        if reply.outcome != NativeTargetOutcome::Durable {
+            return Err(ControlledError::TargetOutcome {
+                outcome: reply.outcome,
+                message: "target observation is not durable".to_owned(),
+            });
+        }
         let observation = reply
             .observation
             .ok_or(ControlledError::Rejected("target observation missing"))?;
+        if observation.stage == NativeTargetStage::Opened
+            && observation
+                .record
+                .as_ref()
+                .is_none_or(|record| record.specification != self.specification)
+        {
+            return Err(ControlledError::Rejected(
+                "opened target operation differs from source",
+            ));
+        }
         if let Some(configuration) = configuration {
             if observation.stage != NativeTargetStage::Opened
                 || observation.configuration.as_ref() != Some(&configuration)
@@ -122,11 +140,11 @@ impl SourceTargetPort {
             meta: seed.meta.clone(),
             manifest: seed.manifest.clone(),
         };
-        // Export registration precedes transmission; a caller owns only the result waiter.
-        let mut chunks = seed.input.open(seed.manifest, self.identity.group).await?;
+        // Owned transfer registration precedes transmission; the caller owns only its waiter.
+        let input = seed.input.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         // The export's registry owns the transfer continuation too, rather than a detached task.
-        seed.input.run(async move {
+        input.run(async move {
             let result = async {
                 let start = port
                     .request(
@@ -135,8 +153,10 @@ impl SourceTargetPort {
                     )
                     .await?;
                 if start.outcome == NativeTargetOutcome::Durable {
+                    port.validate_install_reply(&start)?;
                     return Ok(());
                 }
+                let mut chunks = seed.input.open(seed.manifest, port.identity.group).await?;
                 let mut sequence = 0;
                 loop {
                     let chunk = chunks
@@ -159,6 +179,7 @@ impl SourceTargetPort {
                 if finish.outcome != NativeTargetOutcome::Durable {
                     return Err(ControlledError::Rejected("target seed not durably opened"));
                 }
+                port.validate_install_reply(&finish)?;
                 Ok(())
             }
             .await;
@@ -170,6 +191,22 @@ impl SourceTargetPort {
                 outcome_unknown: true,
             })?
             .map_err(|_| ControlledError::Closed)?
+    }
+    fn validate_install_reply(&self, reply: &NativeTargetReply) -> Result<(), ControlledError> {
+        if reply.observation.as_ref().is_none_or(|observation| {
+            observation.stage != NativeTargetStage::Opened
+                || observation
+                    .record
+                    .as_ref()
+                    .is_none_or(|record| record.specification != self.specification)
+                || observation.applied.is_none()
+                || observation.configuration.is_none()
+        }) {
+            return Err(ControlledError::Rejected(
+                "durable seed reply lacks actual opened operation",
+            ));
+        }
+        Ok(())
     }
     /// Read persistent native target status after a lost install reply; never restarts construction.
     pub async fn status(&self) -> Result<NativeTargetObservation, ControlledError> {

@@ -2,6 +2,7 @@
 use super::*;
 use multiraft_core::typ::{self, LogId, SnapshotMeta, Vote};
 use openraft::storage::{RaftLogReader, RaftLogStorage, RaftStateMachine};
+use openraft::vote::RaftLeaderId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,10 +139,16 @@ fn validate_anchor<S: StateMachine>(
             "seed operation or generation identity mismatch",
         ));
     }
-    anchor
+    let cut = anchor
         .meta
         .last_log_id
-        .ok_or(ControlledError::Rejected("seed native log floor missing"))
+        .ok_or(ControlledError::Rejected("seed native log floor missing"))?;
+    if anchor.vote.leader_id().to_committed() != cut.leader_id {
+        return Err(ControlledError::Rejected(
+            "seed vote does not identify actual checkpoint leader",
+        ));
+    }
+    Ok(cut)
 }
 
 pub(super) async fn install<S: StateMachine>(

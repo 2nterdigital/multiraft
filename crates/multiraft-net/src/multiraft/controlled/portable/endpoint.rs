@@ -5,7 +5,7 @@ use multiraft_store::{
     disk_snapshot::{DiskManifest, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES},
     ControlledGroupStage,
 };
-use openraft::storage::RaftStateMachine;
+use openraft::{storage::RaftStateMachine, vote::RaftLeaderId};
 use tokio::sync::{mpsc, Notify};
 
 struct Installation {
@@ -26,6 +26,13 @@ pub struct NativeTargetEndpoint<S: StateMachine> {
     specification: ReplacementSpec,
     identity: NativeTargetIdentity,
     installation: Arc<tokio::sync::Mutex<Option<Installation>>>,
+}
+impl<S: StateMachine> std::fmt::Debug for NativeTargetEndpoint<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeTargetEndpoint")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
 }
 impl<S: StateMachine> Clone for NativeTargetEndpoint<S> {
     fn clone(&self) -> Self {
@@ -225,6 +232,10 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
             || header.record.terminal.is_some()
             || header.meta.last_membership != self.specification.expected_start
             || !header.vote.committed
+            || header
+                .meta
+                .last_log_id
+                .is_none_or(|cut| header.vote.leader_id().to_committed() != cut.leader_id)
         {
             return Err(ControlledError::Rejected(
                 "seed header operation or configuration mismatch",

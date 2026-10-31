@@ -42,17 +42,21 @@ impl<S: StateMachine> Export for LocalExport<S> {
                 return Err(ControlledError::Closed);
             }
             let (sender, receiver) = mpsc::channel(1);
+            let (ready, acquired) = tokio::sync::oneshot::channel();
             if !owner.watchers.spawn(async move {
                 let result =
                     tokio::task::spawn_blocking(move || ChunkSource::open(manifest, group)).await;
                 let mut source = match result {
-                    Ok(Ok(source)) => source,
+                    Ok(Ok(source)) => {
+                        let _ = ready.send(Ok(()));
+                        source
+                    }
                     Ok(Err(error)) => {
-                        let _ = sender.try_send(Err(error.to_string()));
+                        let _ = ready.send(Err(error.to_string()));
                         return;
                     }
                     Err(error) => {
-                        let _ = sender.try_send(Err(error.to_string()));
+                        let _ = ready.send(Err(error.to_string()));
                         return;
                     }
                 };
@@ -76,18 +80,28 @@ impl<S: StateMachine> Export for LocalExport<S> {
                     source = returned;
                     let done = !matches!(chunk, Ok(Some(_)));
                     let chunk = chunk.map_err(|error| error.to_string());
+                    if done {
+                        // EOF acknowledges that the source lease destructor was joined.
+                        let _ = tokio::task::spawn_blocking(move || drop(source)).await;
+                        tokio::select! {
+                            _ = stopping.changed() => {},
+                            _ = sender.send(chunk) => {},
+                        }
+                        return;
+                    }
                     tokio::select! {
                         _ = stopping.changed() => break,
                         result = sender.send(chunk) => if result.is_err() { break; },
-                    }
-                    if done {
-                        break;
                     }
                 }
                 let _ = tokio::task::spawn_blocking(move || drop(source)).await;
             }) {
                 return Err(ControlledError::Closed);
             }
+            acquired
+                .await
+                .map_err(|_| ControlledError::Closed)?
+                .map_err(ControlledError::Native)?;
             Ok(receiver)
         })
     }

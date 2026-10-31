@@ -124,6 +124,11 @@ pub enum ControlledError {
     Closed,
     #[error("controlled request rejected: {0}")]
     Rejected(&'static str),
+    #[error("native target ({outcome:?}): {message}")]
+    TargetOutcome {
+        outcome: portable::NativeTargetOutcome,
+        message: String,
+    },
     #[error("controlled storage: {0}")]
     Storage(#[from] std::io::Error),
     #[error("controlled startup authority: {0}")]
