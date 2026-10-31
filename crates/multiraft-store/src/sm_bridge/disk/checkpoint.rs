@@ -7,7 +7,36 @@ use multiraft_core::{
 };
 use multiraft_fsm::StateMachine;
 use openraft::alias::SnapshotMetaOf;
+use std::collections::BTreeMap;
 use std::io;
+
+fn validate_files(manifest: &DiskManifest) -> io::Result<()> {
+    let expected: BTreeMap<_, _> = manifest
+        .files
+        .iter()
+        .map(|file| (file.name.as_str(), file.size))
+        .collect();
+    let mut count = 0;
+    for entry in std::fs::read_dir(&manifest.source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let expected_size = name
+            .to_str()
+            .and_then(|name| expected.get(name))
+            .ok_or_else(|| invalid("controlled checkpoint contains an undeclared entry"))?;
+        let actual = std::fs::symlink_metadata(entry.path())?;
+        if !actual.file_type().is_file() || actual.len() != *expected_size {
+            return Err(invalid(
+                "controlled checkpoint file differs from its manifest",
+            ));
+        }
+        count += 1;
+    }
+    if count != expected.len() {
+        return Err(invalid("controlled checkpoint is missing a declared file"));
+    }
+    Ok(())
+}
 
 /// Durable applied facts read from the checkpoint database, not the live FSM.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,14 +88,7 @@ impl<S: StateMachine> StateMachineStore<S> {
                 "controlled checkpoint directory is not owned regular storage",
             ));
         }
-        for file in &published.manifest.files {
-            let actual = std::fs::symlink_metadata(published.manifest.source.join(&file.name))?;
-            if !actual.file_type().is_file() || actual.len() != file.size {
-                return Err(invalid(
-                    "controlled checkpoint file differs from its manifest",
-                ));
-            }
-        }
+        validate_files(&published.manifest)?;
         let bytes = self
             .inner
             .lock()
@@ -76,6 +98,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             .ok_or_else(|| invalid("state machine left disk-backed mode"))?
             .inspect_checkpoint(&published.manifest.source)?
             .ok_or_else(|| invalid("controlled checkpoint has no applied record"))?;
+        validate_files(&published.manifest)?;
         let record = AppliedRecord::decode(&bytes)?;
         if Some(record.last_applied) != meta.last_log_id
             || record.membership != meta.last_membership
