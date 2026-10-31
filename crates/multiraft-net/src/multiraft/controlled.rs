@@ -9,7 +9,9 @@ mod cleanup;
 mod durable_record;
 mod open;
 mod owner;
+pub mod portable;
 mod seed;
+mod seed_stream;
 mod source;
 mod storage_owner;
 mod terminal;
@@ -68,7 +70,7 @@ impl<S: StateMachine> std::fmt::Debug for ControlledGroup<S> {
 }
 
 /// A sealed fresh native checkpoint containing the current operation's committed Begin.
-/// Its descriptor owns no file lease; a removed source checkpoint fails closed on delivery.
+/// The descriptor holds no file or FSM lease; export acquires a source-owned streaming lease.
 #[derive(Clone)]
 pub struct ControlledSeed {
     specification: ReplacementSpec,
@@ -77,6 +79,7 @@ pub struct ControlledSeed {
     fingerprint: Option<[u8; 32]>,
     meta: multiraft_core::typ::SnapshotMeta,
     manifest: Vec<u8>,
+    input: seed_stream::SeedInput,
 }
 impl std::fmt::Debug for ControlledSeed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -176,8 +179,19 @@ impl<S: StateMachine> ControlledGroup<S> {
             })
             .await
     }
-    /// Consume this reserved target using its exact durable identity and operation binding.
+    /// Install through the same encoded native port used by independent processes.
     pub async fn open_target(
+        &self,
+        seed: ControlledSeed,
+        admission: StartupAdmission,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, ControlledError> {
+        let port = self.target_port(seed.specification.clone())?;
+        port.install_seed(seed, admission, deadline).await?;
+        Ok(self.clone())
+    }
+    /// Consume this reserved target using its exact durable identity and operation binding.
+    pub(super) async fn open_target_input(
         &self,
         seed: ControlledSeed,
         admission: StartupAdmission,

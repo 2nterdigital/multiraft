@@ -654,3 +654,6 @@ where
 mod read_quorum_tests;
 #[cfg(test)]
 mod tests;
+
+/// Portable native target transport and untrusted wire protocol.
+pub use controlled::portable;
