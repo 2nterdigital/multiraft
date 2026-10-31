@@ -41,6 +41,11 @@ impl Request {
 impl Serialize for Request {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
+        if self.control.is_some() && !self.data.is_empty() {
+            return Err(serde::ser::Error::custom(
+                "native entry also contains application bytes",
+            ));
+        }
         if !serializer.is_human_readable() {
             if self.control.is_some() {
                 return Err(serde::ser::Error::custom(

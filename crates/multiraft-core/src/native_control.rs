@@ -87,6 +87,6 @@ pub enum ControlRejection {
 /// Exact result encoded in the native proposal's effects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlReply {
-    Applied(NativeLedger),
+    Applied(Box<NativeLedger>),
     Rejected(ControlRejection),
 }
