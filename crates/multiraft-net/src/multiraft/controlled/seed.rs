@@ -97,7 +97,7 @@ impl<S: StateMachine> ControlledGroup<S> {
 fn native(error: impl std::fmt::Display) -> ControlledError {
     ControlledError::Native(error.to_string())
 }
-fn covers(actual: LogId, floor: LogId) -> bool {
+pub(super) fn covers(actual: LogId, floor: LogId) -> bool {
     actual >= floor
         && actual.index >= floor.index
         && (actual.index != floor.index || actual == floor)

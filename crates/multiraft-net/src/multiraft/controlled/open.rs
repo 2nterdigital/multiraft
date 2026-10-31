@@ -285,6 +285,7 @@ impl<S: StateMachine> MultiRaft<S> {
                         ));
                     }
                     if old.stage == ControlledGroupStage::Opening
+                        && !bootstrap::owns_generation(&node, &request)?
                         && catalog.active_operation.as_ref().is_none_or(|binding| {
                             binding.target.node_id != node.node_id
                                 || binding.target.generation != request.generation
@@ -297,8 +298,9 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                 }
             }
+            let bootstrap_generation = bootstrap::owns_generation(&node, &request)?;
             let quarantine = !matches!(&request.mode, ControlledOpenMode::BootstrapNew { .. })
-                && !bootstrap::owns_generation(&node, &request)?;
+                || bootstrap::has_anchor(&node, request.group_id)?;
             if node.controlled_parts(request.group_id).is_err() {
                 let root = node.config.data_dir.clone();
                 let consumed_admission = admission.clone();
@@ -332,6 +334,9 @@ impl<S: StateMachine> MultiRaft<S> {
             if quarantine {
                 let ready = if let Some(seed) = seed {
                     super::seed::install(&node, &request, &authority, seed).await?;
+                    true
+                } else if bootstrap_generation {
+                    bootstrap::recover_anchor(&node, &request).await?;
                     true
                 } else {
                     super::seed::recover_anchor(&node, &request).await?

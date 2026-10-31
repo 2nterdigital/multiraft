@@ -95,6 +95,7 @@ impl<S: StateMachine> MultiRaft<S> {
         );
         let config = Config {
             enable_elect: !quarantine,
+            enable_leader_restore: if quarantine { Some(false) } else { None },
             heartbeat_interval: self.config.heartbeat_interval_ms,
             election_timeout_min: self.config.election_timeout_min_ms,
             election_timeout_max: self.config.election_timeout_max_ms,
