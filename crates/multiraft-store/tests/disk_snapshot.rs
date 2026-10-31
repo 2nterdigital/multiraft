@@ -175,6 +175,26 @@ async fn close_racing_verified_transfer_destroys_restored_incoming_before_quiesc
     );
 }
 
+#[tokio::test]
+async fn open_owner_quiescence_preserves_verified_transfer_for_native_install() {
+    let _install = INSTALLS.lock().await;
+    let source_root = scratch();
+    let (_source, meta, manifest) = leader(source_root.path(), 0).await;
+    let root = scratch();
+    let mut receiver = store(root.path(), DiskBlobs::open(&path(root.path())));
+    transfer(&receiver, manifest.clone(), None).await.unwrap();
+    receiver
+        .verify_disk_snapshot(&meta, &manifest)
+        .await
+        .unwrap();
+    receiver.wait_native_quiescent().await;
+    receiver
+        .install_snapshot(&meta, std::io::Cursor::new(manifest))
+        .await
+        .unwrap();
+    assert_eq!(receiver.applied_state().await.unwrap().0, meta.last_log_id);
+}
+
 #[test]
 fn cancelled_begin_keeps_blocking_work_and_cleanup_inside_quiescence() {
     tokio::runtime::Builder::new_current_thread()
