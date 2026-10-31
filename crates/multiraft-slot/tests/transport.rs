@@ -52,9 +52,9 @@ fn transport() -> SlotTransportConfig {
     }
 }
 fn root(label: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.tmp/transport-tests")
-        .join(format!("{}-{label}", std::process::id()))
+    let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/transport-tests");
+    std::fs::create_dir_all(&parent).expect("create transport fixture parent");
+    parent.join(format!("{}-{label}", std::process::id()))
 }
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(20)
