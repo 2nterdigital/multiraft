@@ -1,5 +1,5 @@
 //! Opaque application bytes persisted atomically with the native applied record.
-use multiraft_fsm::{AppliedState, ApplyOut, DiskState, GroupId, StateMachine};
+use multiraft_fsm::{AppliedState, ApplyOut, DiskState, DiskStoragePaths, GroupId, StateMachine};
 use multiraft_store::{rocksdb::WriteBatch, DiskFsmDb, DiskFsmOptions};
 use std::{
     io,
@@ -8,6 +8,7 @@ use std::{
 
 pub struct DiskImage {
     db: DiskFsmDb,
+    gate_root: PathBuf,
 }
 
 impl DiskImage {
@@ -18,6 +19,7 @@ impl DiskImage {
                 group,
                 DiskFsmOptions::new(b"controlled-protocol-opaque-v1".to_vec()),
             )?,
+            gate_root: root.join("application-gate"),
         })
     }
 
@@ -54,6 +56,9 @@ impl StateMachine for DiskImage {
 }
 
 impl DiskState for DiskImage {
+    fn storage_paths(&self) -> io::Result<DiskStoragePaths> {
+        self.db.storage_paths()
+    }
     fn durable_applied(&self) -> io::Result<Option<Vec<u8>>> {
         self.db.applied_record()
     }
@@ -65,6 +70,23 @@ impl DiskState for DiskImage {
         data: Option<&[u8]>,
         applied: &AppliedState,
     ) -> io::Result<ApplyOut> {
+        if data == Some(b"pending-opaque-application".as_slice())
+            && self.gate_root.join("armed").exists()
+        {
+            std::fs::write(
+                self.gate_root.join("entered"),
+                b"application callback entered before atomic durable apply",
+            )?;
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !self.gate_root.join("release").exists() {
+                if std::time::Instant::now() >= limit {
+                    return Err(io::Error::other(
+                        "bounded application test gate was not released",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         let mut batch = WriteBatch::default();
         if let Some(data) = data {
             let mut payloads = self.payloads()?;

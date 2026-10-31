@@ -9,7 +9,10 @@ use multiraft_net::{FsmFactoryContext, MultiRaft};
 use std::{
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::time::Instant;
@@ -72,11 +75,23 @@ pub fn configurations(root: &Path) -> Vec<ClusterConfig> {
         .collect()
 }
 
-pub async fn start(config: ClusterConfig) -> Arc<MultiRaft<DiskImage>> {
+pub async fn start(
+    config: ClusterConfig,
+    creations: Arc<AtomicUsize>,
+) -> Arc<MultiRaft<DiskImage>> {
     let root = config.data_dir.clone();
+    let crash_opening = config.node_id == 4
+        && std::env::var("CONTROLLED_PROTOCOL_SCENARIO").as_deref() == Ok("opening")
+        && std::env::var("CONTROLLED_PROTOCOL_RESUME").as_deref() == Ok("0");
     Arc::new(
         MultiRaft::start_grpc_with_factory(config, move |context: FsmFactoryContext| {
-            Ok(DiskImage::open(&root, context.group_id())?)
+            if crash_opening && context.group_id() == GROUP {
+                // The runtime persists Opening before entering this real factory.
+                super::process::persisted_phase("opening");
+            }
+            let image = DiskImage::open(&root, context.group_id())?;
+            creations.fetch_add(1, Ordering::SeqCst);
+            Ok(image)
         })
         .await
         .expect("start real gRPC peer"),
@@ -84,7 +99,7 @@ pub async fn start(config: ClusterConfig) -> Arc<MultiRaft<DiskImage>> {
 }
 
 pub async fn leader(nodes: &[Arc<MultiRaft<DiskImage>>]) -> usize {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
         let mut previous = None;
         let mut confirmations = 0;
         loop {
@@ -111,8 +126,19 @@ pub async fn leader(nodes: &[Arc<MultiRaft<DiskImage>>]) -> usize {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("committed leader with real quorum")
+    .await;
+    result.unwrap_or_else(|error| {
+        panic!(
+            "committed leader with real quorum: {error}; local observations={:?}",
+            nodes
+                .iter()
+                .map(|node| (
+                    node.node_id(),
+                    node.observe_group(GROUP).map(|(view, _)| view)
+                ))
+                .collect::<Vec<_>>()
+        )
+    })
 }
 
 pub async fn wait_payloads(node: &MultiRaft<DiskImage>, expected: &[Vec<u8>]) {

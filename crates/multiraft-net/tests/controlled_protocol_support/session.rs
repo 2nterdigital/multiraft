@@ -10,12 +10,17 @@ use multiraft_net::{
     ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode, MultiRaft,
 };
 use openraft::{BasicNode, Membership};
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{atomic::AtomicUsize, Arc},
+};
 
 pub struct Session {
     pub nodes: Vec<Arc<MultiRaft<DiskImage>>>,
     pub groups: Vec<Option<ControlledGroup<DiskImage>>>,
     pub authority: Arc<FileAuthority>,
+    pub creations: Vec<Arc<AtomicUsize>>,
     identities: Vec<Vec<u8>>,
 }
 
@@ -48,20 +53,41 @@ impl Session {
             groups: vec![None; 4],
             authority,
             identities: (1..=4).map(|id| vec![id]).collect(),
+            creations: (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect(),
         };
-        for config in cluster::configurations(root) {
-            session.nodes.push(cluster::start(config).await);
-        }
-        for index in 0..3 {
+        for (index, config) in cluster::configurations(root).into_iter().enumerate() {
             session
-                .open(
-                    index,
-                    ControlledOpenMode::BootstrapNew {
-                        voters: VOTERS.into(),
-                    },
-                    1,
-                )
-                .await;
+                .nodes
+                .push(cluster::start(config, session.creations[index].clone()).await);
+        }
+        let mut openings = Vec::new();
+        for index in 0..3 {
+            let node = session.nodes[index].clone();
+            let authority = session.authority.clone();
+            let request = session.open_request(
+                index,
+                ControlledOpenMode::BootstrapNew {
+                    voters: VOTERS.into(),
+                },
+            );
+            let admission = admitted(
+                authority
+                    .admit(session.request(index, 1))
+                    .await
+                    .expect("durably admit bootstrap before native construction"),
+            );
+            openings.push(async move {
+                node.open_controlled_group(request, authority, admission, deadline())
+                    .await
+                    .expect("bootstrap exact three voters concurrently")
+            });
+        }
+        for (index, group) in futures::future::join_all(openings)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            session.groups[index] = Some(group);
         }
         let leader = session.leader().await;
         let membership = session
@@ -83,6 +109,7 @@ impl Session {
             groups: vec![None; 4],
             authority,
             identities: (1..=4).map(|id| vec![id]).collect(),
+            creations: (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect(),
         };
         let catalog = session
             .authority
@@ -100,8 +127,10 @@ impl Session {
                     .map(|proof| proof.target_opened.consumption_id.clone())
             })
             .expect("recover retained target generation identity");
-        for config in cluster::configurations(root) {
-            session.nodes.push(cluster::start(config).await);
+        for (index, config) in cluster::configurations(root).into_iter().enumerate() {
+            session
+                .nodes
+                .push(cluster::start(config, session.creations[index].clone()).await);
         }
         for index in 0..4 {
             let admission = session
@@ -148,26 +177,6 @@ impl Session {
             identity: self.identities[index].clone(),
             mode,
         }
-    }
-
-    pub async fn open(&mut self, index: usize, mode: ControlledOpenMode, boot: u8) {
-        let admission = admitted(
-            self.authority
-                .admit(self.request(index, boot))
-                .await
-                .expect("durable physical startup admission"),
-        );
-        self.groups[index] = Some(
-            self.nodes[index]
-                .open_controlled_group(
-                    self.open_request(index, mode),
-                    self.authority.clone(),
-                    admission,
-                    deadline(),
-                )
-                .await
-                .expect("open controlled group"),
-        );
     }
 
     pub fn group(&self, index: usize) -> &ControlledGroup<DiskImage> {
@@ -286,6 +295,7 @@ impl Session {
                 .await
                 .expect("durably open consumed target once"),
         );
+        assert!(self.nodes[3].create_group(GROUP, &[4]).await.is_err(), "legacy create_group cannot initialize an already opened controlled learner as a singleton");
         self.group(leader)
             .add_learner(&executor, self.group(3), deadline())
             .await

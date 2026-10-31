@@ -1,4 +1,6 @@
 //! Native controlled replacement trajectories over real RocksDB, disk FSM and gRPC.
+#[path = "controlled_protocol_support/application_barrier.rs"]
+mod application_barrier;
 #[path = "controlled_protocol_support/binding_gate.rs"]
 mod binding_gate;
 #[path = "controlled_protocol_support/cancellation.rs"]
@@ -9,10 +11,18 @@ mod catalog;
 mod cluster;
 #[path = "controlled_protocol_support/crash.rs"]
 mod crash;
+#[path = "controlled_protocol_support/ingress.rs"]
+mod ingress;
+#[path = "controlled_protocol_support/lifecycle.rs"]
+mod lifecycle;
 #[path = "controlled_protocol_support/process.rs"]
 mod process;
+#[path = "controlled_protocol_support/recovery.rs"]
+mod recovery;
 #[path = "controlled_protocol_support/session.rs"]
 mod session;
+#[path = "controlled_protocol_support/terminal_gate.rs"]
+mod terminal_gate;
 
 use authority::StartupAuthorityResult;
 use cluster::{deadline, GROUP};
@@ -32,6 +42,31 @@ async fn departed_begin_waiter_keeps_actual_native_work_owned_until_completion()
     cancellation::run(true).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_opaque_application_blocks_joint_and_caller_timeout_retains_owned_work() {
+    application_barrier::run().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unseeded_fresh_target_cannot_grant_delayed_old_native_vote_over_real_grpc() {
+    ingress::unseeded_target_rejects_old_vote().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_leader_handoff_cleans_only_its_group_and_concurrent_rejoin_opens_once() {
+    lifecycle::run().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_source_regains_leadership_in_new_term_and_rejects_old_sealed_token() {
+    recovery::regained_leader_rejects_old_incarnation().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preadmitted_delayed_source_stays_unknown_and_cannot_recover_old_commit_quorum() {
+    recovery::delayed_source_cannot_restore_old_commit_quorum().await;
+}
+
 #[test]
 fn committed_joint_survives_sigkill_then_same_operation_continues() {
     let root = cluster::scratch("joint-sigkill-");
@@ -39,6 +74,15 @@ fn committed_joint_survives_sigkill_then_same_operation_continues() {
     initial.wait_phase("joint");
     initial.kill();
     process::Process::start(&root, "joint", true).finish();
+}
+
+#[test]
+fn target_opening_sigkill_requires_fresh_admission_and_duplicate_never_constructs_twice() {
+    let root = cluster::scratch("opening-sigkill-");
+    let initial = process::Process::start(&root, "opening", false);
+    initial.wait_phase("opening");
+    initial.kill();
+    process::Process::start(&root, "opening", true).finish();
 }
 
 #[test]
@@ -57,6 +101,15 @@ fn terminal_survives_sigkill_checkpoint_and_log_purge_then_all_current_voters_co
     initial.wait_phase("terminal");
     initial.kill();
     process::Process::start(&root, "terminal", true).finish();
+}
+
+#[test]
+fn native_complete_before_catalog_handoff_sigkill_recovers_sealed_proof_and_cleans_source() {
+    let root = cluster::scratch("terminal-before-handoff-sigkill-");
+    let initial = process::Process::start(&root, "terminal_before_handoff", false);
+    initial.wait_phase("terminal_before_handoff");
+    initial.kill();
+    process::Process::start(&root, "terminal_before_handoff", true).finish();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -129,7 +182,7 @@ async fn learner_installs_typed_ledger_snapshot_and_tail_before_exact_terminal()
     assert!(
         session
             .group(leader)
-            .enter_joint(&old_executor, deadline())
+            .enter_joint(&old_executor, session.group(3), deadline())
             .await
             .is_err(),
         "late joint request from old epoch rejected"
@@ -142,7 +195,7 @@ async fn learner_installs_typed_ledger_snapshot_and_tail_before_exact_terminal()
     cluster::wait_payloads(&session.nodes[3], &[initial, tail]).await;
     session
         .group(leader)
-        .enter_joint(&executor, deadline())
+        .enter_joint(&executor, session.group(3), deadline())
         .await
         .expect("commit guarded joint configuration");
     let joint = session

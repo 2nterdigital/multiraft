@@ -30,7 +30,7 @@ async fn initial(root: &Path, phase: &str) {
     .await;
     session
         .group(leader)
-        .enter_joint(&executor, deadline())
+        .enter_joint(&executor, session.group(3), deadline())
         .await
         .expect("commit joint before crash");
     if phase == "joint" {
@@ -64,6 +64,32 @@ async fn initial(root: &Path, phase: &str) {
     if phase == "uniform" {
         process::persisted_phase(phase);
     }
+    if phase == "terminal_before_handoff" {
+        let authority = std::sync::Arc::new(super::terminal_gate::TerminalCrashAuthority(
+            session.authority.clone(),
+        ));
+        let admission = super::admitted(
+            session
+                .authority
+                .admit(session.request(leader, 1))
+                .await
+                .expect("read consumed source-leader startup receipt"),
+        );
+        let source = session.nodes[leader]
+            .open_controlled_group(
+                session.open_request(leader, multiraft_net::ControlledOpenMode::Recover),
+                authority,
+                admission,
+                deadline(),
+            )
+            .await
+            .expect("attach handoff gate at actual public authority seam");
+        source
+            .complete(&executor, session.group(3), deadline())
+            .await
+            .expect("child must be killed before handoff can return");
+        panic!("terminal handoff crash gate was not reached");
+    }
     assert_eq!(phase, "terminal");
     session.authority.lose_next_handoff_reply();
     let terminal = session
@@ -91,7 +117,7 @@ async fn initial(root: &Path, phase: &str) {
 }
 
 async fn recover(root: &Path, phase: &str) {
-    let session = Session::recover(root).await;
+    let mut session = Session::recover(root).await;
     let leader = session.leader().await;
     let catalog = session
         .authority
@@ -114,12 +140,16 @@ async fn recover(root: &Path, phase: &str) {
         session.groups[(source - 1) as usize].is_none(),
         "fresh source startup denied across active or terminal fence"
     );
-    if phase == "terminal" {
+    if phase == "terminal" || phase == "terminal_before_handoff" {
         assert!(
             record.terminal.is_some(),
             "terminal survives replay/checkpoint/purge"
         );
-        assert!(catalog.active_operation.is_none());
+        assert_eq!(
+            catalog.active_operation.is_some(),
+            phase == "terminal_before_handoff",
+            "crash boundary distinguishes native Complete from catalog handoff"
+        );
         assert!(
             session
                 .group(leader)
@@ -128,6 +158,43 @@ async fn recover(root: &Path, phase: &str) {
                 .is_err(),
             "terminal cannot reactivate after replay"
         );
+        let terminal = session
+            .group(leader)
+            .reconcile_terminal(specification.operation, deadline())
+            .await
+            .expect(
+                "recover sealed terminal without lost executor token and reconcile real handoff",
+            );
+        assert_eq!(Some(terminal.proof()), record.terminal.as_ref());
+        let reconciled = session
+            .authority
+            .read(GROUP)
+            .await
+            .expect("read atomic external retirement after crash reconciliation");
+        assert!(reconciled.active_operation.is_none());
+        assert!(reconciled
+            .completed
+            .iter()
+            .any(|proof| proof.native_record.terminal.as_ref() == Some(terminal.proof())));
+        let source_index = (source - 1) as usize;
+        let retired = session.nodes[source_index]
+            .inspect_controlled_group(
+                GROUP,
+                source * 10,
+                vec![source as u8],
+                session.authority.clone(),
+            )
+            .await
+            .expect("inspect old receipt without voting or opening source Core");
+        retired
+            .retire_and_cleanup(&terminal, deadline())
+            .await
+            .expect("recovered sealed proof can actually stop and clean old source generation");
+        assert_eq!(
+            retired.receipt().expect("retained cleanup tombstone").stage,
+            multiraft_store::ControlledGroupStage::Cleaned
+        );
+        session.groups[source_index] = Some(retired);
     } else {
         assert!(
             record.terminal.is_none(),
@@ -164,6 +231,40 @@ async fn recover(root: &Path, phase: &str) {
                 .is_err(),
             "late old executor epoch rejected after recovery"
         );
+        if phase == "opening" {
+            let count = session.creations[3].load(std::sync::atomic::Ordering::SeqCst);
+            let admission = super::admitted(
+                session
+                    .authority
+                    .admit(session.request(3, 1))
+                    .await
+                    .expect("read original crashed opening admission"),
+            );
+            session
+                .group(3)
+                .open_target(specification.operation, admission, deadline())
+                .await
+                .expect("duplicate old open only replays after recovery");
+            assert_eq!(
+                session.creations[3].load(std::sync::atomic::Ordering::SeqCst),
+                count,
+                "opening crash duplicate cannot construct another core"
+            );
+            session
+                .group(leader)
+                .add_learner(&executor, session.group(3), deadline())
+                .await
+                .expect("continue first learner admission after Opening crash");
+            session.nodes[leader]
+                .propose(GROUP, b"snapshot-tail".to_vec())
+                .await
+                .expect("commit suffix after recovered first opening");
+            session
+                .group(leader)
+                .enter_joint(&executor, session.group(3), deadline())
+                .await
+                .expect("target applied barrier precedes resumed joint");
+        }
         session
             .group(leader)
             .finalize_uniform(&executor, deadline())
