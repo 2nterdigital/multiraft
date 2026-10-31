@@ -31,7 +31,9 @@ impl<S: StateMachine> RuntimeShared<S> {
                 outcome_unknown: false,
             });
         }
-        if self.ready.lock().unwrap().contains(&group.group_id) {
+        if matches!(kind, StartupKind::Legacy)
+            && self.ready.lock().unwrap().contains(&group.group_id)
+        {
             return Ok(());
         }
         // One constructor/basis/validator pipeline for both contracts. The
