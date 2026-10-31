@@ -47,6 +47,8 @@ pub struct StartupBinding {
     pub group_id: GroupId,
     pub specification: ReplacementSpec,
     pub source: NodeId,
+    /// Exact old source generation retained for cleanup after retirement.
+    pub source_generation: u64,
     pub target: StartupTargetGeneration,
 }
 
@@ -60,6 +62,8 @@ pub struct StartupBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupTerminalProof {
     pub group_id: GroupId,
+    /// Retired source generation; old terminal evidence cannot clean a later generation.
+    pub source_generation: u64,
     pub native_record: OperationRecord,
     pub committed_membership: StoredMembership,
     pub applied_membership: StoredMembership,

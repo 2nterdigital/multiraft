@@ -59,6 +59,7 @@ fn binding() -> StartupBinding {
             target_generation: 40,
         },
         source: 1,
+        source_generation: 10,
         target: StartupTargetGeneration {
             node_id: 4,
             generation: 40,
@@ -69,6 +70,7 @@ fn binding() -> StartupBinding {
 fn terminal(binding: &StartupBinding) -> StartupTerminalProof {
     StartupTerminalProof {
         group_id: 7,
+        source_generation: binding.source_generation,
         native_record: OperationRecord {
             specification: binding.specification.clone(),
             executor_epoch: 2,
@@ -165,6 +167,7 @@ async fn uncertain_terminal_handoff_reopens_with_atomic_retirement_and_cold_star
     assert_eq!(readback.active_operation, None);
     assert_eq!(readback.authorized, [(2, 20), (3, 30), (4, 40)].into());
     assert_eq!(readback.completed, vec![proof.clone()]);
+    assert_eq!(readback.completed[0].source_generation, 10);
     assert!(
         readback.admissions.contains(&delayed),
         "late physical source open is still tracked; native config provides exclusion"
@@ -225,6 +228,8 @@ async fn effective_only_or_wrong_operation_or_unconsumed_generation_cannot_final
     wrong_operation.native_record.specification.operation.nonce = [8; 16];
     let mut wrong_target = proof.clone();
     wrong_target.target_opened.generation = 41;
+    let mut wrong_source_generation = proof.clone();
+    wrong_source_generation.source_generation = 11;
     let mut no_native_terminal = proof.clone();
     no_native_terminal.native_record.terminal = None;
     let mut wrong_log = proof;
@@ -235,6 +240,7 @@ async fn effective_only_or_wrong_operation_or_unconsumed_generation_cannot_final
         wrong_target,
         wrong_log,
         no_native_terminal,
+        wrong_source_generation,
     ] {
         assert_eq!(
             authority.terminal_handoff(invalid).await.unwrap(),
@@ -313,4 +319,17 @@ async fn bootstrap_provisioning_records_native_identity_once_before_binding() {
     binding.specification.expected_start = actual.clone();
     applied(reopened.bind_active(binding).await.unwrap());
     assert!(reopened.bootstrap_membership(actual).is_err());
+}
+
+#[tokio::test]
+async fn binding_cannot_claim_a_different_source_generation() {
+    let directory = directory();
+    let path = directory.path().join("catalog.json");
+    let authority = provision(&path);
+    let mut forged = binding();
+    forged.source_generation = 11;
+    assert_eq!(
+        authority.bind_active(forged).await.unwrap(),
+        StartupAuthorityResult::Rejected(StartupAuthorityRejection::IdentityConflict)
+    );
 }

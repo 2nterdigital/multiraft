@@ -258,7 +258,7 @@ impl StartupAuthority for FileAuthority {
                     || binding.target.generation != binding.specification.target_generation
                     || !state.consumed_targets.contains(&binding.target)
                     || binding.target.consumption_id.is_empty()
-                    || !catalog.authorized.contains_key(&binding.source)
+                    || catalog.authorized.get(&binding.source) != Some(&binding.source_generation)
                 {
                     return rejected(StartupAuthorityRejection::IdentityConflict);
                 }
@@ -317,7 +317,8 @@ impl StartupAuthority for FileAuthority {
                     proof.applied_log.index() >= id.index()
                         && (proof.applied_log.index() != id.index() || proof.applied_log == *id)
                 });
-                if proof.native_record.specification != binding.specification
+                if proof.source_generation != binding.source_generation
+                    || proof.native_record.specification != binding.specification
                     || proof.applied_membership != *membership
                     || !valid_log
                     || configs != &vec![binding.specification.target_voters.clone()]
