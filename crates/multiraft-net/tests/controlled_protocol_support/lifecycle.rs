@@ -148,9 +148,45 @@ pub async fn run() {
     );
     session
         .group(source)
-        .retire_and_cleanup(&terminal, deadline())
+        .retire(&terminal, deadline())
         .await
-        .expect("actual native stop and resource release precede group cleanup");
+        .expect("retire joins native owners while preserving replica data");
+    assert_eq!(
+        session
+            .group(source)
+            .receipt()
+            .expect("durable local stop receipt")
+            .stage,
+        ControlledGroupStage::Retired
+    );
+    let live_database = root.join(format!("node-{source_id}/fsm-rocksdb/group-7"));
+    assert!(
+        live_database.exists(),
+        "retirement retains the live FSM database"
+    );
+    assert!(
+        checkpoint_workspace.exists(),
+        "retirement retains checkpoints until explicit cleanup"
+    );
+    assert!(
+        session.nodes[source]
+            .with_fsm(GROUP, |_| ())
+            .await
+            .is_none(),
+        "retirement confirms local core stop"
+    );
+    session
+        .group(source)
+        .retire(&terminal, deadline())
+        .await
+        .expect("identical retirement replays without deleting files");
+    assert!(live_database.exists());
+    assert!(checkpoint_workspace.exists());
+    session
+        .group(source)
+        .cleanup(&terminal, deadline())
+        .await
+        .expect("only explicit cleanup deletes the proven retired generation");
     assert_eq!(
         session
             .group(source)
