@@ -20,6 +20,7 @@ impl<S: StateMachine> ControlledGroup<S> {
         let target = target.clone();
         self.node()?
             .controlled_run(self.group, deadline, move |node| async move {
+                this.checked_active()?;
                 let (raft, sm) = node.controlled_parts(this.group)?;
                 let leader = current_leader(&raft, node.node_id).await?;
                 let target_node = target.node()?;
@@ -55,6 +56,15 @@ impl<S: StateMachine> ControlledGroup<S> {
                     group_id: this.group,
                     specification: specification.clone(),
                     source: source[0],
+                    source_generation: *this
+                        .authority
+                        .read(this.group)
+                        .await?
+                        .authorized
+                        .get(&source[0])
+                        .ok_or(ControlledError::Rejected(
+                            "source generation is not authorized",
+                        ))?,
                     target: StartupTargetGeneration {
                         node_id: target_node.node_id,
                         generation: target.generation,
@@ -81,6 +91,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 write_control(
                     &raft,
                     &sm,
+                    leader,
                     NativeControl::Begin {
                         specification,
                         executor_epoch: epoch,
@@ -105,8 +116,10 @@ impl<S: StateMachine> ControlledGroup<S> {
     ) -> Result<ControlledExecutor, ControlledError> {
         let group = self.group;
         let authority = self.authority.clone();
+        let this = self.clone();
         self.node()?
             .controlled_run(group, deadline, move |node| async move {
+                this.checked_active()?;
                 let (raft, sm) = node.controlled_parts(group)?;
                 let leader = current_leader(&raft, node.node_id).await?;
                 if authority
@@ -121,6 +134,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 write_control(
                     &raft,
                     &sm,
+                    leader,
                     NativeControl::Claim {
                         operation,
                         executor_epoch: epoch,
@@ -148,6 +162,7 @@ impl<S: StateMachine> ControlledGroup<S> {
         let target = target.clone();
         self.node()?
             .controlled_run(self.group, deadline, move |node| async move {
+                this.checked_active()?;
                 let (raft, sm) = node.controlled_parts(this.group)?;
                 let record = checked_executor(&raft, &sm, &executor, node.node_id).await?;
                 let target_node = target.node()?;
@@ -229,8 +244,10 @@ impl<S: StateMachine> ControlledGroup<S> {
     ) -> Result<(), ControlledError> {
         let group = self.group;
         let executor = executor.clone();
+        let this = self.clone();
         self.node()?
             .controlled_run(group, deadline, move |node| async move {
+                this.checked_active()?;
                 let (raft, sm) = node.controlled_parts(group)?;
                 let record = checked_executor(&raft, &sm, &executor, node.node_id).await?;
                 let guard = membership_guard(&raft, &executor).await?;
@@ -300,6 +317,7 @@ impl<S: StateMachine> ControlledGroup<S> {
         let executor = executor.clone();
         let target = target.clone();
         self.node()?.controlled_run(self.group, deadline, move |node| async move {
+            this.checked_active()?;
             let (raft, sm) = node.controlled_parts(this.group)?;
             // A terminal retry reads the original immutable proof; it never reopens a target.
             raft.ensure_linearizable(ReadPolicy::ReadIndex).await.map_err(|error| ControlledError::Native(error.to_string()))?;
@@ -327,20 +345,30 @@ impl<S: StateMachine> ControlledGroup<S> {
                 // Authenticate again after the application wait; terminal cannot overtake opening.
                 if target.checked_receipt()?.stage != ControlledGroupStage::Opened { return Err(ControlledError::Rejected("target generation retired during completion")); }
                 let target_open = TargetOpenReceipt { operation: executor.operation, target_node: target_node.node_id, generation: target.generation, applied, receipt: target.identity.clone() };
-                let ledger = write_control(&raft, &sm, NativeControl::Complete { operation: executor.operation, executor_epoch: executor.epoch, target_open }).await?;
+                let ledger = write_control(&raft, &sm, executor.leader, NativeControl::Complete { operation: executor.operation, executor_epoch: executor.epoch, target_open }).await?;
                 record = ledger.current.ok_or(ControlledError::Rejected("native terminal record missing"))?;
             }
             let proof = record.terminal.clone().ok_or(ControlledError::Rejected("native terminal proof missing"))?;
             let old: BTreeSet<_> = record.specification.expected_start.membership().voter_ids().collect();
             let source = *old.difference(&record.specification.target_voters).next().ok_or(ControlledError::Rejected("excluded source missing"))?;
-            let handoff = StartupTerminalProof { group_id: this.group, native_record: record.clone(), committed_membership: proof.configuration.clone(), applied_membership: proof.configuration.clone(), applied_log: proof.barrier, target_opened: StartupTargetGeneration { node_id: proof.target_open.target_node, generation: proof.target_open.generation, consumption_id: proof.target_open.receipt.clone() } };
+            let catalog = this.authority.read(this.group).await?;
+            let source_generation = catalog.active_operation.as_ref().filter(|binding| binding.specification == record.specification).map(|binding| binding.source_generation)
+                .or_else(|| catalog.completed.iter().find(|completed| completed.native_record == record).map(|completed| completed.source_generation))
+                .ok_or(ControlledError::Rejected("source generation proof missing"))?;
+            let handoff = StartupTerminalProof { source_generation, group_id: this.group, native_record: record.clone(), committed_membership: proof.configuration.clone(), applied_membership: proof.configuration.clone(), applied_log: proof.barrier, target_opened: StartupTargetGeneration { node_id: proof.target_open.target_node, generation: proof.target_open.generation, consumption_id: proof.target_open.receipt.clone() } };
             match this.authority.terminal_handoff(handoff.clone()).await? {
                 StartupAuthorityResult::Applied(actual) if actual == handoff => {}
                 StartupAuthorityResult::Unknown if this.authority.read(this.group).await?.completed.contains(&handoff) => {}
                 _ => return Err(ControlledError::Rejected("terminal startup handoff is unconfirmed")),
             }
-            Ok(ControlledTerminal { group: this.group, source, proof, specification: record.specification })
+            Ok(ControlledTerminal { group: this.group, source, source_generation, proof, specification: record.specification })
         }).await
+    }
+    pub(super) fn checked_active(&self) -> Result<(), ControlledError> {
+        if self.checked_receipt()?.stage != ControlledGroupStage::Opened {
+            return Err(ControlledError::Rejected("local generation is not active"));
+        }
+        Ok(())
     }
     pub(super) fn checked_receipt(
         &self,
@@ -410,11 +438,18 @@ async fn membership_guard<S: StateMachine>(
 async fn write_control<S: StateMachine>(
     raft: &Raft<S>,
     sm: &StateMachineStore<S>,
+    leader: openraft::alias::CommittedLeaderIdOf<TypeConfig>,
     command: NativeControl,
 ) -> Result<NativeLedger, ControlledError> {
-    let response = raft
-        .client_write(Request::native_control(command))
+    let (responder, receiver) = openraft::impls::OneshotResponder::new_pair();
+    raft.write(Request::native_control(command))
+        .with_leader(leader)
+        .responder(responder)
         .await
+        .map_err(|error| ControlledError::Native(error.to_string()))?;
+    let response = receiver
+        .await
+        .map_err(|error| ControlledError::Native(error.to_string()))?
         .map_err(|error| ControlledError::Native(error.to_string()))?;
     let result: ControlReply = serde_json::from_slice(&response.data.effects)
         .map_err(|error| ControlledError::Native(error.to_string()))?;

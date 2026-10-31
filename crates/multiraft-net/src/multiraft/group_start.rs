@@ -444,7 +444,12 @@ impl<S: StateMachine> MultiRaft<S> {
 
     /// Keep standby throttle in sync with committed learner membership so every
     /// potential leader throttles dynamically added Standbys after failover.
-    pub(super) fn spawn_standby_throttle_watch(&self, group: GroupId, raft: Raft<S>, throttle: StandbyThrottle) {
+    pub(super) fn spawn_standby_throttle_watch(
+        &self,
+        group: GroupId,
+        raft: Raft<S>,
+        throttle: StandbyThrottle,
+    ) {
         let owner = self.group_owner(group);
         let mut stopping = owner.stopping();
         owner.watchers.spawn(async move {

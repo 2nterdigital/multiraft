@@ -104,7 +104,9 @@ impl<S: StateMachine> MultiRaft<S> {
             .ok_or(ControlledError::Rejected("local core is not running"))?;
         Ok((app.raft.clone(), app.state_machine.clone()))
     }
-    pub(super) fn controlled_db(&self) -> Result<RocksLogDb<TypeConfig>, ControlledError> {
+    pub(in crate::multiraft) fn controlled_db(
+        &self,
+    ) -> Result<RocksLogDb<TypeConfig>, ControlledError> {
         self.rocks_log_db
             .lock()
             .expect("Raft log owner lock poisoned")

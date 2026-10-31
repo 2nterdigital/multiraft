@@ -14,7 +14,10 @@ impl<S: StateMachine> ControlledGroup<S> {
         let terminal = terminal.clone();
         self.node()?
             .controlled_run(self.group, deadline, move |node| async move {
-                if terminal.group != this.group || terminal.source != node.node_id {
+                if terminal.group != this.group
+                    || terminal.source != node.node_id
+                    || terminal.source_generation != this.generation
+                {
                     return Err(ControlledError::Rejected(
                         "terminal does not exclude this local replica",
                     ));

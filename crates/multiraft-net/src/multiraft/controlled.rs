@@ -71,6 +71,7 @@ pub struct ControlledExecutor {
 pub struct ControlledTerminal {
     group: GroupId,
     source: NodeId,
+    source_generation: u64,
     proof: TerminalProof,
     specification: ReplacementSpec,
 }
@@ -125,6 +126,45 @@ impl<S: StateMachine> ControlledGroup<S> {
             identity: request.identity.clone(),
             authority,
         }
+    }
+    /// Observe the durable generation receipt without establishing consensus authority.
+    pub fn receipt(&self) -> Result<multiraft_store::ControlledGroupReceipt, ControlledError> {
+        self.checked_receipt()
+    }
+    /// Read this replica's durable-applied ledger; this observation may be stale.
+    pub async fn local_ledger(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<NativeLedger, ControlledError> {
+        let this = self.clone();
+        self.node()?
+            .controlled_run(self.group, deadline, move |node| async move {
+                this.checked_active()?;
+                let (_, sm) = node.controlled_parts(this.group)?;
+                Ok(sm.controlled_ledger().await?)
+            })
+            .await
+    }
+    /// Consume this reserved target using its exact durable identity and operation binding.
+    pub async fn open_target(
+        &self,
+        operation: OperationId,
+        admission: StartupAdmission,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, ControlledError> {
+        self.node()?
+            .open_controlled_group(
+                ControlledOpen {
+                    group_id: self.group,
+                    generation: self.generation,
+                    identity: self.identity.clone(),
+                    mode: ControlledOpenMode::Target { operation },
+                },
+                self.authority.clone(),
+                admission,
+                deadline,
+            )
+            .await
     }
     /// Read the durable ledger after a new native ReadIndex confirmation.
     pub async fn ledger(
