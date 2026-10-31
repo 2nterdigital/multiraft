@@ -153,6 +153,9 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
         match groups.get(&req.group_id) {
             Some(g) => (g.raft.clone(), g.state_machine.clone()),
             None => {
+                if req.path == super::controlled_append::PATH {
+                    return Err(Status::unavailable("controlled group is not open"));
+                }
                 let payload = encode::<Result<(), typ::RaftError>>(Err(typ::RaftError::Fatal(
                     openraft::error::Fatal::Stopped,
                 )));
@@ -163,6 +166,9 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
 
     let res = match req.path.as_str() {
         "/raft/append" => api::append(&raft, &req.payload).await,
+        super::controlled_append::PATH => {
+            super::controlled_append::receive(&raft, &req.payload).await?
+        }
         "/raft/snapshot" => {
             // Native storage errors are fatal, including WouldBlock. Refuse peer
             // input here, before Core/SM dispatch, while startup proof is pending.

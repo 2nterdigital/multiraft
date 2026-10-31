@@ -176,6 +176,38 @@ async fn completion_requires_exact_applied_uniform_and_survives_checkpoint_witho
         record.executor_epoch, 1,
         "terminal cannot acquire a new executor"
     );
+    let mut next = specification.clone();
+    next.operation = OperationId {
+        sequence: 2,
+        nonce: [11; 16],
+    };
+    next.expected_start = record.terminal.unwrap().configuration;
+    next.target_voters = BTreeSet::from([1, 4, 5]);
+    apply(
+        &mut restored,
+        9,
+        EntryPayload::Normal(Request::native_control(NativeControl::Begin {
+            specification: next.clone(),
+            executor_epoch: 1,
+        })),
+    )
+    .await;
+    apply(
+        &mut restored,
+        10,
+        EntryPayload::Normal(Request::native_control(NativeControl::Begin {
+            specification,
+            executor_epoch: 1,
+        })),
+    )
+    .await;
+    let ledger = restored.controlled_ledger().await.unwrap();
+    assert_eq!(ledger.high_water, 2);
+    assert_eq!(
+        ledger.current.unwrap().specification,
+        next,
+        "terminal handoff permits next operation but rejects old operation resurrection"
+    );
 }
 impl StateMachine for Disk {
     type Error = io::Error;
@@ -326,5 +358,26 @@ async fn operation_arguments_and_executor_epoch_survive_restart() {
     assert_eq!(
         record.executor_epoch, 2,
         "old executor cannot reclaim operation"
+    );
+}
+
+#[tokio::test]
+async fn whole_image_state_machine_refuses_typed_native_control() {
+    let mut store = StateMachineStore::new(7, multiraft_fsm::CounterFsm::default());
+    let entry = Entry {
+        log_id: id(0),
+        payload: EntryPayload::Normal(Request::native_control(NativeControl::Claim {
+            operation: OperationId {
+                sequence: 1,
+                nonce: [1; 16],
+            },
+            executor_epoch: 1,
+        })),
+    };
+    let result = store.apply(stream::iter([Ok((entry, None))])).await;
+    assert_eq!(
+        result.unwrap_err().kind(),
+        io::ErrorKind::Unsupported,
+        "unsupported whole-image mode must reject before application dispatch"
     );
 }

@@ -1,5 +1,6 @@
 //! Deterministic native transport timing seams. No native Raft runtime or probes.
 use super::*;
+use crate::encode;
 use crate::grpc::proto::raft_service_server::{RaftService, RaftServiceServer};
 use crate::grpc::proto::{RaftRequest, RaftResponse};
 use openraft::alias::{SnapshotMetaOf, SnapshotOf};

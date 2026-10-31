@@ -10,6 +10,7 @@
 mod api;
 pub mod application_rpc;
 mod conn_metrics;
+pub mod controlled_startup;
 mod election_source;
 mod fsm_factory;
 mod group_control;
@@ -84,6 +85,10 @@ pub use multiraft::SharedFabric;
 pub use multiraft::{
     CompactionProgress, CompactionRejection, CompactionSubmission, DurableSnapshotObservation,
     LocalStorageStatus, NATIVE_SNAPSHOT_COMPACTION_CONTRACT,
+};
+pub use multiraft::{
+    ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,
+    ControlledTerminal,
 };
 pub use multiraft_core::ObservationClosed;
 pub use network::GrpcNetworkFactory;
