@@ -42,3 +42,11 @@ pub use status::{ShutdownReport, SlotStatus};
 
 mod transport;
 pub use transport::{SlotTransportConfig, SlotTransportNode};
+
+mod strict_manifest;
+mod strict_startup;
+pub use status::{SlotGroupObservation, SlotObservedGroup};
+pub use strict_startup::{
+    SlotLocalIdentity, SlotStartupDisposition, StrictSlotStartup, TrustedSlotDirectory,
+    SLOT_PROTOCOL_VERSION,
+};

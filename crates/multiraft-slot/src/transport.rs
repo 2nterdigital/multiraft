@@ -20,7 +20,10 @@ pub struct SlotTransportConfig {
 }
 impl SlotTransportConfig {
     pub fn validate(&self, layout: &ClusterLayout) -> Result<(), RuntimeError> {
-        if self.nodes.len() != layout.nodes().len()
+        self.validate_nodes(layout.nodes())
+    }
+    pub(crate) fn validate_nodes(&self, nodes: &[crate::NodeAddress]) -> Result<(), RuntimeError> {
+        if self.nodes.len() != nodes.len()
             || self.raft_bind.port() == 0
             || self.application_rpc_bind.port() == 0
         {
@@ -41,7 +44,7 @@ impl SlotTransportConfig {
                     )
                 })
                 .collect::<Vec<_>>();
-            multiraft_core::validate_dial_catalog(&peers, layout.nodes().iter().map(|n| n.node_id))
+            multiraft_core::validate_dial_catalog(&peers, nodes.iter().map(|n| n.node_id))
                 .map_err(|_| RuntimeError::InvalidConfig)?;
         }
         Ok(())
