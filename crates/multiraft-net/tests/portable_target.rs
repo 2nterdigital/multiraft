@@ -142,7 +142,7 @@ async fn encoded_scope_rejection_cannot_construct_target_and_real_port_completes
     let request = NativeTargetRequest {
         scope: scope.clone(),
         command: NativeTargetCommand::StartSeed {
-            header: wrong_vote,
+            header: Box::new(wrong_vote),
             admission: admission.clone(),
         },
     };

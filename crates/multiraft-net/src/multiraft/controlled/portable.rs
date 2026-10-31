@@ -58,7 +58,7 @@ pub enum NativeTargetCommand {
         barrier: Option<LogId>,
     },
     StartSeed {
-        header: NativeSeedHeader,
+        header: Box<NativeSeedHeader>,
         admission: StartupAdmission,
     },
     SeedChunk {

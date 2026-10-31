@@ -157,7 +157,7 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                 Some(self.observe(configuration.clone(), *barrier).await?),
             )),
             NativeTargetCommand::StartSeed { header, admission } => {
-                self.start(request.scope.clone(), header.clone(), admission.clone())
+                self.start(request.scope.clone(), (**header).clone(), admission.clone())
                     .await
             }
             NativeTargetCommand::SeedChunk { sequence, chunk } => {
@@ -182,11 +182,23 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                 if *sequence != state.next {
                     return Err(ControlledError::Rejected("seed chunk sequence mismatch"));
                 }
-                state
-                    .sender
-                    .send(Ok(chunk.clone()))
-                    .await
-                    .map_err(|_| ControlledError::Rejected("seed receiver closed"))?;
+                if state.sender.send(Ok(chunk.clone())).await.is_err() {
+                    let outcome = state.outcome.clone();
+                    let changed = state.changed.clone();
+                    loop {
+                        let notified = changed.notified();
+                        let result = outcome.lock().expect("seed outcome lock poisoned").clone();
+                        if let Some(result) = result {
+                            result.map_err(ControlledError::Native)?;
+                            break;
+                        }
+                        notified.await;
+                    }
+                    return Ok((
+                        NativeTargetOutcome::Durable,
+                        Some(self.observe(None, None).await?),
+                    ));
+                }
                 state.next += 1;
                 state.last = Some((*sequence, bytes));
                 Ok((NativeTargetOutcome::InProgress, None))
@@ -365,20 +377,33 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
             });
         }
         let target = self.target.clone();
-        self.target.node()?.controlled_run(self.identity.group, tokio::time::Instant::now() + Duration::from_secs(120), move |node| async move {
-            let (raft, mut sm) = node.controlled_parts(target.group)?;
-            let mut stopping = node.group_owner(target.group).stopping();
-            loop {
-                target.checked_active()?;
-                if *stopping.borrow_and_update() || raft.metrics().borrow_watched().running_state.is_err() { return Err(ControlledError::Closed); }
-                let (applied, actual) = sm.applied_state().await.map_err(|error| ControlledError::Native(error.to_string()))?;
-                let record = sm.controlled_ledger().await?.current;
-                if configuration.as_ref().is_none_or(|configuration| actual == *configuration && applied.is_some_and(|applied| barrier.is_none_or(|floor| super::super::seed::covers(applied, floor)))) {
-                    return Ok(NativeTargetObservation { stage, configuration: Some(actual), applied, record });
+        let node = self.target.node()?;
+        let owner = node.group_owner(target.group);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        // Reads must remain owned for cleanup, but cannot acquire the actor serial lock:
+        // this target can itself be the source leader executing Complete through a local port.
+        if !owner.watchers.spawn(async move {
+            let result = async {
+                let (raft, mut sm) = node.controlled_parts(target.group)?;
+                let mut stopping = node.group_owner(target.group).stopping();
+                loop {
+                    target.checked_active()?;
+                    if *stopping.borrow_and_update() || raft.metrics().borrow_watched().running_state.is_err() { return Err(ControlledError::Closed); }
+                    let (applied, actual) = sm.applied_state().await.map_err(|error| ControlledError::Native(error.to_string()))?;
+                    let record = sm.controlled_ledger().await?.current;
+                    if configuration.as_ref().is_none_or(|configuration| actual == *configuration && applied.is_some_and(|applied| barrier.is_none_or(|floor| super::super::seed::covers(applied, floor)))) {
+                        target.checked_active()?;
+                        return Ok(NativeTargetObservation { stage, configuration: Some(actual), applied, record });
+                    }
+                    if configuration.as_ref().is_some_and(|wanted| actual.log_id() >= wanted.log_id() && actual != *wanted) {
+                        return Err(ControlledError::Rejected("target applied a different configuration"));
+                    }
+                    tokio::select! { _ = stopping.changed() => return Err(ControlledError::Closed), _ = tokio::time::sleep(Duration::from_millis(20)) => {} }
                 }
-                tokio::select! { _ = stopping.changed() => return Err(ControlledError::Closed), _ = tokio::time::sleep(Duration::from_millis(20)) => {} }
-            }
-        }).await
+            }.await;
+            let _ = sender.send(result);
+        }) { return Err(ControlledError::Closed); }
+        receiver.await.map_err(|_| ControlledError::Closed)?
     }
 }
 impl<S: StateMachine> NativeTargetTransport for NativeTargetEndpoint<S> {

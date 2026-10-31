@@ -191,6 +191,11 @@ impl<S: StateMachine> ControlledGroup<S> {
         admission: StartupAdmission,
         deadline: tokio::time::Instant,
     ) -> Result<Self, ControlledError> {
+        if seed.fingerprint != self.node()?.config.raft_transport_fingerprint {
+            return Err(ControlledError::Rejected(
+                "seed transport domain does not match the target",
+            ));
+        }
         let port = self.target_port(seed.specification.clone())?;
         port.install_seed(seed, admission, deadline).await?;
         Ok(self.clone())

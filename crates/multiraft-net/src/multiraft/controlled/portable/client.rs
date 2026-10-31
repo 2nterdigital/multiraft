@@ -149,7 +149,10 @@ impl SourceTargetPort {
                 let start = port
                     .request(
                         scope.clone(),
-                        NativeTargetCommand::StartSeed { header, admission },
+                        NativeTargetCommand::StartSeed {
+                            header: Box::new(header),
+                            admission,
+                        },
                     )
                     .await?;
                 if start.outcome == NativeTargetOutcome::Durable {
@@ -165,11 +168,16 @@ impl SourceTargetPort {
                         .ok_or(ControlledError::Rejected("source stream incomplete"))?
                         .map_err(ControlledError::Native)?;
                     let done = chunk.is_none();
-                    port.request(
-                        scope.clone(),
-                        NativeTargetCommand::SeedChunk { sequence, chunk },
-                    )
-                    .await?;
+                    let response = port
+                        .request(
+                            scope.clone(),
+                            NativeTargetCommand::SeedChunk { sequence, chunk },
+                        )
+                        .await?;
+                    if response.outcome == NativeTargetOutcome::Durable {
+                        port.validate_install_reply(&response)?;
+                        return Ok(());
+                    }
                     sequence += 1;
                     if done {
                         break;
