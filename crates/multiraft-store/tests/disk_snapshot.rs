@@ -41,6 +41,7 @@ fn options(format: &[u8]) -> DiskFsmOptions {
 /// Sum plus one incompressible blob row per entry, all in RocksDB.
 struct DiskBlobs {
     db: DiskFsmDb,
+    workspace_ready: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl DiskBlobs {
@@ -50,6 +51,7 @@ impl DiskBlobs {
     fn open_as(path: &Path, format: &[u8]) -> Self {
         Self {
             db: DiskFsmDb::open(path, GROUP, options(format)).unwrap(),
+            workspace_ready: None,
         }
     }
     fn sum(&self) -> u64 {
@@ -111,6 +113,9 @@ impl DiskState for DiskBlobs {
         Ok(ApplyOut::default())
     }
     fn snapshot_workspace(&self) -> io::Result<PathBuf> {
+        if let Some(ready) = &self.workspace_ready {
+            ready.notify_one();
+        }
         self.db.snapshot_workspace()
     }
     fn checkpoint(&self, dir: &Path) -> io::Result<()> {
@@ -122,6 +127,58 @@ impl DiskState for DiskBlobs {
     fn install_checkpoint(&mut self, dir: &Path) -> io::Result<()> {
         self.db.install_checkpoint(dir)
     }
+}
+
+#[test]
+fn cancelled_begin_keeps_blocking_work_and_cleanup_inside_quiescence() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let source_root = scratch();
+            let (_source, _meta, manifest) = leader(source_root.path(), 0).await;
+            let root = scratch();
+            let notice = Arc::new(tokio::sync::Notify::new());
+            let mut fsm = DiskBlobs::open(&path(root.path()));
+            fsm.workspace_ready = Some(notice.clone());
+            let receiver = store(root.path(), fsm);
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let entered_child = entered.clone();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered_child.notify_one();
+                let _ = blocked.recv();
+            });
+            entered.notified().await;
+            let mut begin = Box::pin(receiver.receive_disk_chunk(DiskChunk::Begin {
+                transfer: 1,
+                manifest,
+            }));
+            assert!(futures::poll!(begin.as_mut()).is_pending());
+            notice.notified().await;
+            drop(begin);
+            receiver.close_native_intake();
+            let mut quiescent = Box::pin(receiver.wait_native_quiescent());
+            let retained = futures::poll!(quiescent.as_mut()).is_pending();
+            release.send(()).unwrap();
+            assert!(
+                retained,
+                "quiescence cannot pass while cancelled Begin still owns queued blocking work"
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), quiescent)
+                .await
+                .unwrap();
+            blocker.await.unwrap();
+            let workspace = DiskFsmDb::workspace_path(&path(root.path())).unwrap();
+            std::fs::remove_dir_all(&workspace).unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(
+                !workspace.exists(),
+                "completed quiescence prevents late staging resurrection"
+            );
+        });
 }
 
 fn log_id(index: u64) -> LogId {

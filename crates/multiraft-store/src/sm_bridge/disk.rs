@@ -6,6 +6,7 @@ use openraft::storage::{RaftLogReader, RaftLogStorage};
 use serde::{Deserialize, Serialize};
 
 mod checkpoint;
+mod cleanup;
 mod control;
 pub use checkpoint::ControlledCheckpointState;
 mod install;
@@ -52,6 +53,7 @@ pub(super) struct DiskRuntime {
     /// Serializes chunk writes and verification, so a retried chunk waits for
     /// its first delivery instead of racing it.
     pub(super) receiving: Arc<tokio::sync::Mutex<()>>,
+    pub(super) cleanup: Arc<cleanup::CleanupWork>,
 }
 
 pub(super) fn unsupported(operation: &str) -> io::Error {

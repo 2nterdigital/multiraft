@@ -48,7 +48,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             *slot = Some(incoming);
         } else {
             drop(slot);
-            discard(incoming);
+            self.discard(incoming);
         }
     }
 
@@ -56,49 +56,53 @@ impl<S: StateMachine> StateMachineStore<S> {
     /// `Begin` replaces any unfinished transfer. Errors are refusals.
     pub async fn receive_disk_chunk(&self, chunk: DiskChunk) -> io::Result<()> {
         self.require_disk()?;
-        match chunk {
-            DiskChunk::Begin { transfer, manifest } => {
-                let _receiving = self.disk_rt.receiving.lock().await;
-                if self
-                    .disk_rt
-                    .incoming
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|incoming| incoming.awaiting_install(VERIFIED_HOLD))
-                {
-                    // Replacing it would make the pending install fail fatally.
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "a verified disk snapshot is awaiting install",
-                    ));
+        let receiving = self.disk_rt.receiving.clone().lock_owned().await;
+        self.require_disk()?;
+        let store = self.clone();
+        // Register with an already-held gate: cancellation cannot let shutdown
+        // pass a task which has not started polling yet.
+        tokio::spawn(async move {
+            let _receiving = receiving;
+            store.require_disk()?;
+            match chunk {
+                DiskChunk::Begin { transfer, manifest } => {
+                    if store
+                        .disk_rt
+                        .incoming
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|incoming| incoming.awaiting_install(VERIFIED_HOLD))
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "a verified disk snapshot is awaiting install",
+                        ));
+                    }
+                    let workspace = store.disk_workspace().await?;
+                    let group = store.group_id;
+                    let incoming = tokio::task::spawn_blocking(move || {
+                        Incoming::begin(&workspace, group, transfer, manifest)
+                    })
+                    .await
+                    .map_err(io::Error::other)??;
+                    if let Err(error) = store.require_disk() {
+                        store.discard(incoming);
+                        return Err(error);
+                    }
+                    let previous = store.disk_rt.incoming.lock().unwrap().replace(incoming);
+                    if let Some(previous) = previous {
+                        store.discard(previous);
+                    }
+                    Ok(())
                 }
-                let workspace = self.disk_workspace().await?;
-                let group = self.group_id;
-                let incoming = tokio::task::spawn_blocking(move || {
-                    Incoming::begin(&workspace, group, transfer, manifest)
-                })
-                .await
-                .map_err(io::Error::other)??;
-                let previous = self.disk_rt.incoming.lock().unwrap().replace(incoming);
-                if let Some(previous) = previous {
-                    discard(previous);
-                }
-                Ok(())
-            }
-            DiskChunk::Data {
-                transfer,
-                file,
-                offset,
-                bytes,
-                sha256,
-            } => {
-                // Owned task: if the RPC is cancelled (sender deadline), the
-                // write still finishes and puts the transfer back, so the
-                // sender's retry of this chunk is recognized as a duplicate.
-                let store = self.clone();
-                tokio::spawn(async move {
-                    let _receiving = store.disk_rt.receiving.clone().lock_owned().await;
+                DiskChunk::Data {
+                    transfer,
+                    file,
+                    offset,
+                    bytes,
+                    sha256,
+                } => {
                     let mut incoming = store
                         .take_incoming(|incoming| incoming.transfer() == transfer)
                         .ok_or_else(|| invalid("unknown disk snapshot transfer"))?;
@@ -108,21 +112,25 @@ impl<S: StateMachine> StateMachineStore<S> {
                     })
                     .await
                     .map_err(io::Error::other)?;
+                    if let Err(error) = store.require_disk() {
+                        store.discard(incoming);
+                        return Err(error);
+                    }
                     match result {
                         Ok(()) => {
                             store.restore_incoming(incoming);
                             Ok(())
                         }
                         Err(error) => {
-                            discard(incoming);
+                            store.discard(incoming);
                             Err(error)
                         }
                     }
-                })
-                .await
-                .map_err(io::Error::other)?
+                }
             }
-        }
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     /// Transport ingress, before OpenRaft dispatch: the staged transfer for
@@ -157,7 +165,7 @@ impl<S: StateMachine> StateMachineStore<S> {
             .take_incoming(|incoming| incoming.manifest_bytes() == data)
             .ok_or_else(|| invalid("disk snapshot files were not received"))?;
         if !incoming.complete() {
-            discard(incoming);
+            self.discard(incoming);
             return Err(invalid("disk snapshot transfer is incomplete"));
         }
         let record = {
@@ -192,7 +200,7 @@ impl<S: StateMachine> StateMachineStore<S> {
                 Ok(())
             }
             Err(error) => {
-                discard(incoming);
+                self.discard(incoming);
                 Err(error)
             }
         }
@@ -303,12 +311,24 @@ impl<S: StateMachine> StateMachineStore<S> {
     }
 }
 
-/// Drop a staged transfer (removing its directory) off the async workers.
-fn discard(incoming: Incoming) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn_blocking(move || drop(incoming));
+impl<S: StateMachine> StateMachineStore<S> {
+    /// Destruction retains its FSM owner and is included in receive quiescence.
+    fn discard(&self, incoming: Incoming) {
+        let cleanup = self.disk_rt.cleanup.retain();
+        let owner = self.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    drop(incoming);
+                    drop(owner);
+                    drop(cleanup);
+                });
+            }
+            Err(_) => {
+                drop(incoming);
+                drop(owner);
+                drop(cleanup);
+            }
         }
-        Err(_) => drop(incoming),
     }
 }

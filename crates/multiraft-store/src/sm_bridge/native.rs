@@ -146,11 +146,14 @@ impl<S: StateMachine> StateMachineStore<S> {
     pub async fn wait_native_quiescent(&self) {
         let _validation = self.validation.transition.lock().await;
         let _work = self.validation.work.clone().acquire_owned().await;
-        if let Some(native) = &self.native {
-            let _transition = native.transition.lock().await;
-            let _disk = self.disk_rt.transition.lock().await;
-            let _application = self.inner.lock().await;
-        }
+        let _transition = match &self.native {
+            Some(native) => Some(native.transition.lock().await),
+            None => None,
+        };
+        let _disk = self.disk_rt.transition.lock().await;
+        let _receiving = self.disk_rt.receiving.lock().await;
+        self.disk_rt.cleanup.wait().await;
+        let _application = self.inner.lock().await;
     }
 
     pub fn snapshot_capture_refusal(&self) -> Option<CaptureRefusal> {
