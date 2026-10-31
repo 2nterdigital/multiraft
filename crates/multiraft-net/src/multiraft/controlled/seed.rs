@@ -1,8 +1,8 @@
 //! Fresh committed operation checkpoints establish a native vote/log floor before route publication.
 use super::*;
 use multiraft_core::typ::{self, LogId, SnapshotMeta, Vote};
-use multiraft_store::disk_snapshot::ChunkSource;
 use openraft::storage::{RaftLogReader, RaftLogStorage, RaftStateMachine};
+use openraft::vote::RaftLeaderId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +91,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                     fingerprint: node.config.raft_transport_fingerprint,
                     meta: snapshot.meta,
                     manifest,
+                    input: super::seed_stream::SeedInput::local(&node, this.group),
                 })
             })
             .await
@@ -138,10 +139,16 @@ fn validate_anchor<S: StateMachine>(
             "seed operation or generation identity mismatch",
         ));
     }
-    anchor
+    let cut = anchor
         .meta
         .last_log_id
-        .ok_or(ControlledError::Rejected("seed native log floor missing"))
+        .ok_or(ControlledError::Rejected("seed native log floor missing"))?;
+    if anchor.vote.leader_id().to_committed() != cut.leader_id {
+        return Err(ControlledError::Rejected(
+            "seed vote does not identify actual checkpoint leader",
+        ));
+    }
+    Ok(cut)
 }
 
 pub(super) async fn install<S: StateMachine>(
@@ -188,31 +195,39 @@ pub(super) async fn install<S: StateMachine>(
     }
     let (raft, sm) = node.controlled_parts(request.group_id)?;
     let manifest = seed.manifest;
-    let source_manifest = manifest.clone();
     let group = request.group_id;
-    let mut source = tokio::task::spawn_blocking(move || ChunkSource::open(source_manifest, group))
-        .await
-        .map_err(native)??;
+    let mut stream = seed.input.open(manifest.clone(), group).await?;
     let mut stopping = node.group_owner(group).stopping();
     loop {
         if *stopping.borrow_and_update() {
             return Err(ControlledError::Closed);
         }
-        let (returned, chunk) = tokio::task::spawn_blocking(move || {
-            let chunk = source.next_chunk();
-            (source, chunk)
-        })
-        .await
-        .map_err(native)?;
-        source = returned;
-        let Some(chunk) = chunk? else {
-            break;
+        let chunk = tokio::select! {
+            _ = stopping.changed() => return Err(ControlledError::Closed),
+            chunk = tokio::time::timeout(Duration::from_secs(30), stream.recv()) => chunk.map_err(|_| ControlledError::Rejected("seed stream idle timeout"))?,
         };
-        sm.receive_disk_chunk(chunk).await?;
+        match chunk {
+            Some(Ok(Some(chunk))) => {
+                let begin = matches!(
+                    &chunk,
+                    multiraft_store::disk_snapshot::DiskChunk::Begin { .. }
+                );
+                sm.receive_disk_chunk(chunk).await?;
+                if begin {
+                    // Begin owns a fresh nonce staging directory even when transfer ids repeat.
+                    // Join destruction of the superseded directory before accepting file data.
+                    sm.wait_native_quiescent().await;
+                }
+            }
+            Some(Ok(None)) => break,
+            Some(Err(error)) => return Err(ControlledError::Native(error)),
+            None => {
+                return Err(ControlledError::Rejected(
+                    "seed stream ended without completion",
+                ))
+            }
+        }
     }
-    tokio::task::spawn_blocking(move || drop(source))
-        .await
-        .map_err(native)?;
     sm.verify_disk_snapshot(&anchor.meta, &manifest).await?;
     raft.install_full_snapshot(
         anchor.vote,

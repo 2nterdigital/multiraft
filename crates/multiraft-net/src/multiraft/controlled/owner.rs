@@ -64,7 +64,7 @@ impl<S: StateMachine> MultiRaft<S> {
         F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, ControlledError>> + Send + 'static,
     {
-        self.controlled_run_inner(group, deadline, false, operation)
+        self.controlled_run_inner(group, Some(deadline), false, operation)
             .await
     }
     pub(super) async fn controlled_cleanup_run<T: Send + 'static, F, Fut>(
@@ -77,13 +77,26 @@ impl<S: StateMachine> MultiRaft<S> {
         F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, ControlledError>> + Send + 'static,
     {
-        self.controlled_run_inner(group, deadline, true, operation)
+        self.controlled_run_inner(group, Some(deadline), true, operation)
+            .await
+    }
+    pub(super) async fn controlled_run_completion<T: Send + 'static, F, Fut>(
+        self: &Arc<Self>,
+        group: GroupId,
+        deadline: Option<tokio::time::Instant>,
+        operation: F,
+    ) -> Result<T, ControlledError>
+    where
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, ControlledError>> + Send + 'static,
+    {
+        self.controlled_run_inner(group, deadline, false, operation)
             .await
     }
     async fn controlled_run_inner<T: Send + 'static, F, Fut>(
         self: &Arc<Self>,
         group: GroupId,
-        deadline: tokio::time::Instant,
+        deadline: Option<tokio::time::Instant>,
         cleanup: bool,
         operation: F,
     ) -> Result<T, ControlledError>
@@ -92,11 +105,15 @@ impl<S: StateMachine> MultiRaft<S> {
         Fut: Future<Output = Result<T, ControlledError>> + Send + 'static,
     {
         let owner = self.group_owner(group);
-        let guard = tokio::time::timeout_at(deadline, owner.serial.clone().lock_owned())
-            .await
-            .map_err(|_| ControlledError::Deadline {
-                outcome_unknown: false,
-            })?;
+        let locking = owner.serial.clone().lock_owned();
+        let guard = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, locking)
+                .await
+                .map_err(|_| ControlledError::Deadline {
+                    outcome_unknown: false,
+                })?,
+            None => locking.await,
+        };
         if (!cleanup && *owner.stopping().borrow())
             || self
                 .snapshot_rt
@@ -114,12 +131,15 @@ impl<S: StateMachine> MultiRaft<S> {
         }) {
             return Err(ControlledError::Closed);
         }
-        tokio::time::timeout_at(deadline, receiver)
-            .await
-            .map_err(|_| ControlledError::Deadline {
-                outcome_unknown: true,
-            })?
-            .map_err(|_| ControlledError::Closed)?
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, receiver)
+                .await
+                .map_err(|_| ControlledError::Deadline {
+                    outcome_unknown: true,
+                })?,
+            None => receiver.await,
+        }
+        .map_err(|_| ControlledError::Closed)?
     }
     pub(super) fn controlled_parts(
         &self,

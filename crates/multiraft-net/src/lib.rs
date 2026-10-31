@@ -142,3 +142,6 @@ pub use election_source::{
     NativeElectionKind, NativeElectionTiming, SourceRpcFailure, VoteRequestDisposition,
     VoteResponseDisposition,
 };
+
+/// Portable native target transport and untrusted wire protocol.
+pub use multiraft::portable;

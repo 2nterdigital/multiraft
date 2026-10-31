@@ -1,12 +1,13 @@
 //! Membership steps and terminal proof run under one local per-group command owner.
+use super::portable::{NativeTargetStage, SourceTargetPort};
 use super::*;
 use crate::controlled_startup::{StartupAuthorityResult, StartupBinding, StartupTargetGeneration};
-use multiraft_core::{ControlReply, NativeControl, TargetOpenReceipt};
+use multiraft_core::{ControlReply, NativeControl};
 use multiraft_store::ControlledGroupStage;
-use openraft::{storage::RaftStateMachine, vote::RaftLeaderId, MembershipChangeGuard};
+use openraft::{vote::RaftLeaderId, MembershipChangeGuard};
 
 impl<S: StateMachine> ControlledGroup<S> {
-    /// Bind the durable startup fence, then commit immutable native operation arguments.
+    /// Compatibility wrapper through the same authenticated encoded local target port.
     pub async fn begin(
         &self,
         specification: ReplacementSpec,
@@ -14,27 +15,82 @@ impl<S: StateMachine> ControlledGroup<S> {
         target: &Self,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledExecutor, ControlledError> {
+        let port = target.target_port(specification.clone())?;
+        self.begin_with_port(specification, epoch, &port, deadline)
+            .await
+    }
+    async fn compatibility_port(
+        &self,
+        target: &Self,
+        deadline: tokio::time::Instant,
+    ) -> Result<SourceTargetPort, ControlledError> {
+        let record = self
+            .local_ledger(deadline)
+            .await?
+            .current
+            .ok_or(ControlledError::Rejected("no native operation"))?;
+        target.target_port(record.specification)
+    }
+    /// Compatibility learner open through the portable native target boundary.
+    pub async fn add_learner(
+        &self,
+        executor: &ControlledExecutor,
+        target: &Self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ControlledError> {
+        self.add_learner_with_port(
+            executor,
+            &self.compatibility_port(target, deadline).await?,
+            deadline,
+        )
+        .await
+    }
+    /// Compatibility joint step through the portable native application witness.
+    pub async fn enter_joint(
+        &self,
+        executor: &ControlledExecutor,
+        target: &Self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ControlledError> {
+        self.enter_joint_with_port(
+            executor,
+            &self.compatibility_port(target, deadline).await?,
+            deadline,
+        )
+        .await
+    }
+    /// Compatibility completion through the portable native application witness.
+    pub async fn complete(
+        &self,
+        executor: &ControlledExecutor,
+        target: &Self,
+        deadline: tokio::time::Instant,
+    ) -> Result<ControlledTerminal, ControlledError> {
+        self.complete_with_port(
+            executor,
+            &self.compatibility_port(target, deadline).await?,
+            deadline,
+        )
+        .await
+    }
+    /// Bind the durable startup fence, then commit immutable native operation arguments.
+    pub async fn begin_with_port(
+        &self,
+        specification: ReplacementSpec,
+        epoch: u64,
+        target: &SourceTargetPort,
+        deadline: tokio::time::Instant,
+    ) -> Result<ControlledExecutor, ControlledError> {
         let this = self.clone();
-        let target = target.clone();
+        let target = target.with_source_stop(self.node()?.group_owner(self.group).stopping());
         self.node()?
             .controlled_run(self.group, deadline, move |node| async move {
                 this.checked_active()?;
                 let (raft, sm) = node.controlled_parts(this.group)?;
                 let leader = current_leader(&raft, node.node_id).await?;
-                let target_node = target.node()?;
-                if target_node.config.raft_transport_fingerprint
-                    != node.config.raft_transport_fingerprint
-                {
-                    return Err(ControlledError::Rejected(
-                        "target transport domain does not match the source",
-                    ));
-                }
-                let target_receipt = target.checked_receipt()?;
-                if this.group != target.group
-                    || specification.target_generation != target.generation
-                    || target_receipt.stage != ControlledGroupStage::Reserved
-                    || target.target_specification.as_ref() != Some(&specification)
-                {
+                target.validate_source(&node, this.group, &specification)?;
+                let observation = target.observe(None, None).await?;
+                if observation.stage != NativeTargetStage::Reserved {
                     return Err(ControlledError::Rejected(
                         "target is not the reserved replacement generation",
                     ));
@@ -53,7 +109,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                     .difference(&old)
                     .copied()
                     .collect();
-                if source.len() != 1 || added != [target_node.node_id] {
+                if source.len() != 1 || added != [target.identity().node] {
                     return Err(ControlledError::Rejected(
                         "replacement must exchange exactly one voter",
                     ));
@@ -72,9 +128,9 @@ impl<S: StateMachine> ControlledGroup<S> {
                             "source generation is not authorized",
                         ))?,
                     target: StartupTargetGeneration {
-                        node_id: target_node.node_id,
-                        generation: target.generation,
-                        consumption_id: target.identity.clone(),
+                        node_id: target.identity().node,
+                        generation: target.identity().generation,
+                        consumption_id: target.identity().consumption.clone(),
                     },
                 };
                 match this.authority.bind_active(binding.clone()).await? {
@@ -157,47 +213,22 @@ impl<S: StateMachine> ControlledGroup<S> {
     }
 
     /// Append one guarded learner membership after the target core has durably opened.
-    pub async fn add_learner(
+    pub async fn add_learner_with_port(
         &self,
         executor: &ControlledExecutor,
-        target: &Self,
+        target: &SourceTargetPort,
         deadline: tokio::time::Instant,
     ) -> Result<(), ControlledError> {
         let this = self.clone();
         let executor = executor.clone();
-        let target = target.clone();
+        let target = target.with_source_stop(self.node()?.group_owner(self.group).stopping());
         self.node()?
             .controlled_run(self.group, deadline, move |node| async move {
                 this.checked_active()?;
                 let (raft, sm) = node.controlled_parts(this.group)?;
                 let record = checked_executor(&raft, &sm, &executor, node.node_id).await?;
-                let target_node = target.node()?;
-                if target_node.config.raft_transport_fingerprint
-                    != node.config.raft_transport_fingerprint
-                {
-                    return Err(ControlledError::Rejected(
-                        "target transport domain does not match the source",
-                    ));
-                }
-                let receipt = target.checked_receipt()?;
-                let old: BTreeSet<_> = record
-                    .specification
-                    .expected_start
-                    .membership()
-                    .voter_ids()
-                    .collect();
-                let added: Vec<_> = record
-                    .specification
-                    .target_voters
-                    .difference(&old)
-                    .copied()
-                    .collect();
-                if target.group != this.group
-                    || target.generation != record.specification.target_generation
-                    || added != [target_node.node_id]
-                    || receipt.stage != ControlledGroupStage::Opened
-                    || target_node.raft(target.group).is_none()
-                {
+                target.validate_source(&node, this.group, &record.specification)?;
+                if target.observe(None, None).await?.stage != NativeTargetStage::Opened {
                     return Err(ControlledError::Rejected(
                         "target core is not durably opened",
                     ));
@@ -206,7 +237,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 if guard
                     .effective
                     .membership()
-                    .get_node(&target_node.node_id)
+                    .get_node(&target.identity().node)
                     .is_some()
                 {
                     return Ok(());
@@ -215,12 +246,12 @@ impl<S: StateMachine> ControlledGroup<S> {
                     .config
                     .peers
                     .iter()
-                    .find(|(id, _)| *id == target_node.node_id)
+                    .find(|(id, _)| *id == target.identity().node)
                     .map(|(_, address)| address.to_string())
                     .ok_or(ControlledError::Rejected("target peer address is unknown"))?;
                 raft.change_membership_guarded(
                     ChangeMembers::AddNodes(BTreeMap::from([(
-                        target_node.node_id,
+                        target.identity().node,
                         BasicNode { addr },
                     )])),
                     false,
@@ -234,10 +265,10 @@ impl<S: StateMachine> ControlledGroup<S> {
     }
 
     /// Append exactly the joint step; caller cancellation cannot release its command fence.
-    pub async fn enter_joint(
+    pub async fn enter_joint_with_port(
         &self,
         executor: &ControlledExecutor,
-        target: &Self,
+        target: &SourceTargetPort,
         deadline: tokio::time::Instant,
     ) -> Result<(), ControlledError> {
         self.membership_step(executor, Some(target.clone()), false, deadline)
@@ -254,13 +285,15 @@ impl<S: StateMachine> ControlledGroup<S> {
     async fn membership_step(
         &self,
         executor: &ControlledExecutor,
-        target: Option<Self>,
+        target: Option<SourceTargetPort>,
         finalize: bool,
         deadline: tokio::time::Instant,
     ) -> Result<(), ControlledError> {
         let group = self.group;
         let executor = executor.clone();
         let this = self.clone();
+        let stopping = self.node()?.group_owner(group).stopping();
+        let target = target.map(|target| target.with_source_stop(stopping.clone()));
         self.node()?
             .controlled_run(group, deadline, move |node| async move {
                 this.checked_active()?;
@@ -317,14 +350,8 @@ impl<S: StateMachine> ControlledGroup<S> {
                     let target = target.as_ref().ok_or(ControlledError::Rejected(
                         "target application witness missing",
                     ))?;
-                    target_receipt_at(
-                        &node,
-                        group,
-                        target,
-                        &record.specification,
-                        &guard.committed,
-                    )
-                    .await?;
+                    target.validate_source(&node, group, &record.specification)?;
+                    target.receipt_at(&guard.committed).await?;
                     raft.change_membership_guarded(
                         record.specification.target_voters,
                         false,
@@ -339,15 +366,15 @@ impl<S: StateMachine> ControlledGroup<S> {
     }
 
     /// Verify durable target application, commit terminal proof, then reconcile startup handoff.
-    pub async fn complete(
+    pub async fn complete_with_port(
         &self,
         executor: &ControlledExecutor,
-        target: &Self,
+        target: &SourceTargetPort,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledTerminal, ControlledError> {
         let this = self.clone();
         let executor = executor.clone();
-        let target = target.clone();
+        let target = target.with_source_stop(self.node()?.group_owner(self.group).stopping());
         self.node()?
             .controlled_run(self.group, deadline, move |node| async move {
                 this.checked_active()?;
@@ -379,14 +406,8 @@ impl<S: StateMachine> ControlledGroup<S> {
                             "exact final configuration is not committed",
                         ));
                     }
-                    let target_open = target_receipt_at(
-                        &node,
-                        this.group,
-                        &target,
-                        &record.specification,
-                        &guard.committed,
-                    )
-                    .await?;
+                    target.validate_source(&node, this.group, &record.specification)?;
+                    let target_open = target.receipt_at(&guard.committed).await?;
                     let ledger = write_control(
                         &raft,
                         &sm,
@@ -500,77 +521,5 @@ async fn write_control<S: StateMachine>(
         ControlReply::Rejected(_) => Err(ControlledError::Rejected(
             "native ledger rejected operation or executor",
         )),
-    }
-}
-
-async fn target_receipt_at<S: StateMachine>(
-    source: &Arc<MultiRaft<S>>,
-    group: GroupId,
-    target: &ControlledGroup<S>,
-    specification: &ReplacementSpec,
-    configuration: &multiraft_core::typ::StoredMembership,
-) -> Result<TargetOpenReceipt, ControlledError> {
-    let target_node = target.node()?;
-    if target_node.config.raft_transport_fingerprint != source.config.raft_transport_fingerprint {
-        return Err(ControlledError::Rejected(
-            "target transport domain does not match the source",
-        ));
-    }
-    let old: BTreeSet<_> = specification
-        .expected_start
-        .membership()
-        .voter_ids()
-        .collect();
-    let added: Vec<_> = specification
-        .target_voters
-        .difference(&old)
-        .copied()
-        .collect();
-    if target.group != group
-        || target.generation != specification.target_generation
-        || added != [target_node.node_id]
-        || target.checked_receipt()?.stage != ControlledGroupStage::Opened
-    {
-        return Err(ControlledError::Rejected(
-            "target generation is not durably opened",
-        ));
-    }
-    let (target_raft, mut target_sm) = target_node.controlled_parts(target.group)?;
-    let mut stopping = source.group_owner(group).stopping();
-    let mut target_stopping = target_node.group_owner(target.group).stopping();
-    loop {
-        if *stopping.borrow_and_update()
-            || *target_stopping.borrow_and_update()
-            || target_raft
-                .metrics()
-                .borrow_watched()
-                .running_state
-                .is_err()
-        {
-            return Err(ControlledError::Closed);
-        }
-        let (applied, membership) = target_sm
-            .applied_state()
-            .await
-            .map_err(|error| ControlledError::Native(error.to_string()))?;
-        if membership == *configuration {
-            if let Some(applied) =
-                applied.filter(|applied| Some(*applied) >= *configuration.log_id())
-            {
-                if target.checked_receipt()?.stage != ControlledGroupStage::Opened {
-                    return Err(ControlledError::Rejected(
-                        "target generation retired during application wait",
-                    ));
-                }
-                return Ok(TargetOpenReceipt {
-                    operation: specification.operation,
-                    target_node: target_node.node_id,
-                    generation: target.generation,
-                    applied,
-                    receipt: target.identity.clone(),
-                });
-            }
-        }
-        tokio::select! { _ = stopping.changed() => return Err(ControlledError::Closed), _ = target_stopping.changed() => return Err(ControlledError::Closed), _ = tokio::time::sleep(Duration::from_millis(20)) => {} }
     }
 }
