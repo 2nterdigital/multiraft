@@ -1,6 +1,7 @@
 //! Owned fixed-slot runtime. Handles retain no idle native or listener resources.
 use crate::limits::{Budget, MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES};
 use crate::runtime_error::native;
+mod genesis;
 mod node_config;
 mod observation;
 mod recovery;

@@ -104,6 +104,20 @@ async fn start(
     space: u64,
     compat: u8,
 ) -> (SlotNodeOwner<Counter>, Arc<AtomicU64>, PathBuf) {
+    let (owner, counter, dir) = attempt_start(layout, node, space, compat, deadline()).await;
+    (owner.unwrap(), counter, dir)
+}
+async fn attempt_start(
+    layout: &ClusterLayout,
+    node: u64,
+    space: u64,
+    compat: u8,
+    until: Instant,
+) -> (
+    Result<SlotNodeOwner<Counter>, RuntimeError>,
+    Arc<AtomicU64>,
+    PathBuf,
+) {
     let dir = directory();
     let counter = Arc::new(AtomicU64::new(0));
     let fsm = counter.clone();
@@ -116,10 +130,9 @@ async fn start(
         config,
         startup(layout, node, space, compat),
         move |_| Ok(Counter(fsm.clone())),
-        deadline(),
+        until,
     )
-    .await
-    .unwrap();
+    .await;
     (owner, counter, dir)
 }
 async fn wait_leader(handle: &SlotHandle<Counter>) {
@@ -143,40 +156,28 @@ async fn stop(owner: SlotNodeOwner<Counter>, dir: PathBuf) {
 async fn foreign_space_or_compatibility_cannot_supply_native_quorum() {
     for (space, compat) in [(78, 9), (77, 8)] {
         let layout = layout();
-        let (a, b) = tokio::join!(start(&layout, 1, 77, 9), start(&layout, 2, space, compat));
-        // Two matching voters could form a quorum. A foreign voter must not make that possible.
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        let result =
-            a.0.handle()
-                .propose(b"key", vec![1], Instant::now() + Duration::from_millis(400))
-                .await;
-        assert!(
-            result.is_err(),
-            "foreign space={space} compatibility={compat} supplied native quorum"
+        let until = Instant::now() + Duration::from_millis(700);
+        let (a, b) = tokio::join!(
+            attempt_start(&layout, 1, 77, 9, until),
+            attempt_start(&layout, 2, space, compat, until)
         );
-        assert_eq!(a.1.load(Ordering::Relaxed), 0);
-        assert_eq!(b.1.load(Ordering::Relaxed), 0);
-        for (owner, _, _) in [&a, &b] {
-            let SlotGroupObservation::Present(observed) = owner
-                .handle()
-                .local_group_observation(SlotId(0), deadline())
-                .await
-                .unwrap()
-            else {
-                panic!("local native observation")
-            };
-            let other = if owner.handle().node_id() == 1 { 2 } else { 1 };
-            assert_ne!(
-                observed.membership.flushed_vote.node_id, other,
-                "foreign node obtained a flushed vote"
+        // Foreign votes must not allow the committed/applied genesis barrier to complete.
+        for (node, (owner, counter, dir)) in [(1, a), (2, b)] {
+            assert!(owner.is_err(),"foreign space={space} compatibility={compat} supplied native genesis quorum for node{node}");
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                0,
+                "foreign native quorum applied a command"
             );
+            assert!(!dir.join(".strict-slot.genesis-complete").exists());
+            let addresses = layout.node(node).unwrap();
             assert!(
-                observed.progress.last_applied.is_none(),
-                "foreign node advanced committed/apply progress"
+                TcpListener::bind(addresses.raft).is_ok(),
+                "failure must join native listener cleanup"
             );
+            assert!(TcpListener::bind(addresses.application_rpc).is_ok());
+            std::fs::remove_dir_all(dir).unwrap();
         }
-        stop(a.0, a.2).await;
-        stop(b.0, b.2).await;
     }
 }
 
