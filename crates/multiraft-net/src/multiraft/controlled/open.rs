@@ -14,6 +14,33 @@ impl<S: StateMachine> MultiRaft<S> {
         authority: Arc<dyn StartupAuthority>,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledGroup<S>, ControlledError> {
+        use sha2::Digest;
+        let specification_bytes = serde_json::to_vec(&specification)
+            .map_err(|error| ControlledError::Native(error.to_string()))?;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"multiraft-target-consumption-v1");
+        digest.update((specification_bytes.len() as u64).to_be_bytes());
+        digest.update(specification_bytes);
+        digest.update(&identity);
+        let identity = digest.finalize().to_vec();
+        // Cleaned is a durable barrier: the old owner can perform no later mutation.
+        self.ensure_node_log().await?;
+        if let Some(old) = self.controlled_db()?.lifecycle_receipt(group)? {
+            if old.stage == ControlledGroupStage::Cleaned
+                && old.generation.checked_add(1) == Some(specification.target_generation)
+            {
+                self.controlled_db()?.begin_rejoin(
+                    group,
+                    old.generation,
+                    specification.target_generation,
+                    &identity,
+                )?;
+                self.group_owners
+                    .lock()
+                    .expect("group owner lock poisoned")
+                    .insert(group, Arc::new(GroupOwner::default()));
+            }
+        }
         self.controlled_run(group, deadline, move |node| async move {
             node.controlled_require_storage()?;
             node.ensure_node_log().await?;
@@ -51,6 +78,26 @@ impl<S: StateMachine> MultiRaft<S> {
             ))
         })
         .await
+    }
+
+    /// Attach to an existing receipt for observation or cleanup, without constructing a core.
+    pub async fn inspect_controlled_group(
+        self: &Arc<Self>,
+        group: GroupId,
+        generation: u64,
+        identity: Vec<u8>,
+        authority: Arc<dyn StartupAuthority>,
+    ) -> Result<ControlledGroup<S>, ControlledError> {
+        self.ensure_node_log().await?;
+        let request = ControlledOpen {
+            group_id: group,
+            generation,
+            identity,
+            mode: ControlledOpenMode::Recover,
+        };
+        let handle = ControlledGroup::handle(self, &request, authority);
+        handle.checked_receipt()?;
+        Ok(handle)
     }
 
     /// Open only a durable externally admitted generation. Duplicate target opens only replay.

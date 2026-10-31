@@ -262,7 +262,12 @@ pub(super) async fn open_node_log(
         anyhow::ensure!(database.exists() || persisted.is_empty(), "cannot select RocksDB over persisted FileLog or snapshot history; explicit migration required");
         let db = RocksLogDb::open_with_sync_all(&database, sync_all)?;
         for group in persisted {
-            anyhow::ensure!(db.startup_provenance(group)? == multiraft_core::StartupProvenance::Persisted,
+            let provenance = match db.lifecycle_receipt(group)? {
+                Some(receipt) if matches!(receipt.stage, multiraft_store::ControlledGroupStage::Retired | multiraft_store::ControlledGroupStage::LogsCleaned | multiraft_store::ControlledGroupStage::Cleaned) => continue,
+                Some(receipt) => db.startup_provenance_generation(group, receipt.generation)?,
+                None => db.startup_provenance(group)?,
+            };
+            anyhow::ensure!(provenance == multiraft_core::StartupProvenance::Persisted,
                 "RocksDB group has no local log basis but persisted FileLog or snapshot history exists; explicit migration or recovery required");
         }
         #[cfg(test)]

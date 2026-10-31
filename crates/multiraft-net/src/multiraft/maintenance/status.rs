@@ -38,7 +38,12 @@ pub(super) async fn collect<S: StateMachine>(
         LogInspection::File(directory) => {
             FileLogStoreOf::measure_retained_log_bytes(directory).map(Some)
         }
-        LogInspection::Rocks(db) => db.retained_log_bytes(group).map(Some),
+        LogInspection::Rocks(db) => match db.lifecycle_receipt(group)? {
+            Some(receipt) => db
+                .retained_log_bytes_generation(group, receipt.generation)
+                .map(Some),
+            None => db.retained_log_bytes(group).map(Some),
+        },
     })
     .await
     .map_err(|_| CompactionRejection::StorageFailure)?
