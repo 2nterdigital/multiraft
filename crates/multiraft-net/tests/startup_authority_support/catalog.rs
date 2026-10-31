@@ -26,11 +26,9 @@ pub struct FileAuthority {
     path: PathBuf,
     lose_handoff_reply: AtomicBool,
 }
-struct Lock(PathBuf);
-impl Drop for Lock {
-    fn drop(&mut self) {
-        fs::remove_file(&self.0).expect("release fixture lock");
-    }
+/// Test fixture lock ownership; the kernel releases it even when the process is killed.
+pub struct Lock {
+    _file: File,
 }
 impl FileAuthority {
     pub fn provision(path: &Path, catalog: StartupCatalog) -> Self {
@@ -70,6 +68,8 @@ impl FileAuthority {
             || membership.log_id().is_none()
             || configs.len() != 1
             || configs[0] != voters
+            || configs[0].len() != 3
+            || membership.membership().learner_ids().next().is_some()
         {
             return Err(error(
                 "bootstrap provisioning identity is unavailable or already finalized",
@@ -107,18 +107,19 @@ impl FileAuthority {
     pub fn lose_next_handoff_reply(&self) {
         self.lose_handoff_reply.store(true, Ordering::SeqCst);
     }
-    fn lock(&self) -> Result<Lock, StartupAuthorityError> {
-        let path = self.path.with_extension("lock");
-        // Independent adapter handles serialize through an actual filesystem lock. A crashed
-        // lock holder fails closed: the fixture never expires a lock to bypass admission.
-        for _ in 0..100_000 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Lock(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::thread::yield_now(),
-                Err(e) => return Err(error(e)),
-            }
-        }
-        Err(StartupAuthorityError("fixture lock unavailable".into()))
+    /// Hold the shared catalog lock, also used by the self-spawned crash test.
+    pub fn lock(&self) -> Result<Lock, StartupAuthorityError> {
+        // Keep the sidecar inode stable: unlinking an advisory lock file could let another
+        // opener acquire a different inode while a previous process still owns the lock.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.path.with_extension("lock"))
+            .map_err(error)?;
+        file.lock().map_err(error)?;
+        Ok(Lock { _file: file })
     }
     fn load(&self) -> Result<State, StartupAuthorityError> {
         serde_json::from_slice(&fs::read(&self.path).map_err(error)?).map_err(error)
@@ -247,8 +248,16 @@ impl StartupAuthority for FileAuthority {
                 }
                 let old = catalog.membership.membership().get_joint_config();
                 let target = &binding.specification.target_voters;
-                if old.len() != 1
+                if catalog.membership.log_id().is_none()
+                    || catalog
+                        .membership
+                        .membership()
+                        .learner_ids()
+                        .next()
+                        .is_some()
+                    || old.len() != 1
                     || old[0].len() != 3
+                    || old[0] != catalog.authorized.keys().copied().collect()
                     || target.len() != 3
                     || !old[0].contains(&binding.source)
                     || target.contains(&binding.source)
@@ -258,7 +267,7 @@ impl StartupAuthority for FileAuthority {
                     || binding.target.generation != binding.specification.target_generation
                     || !state.consumed_targets.contains(&binding.target)
                     || binding.target.consumption_id.is_empty()
-                    || !catalog.authorized.contains_key(&binding.source)
+                    || catalog.authorized.get(&binding.source) != Some(&binding.source_generation)
                 {
                     return rejected(StartupAuthorityRejection::IdentityConflict);
                 }
@@ -317,10 +326,12 @@ impl StartupAuthority for FileAuthority {
                     proof.applied_log.index() >= id.index()
                         && (proof.applied_log.index() != id.index() || proof.applied_log == *id)
                 });
-                if proof.native_record.specification != binding.specification
+                if proof.source_generation != binding.source_generation
+                    || proof.native_record.specification != binding.specification
                     || proof.applied_membership != *membership
                     || !valid_log
                     || configs != &vec![binding.specification.target_voters.clone()]
+                    || membership.membership().learner_ids().next().is_some()
                     || proof.target_opened != binding.target
                 {
                     return rejected(StartupAuthorityRejection::InvalidProof);

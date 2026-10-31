@@ -59,6 +59,7 @@ fn binding() -> StartupBinding {
             target_generation: 40,
         },
         source: 1,
+        source_generation: 10,
         target: StartupTargetGeneration {
             node_id: 4,
             generation: 40,
@@ -69,6 +70,7 @@ fn binding() -> StartupBinding {
 fn terminal(binding: &StartupBinding) -> StartupTerminalProof {
     StartupTerminalProof {
         group_id: 7,
+        source_generation: binding.source_generation,
         native_record: OperationRecord {
             specification: binding.specification.clone(),
             executor_epoch: 2,
@@ -165,6 +167,7 @@ async fn uncertain_terminal_handoff_reopens_with_atomic_retirement_and_cold_star
     assert_eq!(readback.active_operation, None);
     assert_eq!(readback.authorized, [(2, 20), (3, 30), (4, 40)].into());
     assert_eq!(readback.completed, vec![proof.clone()]);
+    assert_eq!(readback.completed[0].source_generation, 10);
     assert!(
         readback.admissions.contains(&delayed),
         "late physical source open is still tracked; native config provides exclusion"
@@ -225,6 +228,8 @@ async fn effective_only_or_wrong_operation_or_unconsumed_generation_cannot_final
     wrong_operation.native_record.specification.operation.nonce = [8; 16];
     let mut wrong_target = proof.clone();
     wrong_target.target_opened.generation = 41;
+    let mut wrong_source_generation = proof.clone();
+    wrong_source_generation.source_generation = 11;
     let mut no_native_terminal = proof.clone();
     no_native_terminal.native_record.terminal = None;
     let mut wrong_log = proof;
@@ -235,6 +240,7 @@ async fn effective_only_or_wrong_operation_or_unconsumed_generation_cannot_final
         wrong_target,
         wrong_log,
         no_native_terminal,
+        wrong_source_generation,
     ] {
         assert_eq!(
             authority.terminal_handoff(invalid).await.unwrap(),
@@ -313,4 +319,144 @@ async fn bootstrap_provisioning_records_native_identity_once_before_binding() {
     binding.specification.expected_start = actual.clone();
     applied(reopened.bind_active(binding).await.unwrap());
     assert!(reopened.bootstrap_membership(actual).is_err());
+}
+
+#[tokio::test]
+async fn binding_cannot_claim_a_different_source_generation() {
+    let directory = directory();
+    let path = directory.path().join("catalog.json");
+    let authority = provision(&path);
+    let mut forged = binding();
+    forged.source_generation = 11;
+    assert_eq!(
+        authority.bind_active(forged).await.unwrap(),
+        StartupAuthorityResult::Rejected(StartupAuthorityRejection::IdentityConflict)
+    );
+}
+
+#[test]
+#[ignore = "self-spawned SIGKILL fixture child"]
+fn catalog_lock_child() {
+    let path = std::env::var_os("STARTUP_CRASH_CATALOG").expect("child catalog path");
+    let ready = std::env::var_os("STARTUP_CRASH_READY").expect("child readiness path");
+    let authority = FileAuthority::open(Path::new(&path));
+    let _lock = authority.lock().expect("child acquired catalog lock");
+    let mut pending = std::fs::File::create(Path::new(&path).with_extension("pending")).unwrap();
+    std::io::Write::write_all(&mut pending, b"{partial-unpublished-state").unwrap();
+    pending.sync_all().unwrap();
+    std::fs::write(ready, b"locked").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[tokio::test]
+async fn sigkill_releases_catalog_lock_and_discards_partial_unpublished_state() {
+    let directory = directory();
+    let path = directory.path().join("catalog.json");
+    let ready = directory.path().join("ready");
+    let authority = provision(&path);
+    applied(authority.bind_active(binding()).await.unwrap());
+    let before = authority.read(7).await.unwrap();
+    drop(authority);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "catalog_lock_child", "--ignored"])
+        .env("STARTUP_CRASH_CATALOG", &path)
+        .env("STARTUP_CRASH_READY", &ready)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn lock owner");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let locked = ready.exists();
+    child.kill().expect("SIGKILL child without Drop cleanup");
+    let status = child.wait().unwrap();
+    assert!(
+        locked,
+        "child did not acquire lock before deadline: {status}"
+    );
+    assert!(!status.success());
+    assert_eq!(
+        FileAuthority::open(&path)
+            .read(7)
+            .await
+            .expect("kernel released dead process lock"),
+        before
+    );
+    denied(
+        FileAuthority::open(&path)
+            .admit(request(1, 10, 99))
+            .await
+            .unwrap(),
+    );
+}
+
+fn membership_with_learner(index: u64, voters: &[u64], learner: u64) -> StoredMembership {
+    StoredMembership::new(
+        Some(log_id::<multiraft_core::TypeConfig>(1, 1, index)),
+        Membership::new(
+            vec![voters.iter().copied().collect()],
+            voters
+                .iter()
+                .copied()
+                .chain([learner])
+                .map(|id| (id, BasicNode::default()))
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .expect("valid fixture membership with learner"),
+    )
+}
+
+#[tokio::test]
+async fn binding_requires_initialized_uniform_three_without_learners() {
+    let directory = directory();
+    let initial_path = directory.path().join("initial.json");
+    let authority = provision(&initial_path);
+    let initial = authority.read(7).await.unwrap();
+    for (index, invalid) in [
+        membership_with_learner(1, &[1, 2, 3], 9),
+        StoredMembership::new(None, membership(1, &[1, 2, 3]).membership().clone()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut catalog = initial.clone();
+        catalog.membership = invalid.clone();
+        let path = directory.path().join(format!("invalid-{index}.json"));
+        let authority = FileAuthority::provision(&path, catalog);
+        let mut request = binding();
+        request.specification.expected_start = invalid;
+        authority.consume_target(request.target.clone()).unwrap();
+        assert_eq!(
+            authority.bind_active(request).await.unwrap(),
+            StartupAuthorityResult::Rejected(StartupAuthorityRejection::IdentityConflict)
+        );
+        assert!(authority.read(7).await.unwrap().active_operation.is_none());
+    }
+}
+
+#[tokio::test]
+async fn terminal_handoff_rejects_retired_source_or_other_node_remaining_as_learner() {
+    for learner in [1, 9] {
+        let directory = directory();
+        let path = directory.path().join("catalog.json");
+        let authority = provision(&path);
+        let binding = binding();
+        applied(authority.bind_active(binding.clone()).await.unwrap());
+        let mut proof = terminal(&binding);
+        let invalid = membership_with_learner(8, &[2, 3, 4], learner);
+        proof.committed_membership = invalid.clone();
+        proof.applied_membership = invalid.clone();
+        proof.native_record.terminal.as_mut().unwrap().configuration = invalid;
+        assert_eq!(
+            authority.terminal_handoff(proof).await.unwrap(),
+            StartupAuthorityResult::Rejected(StartupAuthorityRejection::InvalidProof)
+        );
+        let readback = FileAuthority::open(&path).read(7).await.unwrap();
+        assert_eq!(readback.active_operation, Some(binding));
+        assert_eq!(readback.authorized.get(&1), Some(&10));
+        assert!(readback.completed.is_empty());
+    }
 }
