@@ -108,3 +108,124 @@ impl<S: StateMachine> MultiRaft<S> {
         result
     }
 }
+
+impl<S: StateMachine> MultiRaft<S> {
+    /// Called only by the owned creation pipeline; no initialization or glue claim.
+    pub(crate) async fn recover_existing_group(
+        &self,
+        group: GroupId,
+    ) -> Result<(), MultiRaftError> {
+        if self.groups.lock().unwrap().contains_key(&group) {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "strict recovery requires an unopened local Group"
+            )));
+        }
+        self.spawn_persisted_local_group(group).await?;
+        Ok(())
+    }
+
+    pub(super) async fn check_persisted_startup(&self, group: GroupId) -> anyhow::Result<()> {
+        use openraft::{storage::RaftLogStorage, RaftLogReader};
+        anyhow::ensure!(
+            recovery::durable_local_mode(&self.config),
+            "strict recovery requires durable native storage"
+        );
+        anyhow::ensure!(
+            self.log_provenance(group)? == StartupProvenance::Persisted,
+            "strict recovery requires persisted native Group history"
+        );
+        let catalog = SnapshotCatalog::new(self.config.data_dir.join("snapshots"), 1);
+        catalog.startup_provenance(group, self.config.max_snapshot_bytes)?;
+        let snapshot = catalog.describe_native(group, self.config.max_snapshot_bytes)?;
+        let mut log = self.open_native_log(group)?;
+        let committed = log.read_committed().await?;
+        let state = log.get_log_state().await?;
+        let snapshot_membership = snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.meta.last_log_id.is_some()
+                && snapshot
+                    .meta
+                    .last_membership
+                    .membership()
+                    .voter_ids()
+                    .next()
+                    .is_some()
+        });
+        // A saved vote alone is not an initialized Group, even though provenance
+        // correctly records that it must never be overwritten as pristine.
+        // Native snapshot installation may persist a purge boundary and disk
+        // checkpoint without SaveCommitted. Only the post-factory gate can read
+        // that application-owned basis; a purge marker alone never passes it.
+        anyhow::ensure!(
+            committed.is_some() || snapshot_membership || state.last_purged_log_id.is_some(),
+            "strict recovery requires committed native membership or checkpoint"
+        );
+        let vote = log
+            .read_vote()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("strict recovery requires a persisted native vote"))?;
+        let latest = state.last_log_id.max(committed).max(
+            snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.meta.last_log_id),
+        );
+        anyhow::ensure!(
+            latest.is_none_or(|id| vote.leader_id.to_committed() >= *id.committed_leader_id()),
+            "strict recovery vote is older than persisted native history"
+        );
+        if snapshot_membership || state.last_purged_log_id.is_some() {
+            // Generic disk FSM authority is available only after opening the
+            // application. The next gate runs before constructing any Core.
+            return Ok(());
+        }
+        let end = committed.expect("checked committed basis").index;
+        let mut start = 0;
+        while start <= end {
+            let stop = start.saturating_add(256).min(end.saturating_add(1));
+            let entries = log.try_get_log_entries(start..stop).await?;
+            anyhow::ensure!(
+                entries.len() as u64 == stop - start,
+                "strict recovery has an incomplete committed log prefix"
+            );
+            if entries.iter().any(|entry| matches!(&entry.payload,
+                openraft::EntryPayload::Membership(membership) if membership.voter_ids().next().is_some())) {
+                return Ok(());
+            }
+            anyhow::ensure!(stop > start, "strict recovery log index overflow");
+            start = stop;
+        }
+        Err(anyhow::anyhow!(
+            "strict recovery has no committed initialized membership"
+        ))
+    }
+
+    pub(super) async fn check_persisted_fsm_basis(
+        &self,
+        group: GroupId,
+        log: &mut NativeRaftLogStore,
+        sm: &StateMachineStore<S>,
+    ) -> anyhow::Result<()> {
+        use openraft::storage::{RaftLogStorage, RaftStateMachine};
+        let state = log.get_log_state().await?;
+        let Some(purged) = state.last_purged_log_id else {
+            return Ok(());
+        };
+        let snapshot = sm.native_snapshot_info().await?;
+        if snapshot.is_some_and(|snapshot| {
+            snapshot.meta.last_log_id >= Some(purged)
+                && snapshot
+                    .meta
+                    .last_membership
+                    .membership()
+                    .voter_ids()
+                    .next()
+                    .is_some()
+        }) {
+            return Ok(());
+        }
+        let mut sm = sm.clone();
+        let (applied, membership) = sm.applied_state().await?;
+        anyhow::ensure!(applied >= Some(purged) && membership.membership().voter_ids().next().is_some(),
+            "strict recovery Group {group} has purged logs without a complete local FSM/checkpoint basis");
+        Ok(())
+    }
+}
