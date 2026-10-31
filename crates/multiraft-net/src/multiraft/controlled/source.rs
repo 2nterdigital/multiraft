@@ -441,7 +441,7 @@ async fn write_control<S: StateMachine>(
     leader: openraft::alias::CommittedLeaderIdOf<TypeConfig>,
     command: NativeControl,
 ) -> Result<NativeLedger, ControlledError> {
-    let (responder, receiver) = openraft::impls::OneshotResponder::new_pair();
+    let (responder, receiver) = openraft::impls::ProgressResponder::complete_only();
     raft.write(Request::native_control(command))
         .with_leader(leader)
         .responder(responder)
