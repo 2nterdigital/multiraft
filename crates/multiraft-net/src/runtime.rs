@@ -5,6 +5,7 @@
 //! No operation exposes native Raft handles. Commands and effects stay opaque.
 
 mod authority;
+mod carriers;
 mod control;
 mod controlled;
 pub use controlled::{

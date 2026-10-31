@@ -94,6 +94,7 @@ use tokio::sync::Notify;
 mod authority;
 pub use authority::{LocalAuthoritativeMembership, LocalAuthorityError};
 mod application;
+mod carriers;
 mod controlled;
 pub use controlled::{
     ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,

@@ -65,6 +65,15 @@ impl ApplicationRpcOwner {
         handler: Arc<dyn ApplicationRpcHandler>,
         deadline: Instant,
     ) -> Result<(Self, ApplicationRpcHandle), RpcError> {
+        Self::start_with_carrier_scope(config, handler, deadline, None).await
+    }
+    /// Start a transport whose carrier updates must match this actual configured scope.
+    pub async fn start_with_carrier_scope(
+        config: ApplicationRpcConfig,
+        handler: Arc<dyn ApplicationRpcHandler>,
+        deadline: Instant,
+        scope: Option<[u8; 32]>,
+    ) -> Result<(Self, ApplicationRpcHandle), RpcError> {
         validate(&config)?;
         if Instant::now() >= deadline {
             return Err(expired(RpcPhase::Admission, RpcDispatch::NotDispatched));
@@ -96,10 +105,12 @@ impl ApplicationRpcOwner {
             core: Arc::new(Core {
                 node: config.local_node_id,
                 handler,
-                channels: match config.dial_addresses {
-                    Some(peers) => GrpcPeerChannelPool::with_dial_addresses(peers),
-                    None => GrpcPeerChannelPool::new(config.peers),
-                },
+                channels: GrpcPeerChannelPool::with_carrier_config(
+                    config.peers,
+                    config.dial_addresses,
+                    scope,
+                    crate::CarrierService::ApplicationRpc,
+                ),
                 keys: config.metadata_keys,
                 admission: Arc::new(Semaphore::new(config.max_inflight)),
                 accepting: AtomicBool::new(true),
@@ -145,6 +156,7 @@ impl ApplicationRpcOwner {
     }
     pub fn fence(&self) {
         self.shared.core.accepting.store(false, Ordering::Release);
+        self.shared.core.channels.fence_carrier_installs();
     }
     /// Cancellation abandons only this stop wait; origin-runtime cleanup remains retained.
     pub async fn shutdown(self, deadline: Instant) -> Result<(), RpcError> {
@@ -174,6 +186,7 @@ impl Drop for ApplicationRpcOwner {
 impl Shared {
     fn begin_cleanup(self: &Arc<Self>, abnormal: bool) {
         self.core.accepting.store(false, Ordering::Release);
+        self.core.channels.fence_carrier_installs();
         if self.cleaning.swap(true, Ordering::AcqRel) {
             return;
         }

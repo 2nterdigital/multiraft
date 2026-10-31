@@ -1,5 +1,6 @@
 //! Owned, business-neutral application RPC. Separate service from native Raft RPC.
 //! Calls carry opaque operation IDs/bytes/metadata, with one deadline and no retry.
+mod carriers;
 mod error;
 mod metadata;
 mod operation;
