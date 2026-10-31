@@ -416,6 +416,63 @@ async fn controlled_checkpoint_inspection_reads_the_published_database_not_live_
     let manifest =
         multiraft_store::disk_snapshot::DiskManifest::decode(snapshot.snapshot.get_ref(), 7)
             .unwrap();
+    let writable = root.path().join("writable-copy");
+    std::fs::create_dir(&writable).unwrap();
+    let mut original = BTreeMap::new();
+    for file in &manifest.files {
+        original.insert(
+            file.name.clone(),
+            std::fs::read(manifest.source.join(&file.name)).unwrap(),
+        );
+        std::fs::copy(manifest.source.join(&file.name), writable.join(&file.name)).unwrap();
+    }
+    let writer = DiskFsmDb::open(
+        &writable,
+        7,
+        DiskFsmOptions::new(b"controlled-test-v1".to_vec()),
+    )
+    .unwrap();
+    let mut wal_record: serde_json::Value =
+        serde_json::from_slice(&writer.applied_record().unwrap().unwrap()).unwrap();
+    wal_record["control"]["current"]["executor_epoch"] = serde_json::json!(7);
+    writer
+        .commit(
+            WriteBatch::default(),
+            &AppliedState::new(1, 1, serde_json::to_vec(&wal_record).unwrap()),
+        )
+        .unwrap();
+    let mut injected = Vec::new();
+    for entry in std::fs::read_dir(&writable).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|extension| extension == "log") {
+            let destination = manifest.source.join(path.file_name().unwrap());
+            assert!(!original.contains_key(path.file_name().unwrap().to_str().unwrap()));
+            std::fs::copy(&path, &destination).unwrap();
+            injected.push(destination);
+        }
+    }
+    assert!(
+        !injected.is_empty(),
+        "real writable database produced a WAL"
+    );
+    for (name, bytes) in original {
+        assert_eq!(
+            std::fs::read(manifest.source.join(name)).unwrap(),
+            bytes,
+            "all manifest-listed bytes remain unchanged"
+        );
+    }
+    assert!(
+        store
+            .inspect_controlled_checkpoint(&snapshot.meta, snapshot.snapshot.get_ref())
+            .await
+            .is_err(),
+        "undeclared WAL cannot change inspected facts relative to transferred files"
+    );
+    for path in injected {
+        std::fs::remove_file(path).unwrap();
+    }
+    drop(writer);
     let changed = DiskFsmDb::open(
         &manifest.source,
         7,
