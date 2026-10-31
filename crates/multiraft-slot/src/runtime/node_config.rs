@@ -1,5 +1,5 @@
 //! Native configuration invariants for immutable genesis and trusted runtime peers.
-use super::*;
+use crate::{ClusterLayout, NodeId, RuntimeError, SlotLimits, SlotStartupPlan};
 use multiraft_core::{ClusterConfig, LogStorageBackend, NodeRole, SnapshotMode};
 use std::path::PathBuf;
 

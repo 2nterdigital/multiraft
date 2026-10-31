@@ -1,18 +1,17 @@
 //! Owned fixed-slot runtime. Handles retain no idle native or listener resources.
 use crate::limits::{Budget, MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES};
 use crate::runtime_error::native;
-use crate::startup::SlotStartupPlan;
 mod node_config;
 mod observation;
+mod recovery;
 mod start;
 use crate::{
-    ClusterLayout, InflightStatus, NodeId, RuntimeError, ShutdownReport, SlotId, SlotLimits,
-    SlotStatus,
+    ClusterLayout, InflightStatus, NodeId, RuntimeError, ShutdownReport, SlotId, SlotStatus,
 };
 use futures::FutureExt;
 use multiraft_fsm::StateMachine;
 use multiraft_net::{
-    application_rpc::{ApplicationRpcConfig, ApplicationRpcHandle, ApplicationRpcOwner},
+    application_rpc::{ApplicationRpcHandle, ApplicationRpcOwner},
     NodeOwner, RuntimeHandle, StartupReport,
 };
 pub use node_config::SlotNodeConfig;
@@ -28,9 +27,6 @@ use tokio::{
     task::JoinSet,
     time::Instant,
 };
-
-/// Bound for confirming native release after a failed startup.
-const CLEANUP: Duration = Duration::from_secs(60);
 
 /// Application-owned query semantics. Callbacks must be bounded and nonblocking.
 /// Applications validate that command/query payload identity agrees with the routing key.
@@ -90,6 +86,7 @@ pub(crate) struct Shared<S: SlotStateMachine> {
     owners: Mutex<Option<Owners<S>>>,
     accepting: AtomicBool,
     business_enabled: bool,
+    transport_addresses: Option<crate::SlotTransportAddresses>,
     cleaning: AtomicBool,
     pub(crate) budget: Arc<Budget>,
     tasks: Mutex<JoinSet<()>>,
@@ -366,6 +363,16 @@ impl<S: SlotStateMachine> SlotHandle<S> {
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
+    /// Return sockets confirmed by this strict startup, without asserting current reachability.
+    ///
+    /// # Errors
+    /// Returns Closed after fencing, or Unavailable for the legacy startup entry point.
+    pub fn local_transport_addresses(&self) -> Result<crate::SlotTransportAddresses, RuntimeError> {
+        self.shared()?
+            .transport_addresses
+            .clone()
+            .ok_or(RuntimeError::Unavailable)
+    }
     pub fn inflight(&self) -> InflightStatus {
         self.budget.snapshot()
     }
@@ -375,7 +382,7 @@ impl<S: SlotStateMachine> SlotHandle<S> {
             local_recovery_ready: shared.is_some(),
             accepting: shared
                 .as_ref()
-                .is_some_and(|s| s.accepting.load(Ordering::Acquire)),
+                .is_some_and(|s| s.business_enabled && s.accepting.load(Ordering::Acquire)),
             inflight: self.inflight(),
         }
     }

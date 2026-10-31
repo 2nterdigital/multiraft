@@ -3,7 +3,7 @@ use crate::{ClusterLayout, ManifestDigest, NodeAddress, RuntimeError, MAX_NODES}
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// Wire compatibility accepted by this strict Slot entry point.
+/// Strict Slot startup/manifest compatibility; independent from native controlled protocol versions.
 pub const SLOT_PROTOCOL_VERSION: u32 = 2;
 
 /// Startup selection supplied by the application after checking its data-space authority.

@@ -1,6 +1,7 @@
 //! Sample actual local native sources without inferring membership from the frozen layout.
-use super::*;
-use crate::{SlotGroupObservation, SlotObservedGroup};
+use super::{SlotHandle, SlotStateMachine};
+use crate::{RuntimeError, SlotGroupObservation, SlotId, SlotObservedGroup};
+use tokio::time::Instant;
 impl<S: SlotStateMachine> SlotHandle<S> {
     /// Read local memberships and progress; samples are not atomic or authority tokens.
     ///

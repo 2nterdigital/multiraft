@@ -60,3 +60,17 @@ impl SlotTransportConfig {
         }
     }
 }
+
+/// Local sockets confirmed by successful strict startup, separate from advertised peer addresses.
+/// These facts can become stale immediately and do not establish remote reachability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotTransportAddresses {
+    /// Local advertised identity from the supplied directory snapshot.
+    pub advertised: crate::NodeAddress,
+    /// Nonzero native Raft listener socket; a wildcard bind stays a wildcard.
+    pub raft_bind: SocketAddr,
+    /// Nonzero application RPC listener socket, independent from its advertised address.
+    pub application_rpc_bind: SocketAddr,
+    /// Source directory revision used when this owner started.
+    pub directory_version: u64,
+}

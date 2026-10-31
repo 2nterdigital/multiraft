@@ -1,13 +1,29 @@
 //! Startup and listener assembly; owner cleanup remains shared across startup modes.
-use super::*;
-use crate::runtime_error::startup_failure;
-use crate::{SlotManifest, SlotStartupDisposition, StrictSlotStartup};
-use multiraft_net::{GroupConfig, RuntimeConfig, StartupBatch, StartupGroup, StateMachineFactory};
+use super::{Owners, Shared, SlotNodeConfig, SlotNodeOwner, SlotStateMachine};
+use crate::limits::Budget;
+use crate::runtime_error::{native, startup_failure};
+use crate::{RuntimeError, SlotManifest, SlotStartupDisposition, StrictSlotStartup};
+use multiraft_net::{
+    application_rpc::{ApplicationRpcConfig, ApplicationRpcOwner},
+    GroupConfig, NodeOwner, RuntimeConfig, StartupBatch, StartupGroup, StartupReport,
+    StateMachineFactory,
+};
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+use tokio::{sync::watch, task::JoinSet, time::Instant};
+
+/// Bound for confirming native release after a failed startup.
+const CLEANUP: Duration = Duration::from_secs(60);
 
 impl<S: SlotStateMachine> SlotNodeOwner<S> {
     /// Verify or create the slot manifest, start the native node, bring up all
     /// local voter slots with one native `start_groups_with_preference` batch
-    /// (see [`SlotStartupPlan`]), then start the application RPC listener.
+    /// (see [`crate::SlotStartupPlan`]), then start the application RPC listener.
     ///
     /// Returns after local recovery of every voter slot, which is neither
     /// quorum nor leader readiness. The batch's per-group budget is the plan's
@@ -82,6 +98,26 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         let nodes = strict
             .as_ref()
             .map_or_else(|| layout.nodes().to_vec(), |s| s.directory.nodes.clone());
+        let transport_addresses = strict.as_ref().map(|startup| {
+            // Validation guaranteed coverage and nonzero binds before creating the manifest.
+            let advertised = nodes
+                .iter()
+                .find(|n| n.node_id == config.node_id)
+                .expect("strict validation checked local directory coverage")
+                .clone();
+            crate::SlotTransportAddresses {
+                raft_bind: config
+                    .transport
+                    .as_ref()
+                    .map_or(advertised.raft, |t| t.raft_bind),
+                application_rpc_bind: config
+                    .transport
+                    .as_ref()
+                    .map_or(advertised.application_rpc, |t| t.application_rpc_bind),
+                advertised,
+                directory_version: startup.directory.version,
+            }
+        });
         let mut groups = Vec::new();
         for assignment in layout
             .config()
@@ -124,9 +160,21 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             .as_ref()
             .is_some_and(|s| s.disposition == SlotStartupDisposition::RecoverExisting)
         {
-            // Replaced by the persisted-only native admission once that additive API lands.
-            let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
-            return Err(RuntimeError::Unavailable);
+            match super::recovery::recover_sources(
+                &native_owner.handle(),
+                &layout,
+                groups,
+                config.startup.recovery_timeout,
+                deadline,
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                    return Err(error);
+                }
+            }
         } else {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let recovery_timeout = config.startup.recovery_timeout.min(remaining);
@@ -168,6 +216,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             owners: Mutex::new(None),
             accepting: AtomicBool::new(true),
             business_enabled: !candidate,
+            transport_addresses,
             cleaning: AtomicBool::new(false),
             tasks: Mutex::new(JoinSet::new()),
             done: watch::channel(None).0,

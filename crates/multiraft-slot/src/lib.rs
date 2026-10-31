@@ -41,7 +41,7 @@ pub use startup::{SlotStartupPlan, BOOTSTRAP_GRACE_RANGE, MAX_RECOVERY_TIMEOUT};
 pub use status::{ShutdownReport, SlotStatus};
 
 mod transport;
-pub use transport::{SlotTransportConfig, SlotTransportNode};
+pub use transport::{SlotTransportAddresses, SlotTransportConfig, SlotTransportNode};
 
 mod strict_manifest;
 mod strict_startup;
