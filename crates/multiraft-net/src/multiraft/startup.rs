@@ -125,7 +125,6 @@ impl<S: StateMachine> MultiRaft<S> {
     }
 
     pub(super) async fn check_persisted_startup(&self, group: GroupId) -> anyhow::Result<()> {
-        use openraft::{storage::RaftLogStorage, RaftLogReader};
         anyhow::ensure!(
             recovery::durable_local_mode(&self.config),
             "strict recovery requires durable native storage"
@@ -136,6 +135,14 @@ impl<S: StateMachine> MultiRaft<S> {
         );
         let catalog = SnapshotCatalog::new(self.config.data_dir.join("snapshots"), 1);
         catalog.startup_provenance(group, self.config.max_snapshot_bytes)?;
+        self.check_persisted_evidence(group).await
+    }
+
+    // The live probe must not invoke startup_provenance on snapshots: startup
+    // orphan cleanup can delete a generation currently being built by this node.
+    async fn check_persisted_evidence(&self, group: GroupId) -> anyhow::Result<()> {
+        use openraft::{storage::RaftLogStorage, RaftLogReader};
+        let catalog = SnapshotCatalog::new(self.config.data_dir.join("snapshots"), 1);
         let snapshot = catalog.describe_native(group, self.config.max_snapshot_bytes)?;
         let mut log = self.open_native_log(group)?;
         let committed = log.read_committed().await?;
@@ -196,6 +203,49 @@ impl<S: StateMachine> MultiRaft<S> {
         Err(anyhow::anyhow!(
             "strict recovery has no committed initialized membership"
         ))
+    }
+
+    /// Inspect an already owned Group without construction, initialization or
+    /// startup cleanup. A missing basis is retryable by the caller.
+    pub(crate) async fn validate_local_recovery_basis(&self, group: GroupId) -> anyhow::Result<()> {
+        self.ensure_recovery_running(group)?;
+        anyhow::ensure!(
+            recovery::durable_local_mode(&self.config),
+            "local recovery basis requires durable native storage"
+        );
+        let sm = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(&group)
+            .map(|group| group.state_machine.clone())
+            .ok_or(MultiRaftError::UnknownGroup(group))?;
+        // Read native group metadata directly. log_provenance's pristine
+        // migration check can invoke snapshot startup cleanup and is unsuitable
+        // for a live probe. After proving Persisted, open_native_log takes only
+        // its non-mutating existing-namespace path.
+        let db = self.rocks_log_db.lock().unwrap().clone();
+        let provenance = if let Some(db) = db {
+            match db.lifecycle_receipt(group)? {
+                Some(receipt) => db.startup_provenance_generation(group, receipt.generation)?,
+                None => db.startup_provenance(group)?,
+            }
+        } else {
+            anyhow::ensure!(
+                self.config.log_storage_backend == LogStorageBackend::FileLog,
+                "RocksDB log owner has stopped"
+            );
+            FileLogStoreOf::startup_provenance(self.config.data_dir.join(format!("group-{group}")))?
+        };
+        anyhow::ensure!(
+            provenance == StartupProvenance::Persisted,
+            "local recovery basis requires persisted native Group history"
+        );
+        self.check_persisted_evidence(group).await?;
+        let mut log = self.open_native_log(group)?;
+        self.check_persisted_fsm_basis(group, &mut log, &sm).await?;
+        self.ensure_recovery_running(group)?;
+        Ok(())
     }
 
     pub(super) async fn check_persisted_fsm_basis(
