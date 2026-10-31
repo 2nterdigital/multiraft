@@ -417,6 +417,14 @@ where
                     continue;
                 }
 
+                if matches!(&entry.payload, EntryPayload::Normal(request) if request.control.is_some())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "native control requires a disk-backed state machine",
+                    ));
+                }
+
                 if self.native.is_some() {
                     let expected = inner
                         .last_applied_log

@@ -22,7 +22,7 @@ pub use disk_snapshot::{is_disk_snapshot, DiskChunk};
 pub use log_file::FileLogStore;
 pub use log_file::FileLogStreamOptions;
 pub use log_mem::LogStore;
-pub use log_rocks::{RocksLogDb, RocksLogStore};
+pub use log_rocks::{ControlledGroupReceipt, ControlledGroupStage, RocksLogDb, RocksLogStore};
 pub use native_log::NativeRaftLogStore;
 pub use sm_bridge::build_standby_snapshot_async;
 pub use sm_bridge::SmOptions;
