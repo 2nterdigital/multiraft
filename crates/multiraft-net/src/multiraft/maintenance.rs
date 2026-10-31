@@ -134,7 +134,7 @@ impl<S: StateMachine> MultiRaft<S> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let stopping = self.snapshot_rt.stopping.clone();
         let retain = self.config.retain_log_entries;
-        if !self.snapshot_rt.maintenance_tasks.spawn(operation::run(
+        if !self.group_owner(group).maintenance.spawn(operation::run(
             raft, sm, terminal, stopping, retain, deadline, sender,
         )) {
             return Err(CompactionRejection::ShuttingDown);
@@ -184,7 +184,7 @@ impl<S: StateMachine> MultiRaft<S> {
         let node_id = self.node_id;
         let mode = self.config.snapshot_mode;
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        if !self.snapshot_rt.maintenance_tasks.spawn(async move {
+        if !self.group_owner(group).maintenance.spawn(async move {
             let _permit = permit;
             let result = status::collect(node_id, group, mode, raft, sm, inspection, state).await;
             let _ = sender.send(result);

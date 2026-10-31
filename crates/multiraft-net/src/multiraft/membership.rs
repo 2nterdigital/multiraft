@@ -19,6 +19,12 @@ impl<S: StateMachine> MultiRaft<S> {
             )));
         }
 
+        self.ensure_node_log().await?;
+        if self.is_controlled_group(group)? {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "controlled group rejects legacy creation and initialization"
+            )));
+        }
         let is_standby = self.config.role == NodeRole::Standby;
         if !is_standby && !members.contains(&self.node_id) {
             return Err(MultiRaftError::Other(anyhow::anyhow!(

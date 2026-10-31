@@ -1,5 +1,6 @@
 //! Deterministic native transport timing seams. No native Raft runtime or probes.
 use super::*;
+use crate::encode;
 use crate::grpc::proto::raft_service_server::{RaftService, RaftServiceServer};
 use crate::grpc::proto::{RaftRequest, RaftResponse};
 use openraft::alias::{SnapshotMetaOf, SnapshotOf};
@@ -361,6 +362,82 @@ async fn native_cancel_signal_returns_closed_without_releasing_actual_send_slot(
         .await
         .unwrap_err();
     assert!(closed.to_string().contains("native snapshot owner closed"));
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn per_group_send_barrier_retains_cancelled_work_and_preserves_other_groups() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = service(Arc::new(AtomicBool::new(false)), Some(7));
+    let entered = peer.entered.clone();
+    let release = peer.release.clone();
+    let (stop, stopping) = oneshot::channel();
+    let server = tokio::spawn(
+        Server::builder()
+            .add_service(RaftServiceServer::new(peer))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopping.await;
+            }),
+    );
+    let router = GrpcRouter::new(vec![(2, address)], 1);
+    let sending = router.clone();
+    let waiter = tokio::spawn(async move {
+        sending
+            .full_snapshot(
+                2,
+                7,
+                typ::Vote::new_committed(3, 1),
+                snapshot(),
+                std::future::pending(),
+                RPCOption::new(Duration::from_secs(5)),
+            )
+            .await
+    });
+    entered.notified().await;
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    let joining = router.clone();
+    let barrier = tokio::spawn(async move { joining.join_group_sends(7).await });
+    tokio::task::yield_now().await;
+    assert!(
+        !barrier.is_finished(),
+        "group cleanup must await the actual send after caller cancellation"
+    );
+    assert!(
+        router
+            .vote(2, 8, request(), RPCOption::new(Duration::from_secs(1)))
+            .await
+            .unwrap()
+            .vote_granted
+    );
+    release.add_permits(1);
+    barrier.await.unwrap().unwrap();
+    let closed = router
+        .full_snapshot(
+            2,
+            7,
+            typ::Vote::new_committed(3, 1),
+            snapshot(),
+            std::future::pending(),
+            RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+    assert!(closed.to_string().contains("closed"));
+    router
+        .full_snapshot(
+            2,
+            8,
+            typ::Vote::new_committed(3, 1),
+            snapshot(),
+            std::future::pending(),
+            RPCOption::new(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    router.join().await.unwrap();
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
 }

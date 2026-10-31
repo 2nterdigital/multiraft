@@ -78,7 +78,9 @@ pub(super) async fn stream(
         }
     }
     // Release the hard-link lease off the async workers.
-    tokio::task::spawn_blocking(move || drop(source));
+    tokio::task::spawn_blocking(move || drop(source))
+        .await
+        .map_err(|error| unreachable(format!("disk snapshot lease release task: {error}")))?;
     let response = transport
         .send(
             target,

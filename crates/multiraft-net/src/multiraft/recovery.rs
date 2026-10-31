@@ -6,10 +6,6 @@ impl<S: StateMachine> MultiRaft<S> {
     /// first await `wait_for_recovery`; owned runtime startup does this automatically.
     /// Rejection fences the application until shutdown/restart.
     pub async fn validate_recovered(&self, group: GroupId) -> Result<(), MultiRaftError> {
-        let context = FsmFactoryContext {
-            node_id: self.node_id,
-            group_id: group,
-        };
         let sm = self
             .groups
             .lock()
@@ -17,6 +13,17 @@ impl<S: StateMachine> MultiRaft<S> {
             .get(&group)
             .map(|group| group.state_machine.clone())
             .ok_or(MultiRaftError::UnknownGroup(group))?;
+        self.validate_recovered_store(group, sm).await
+    }
+    pub(super) async fn validate_recovered_store(
+        &self,
+        group: GroupId,
+        sm: StateMachineStore<S>,
+    ) -> Result<(), MultiRaftError> {
+        let context = FsmFactoryContext {
+            node_id: self.node_id,
+            group_id: group,
+        };
         let result = sm
             .validate_recovery(|fsm| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -262,7 +269,12 @@ pub(super) async fn open_node_log(
         anyhow::ensure!(database.exists() || persisted.is_empty(), "cannot select RocksDB over persisted FileLog or snapshot history; explicit migration required");
         let db = RocksLogDb::open_with_sync_all(&database, sync_all)?;
         for group in persisted {
-            anyhow::ensure!(db.startup_provenance(group)? == multiraft_core::StartupProvenance::Persisted,
+            let provenance = match db.lifecycle_receipt(group)? {
+                Some(receipt) if matches!(receipt.stage, multiraft_store::ControlledGroupStage::Retired | multiraft_store::ControlledGroupStage::LogsCleaned | multiraft_store::ControlledGroupStage::Cleaned) => continue,
+                Some(receipt) => db.startup_provenance_generation(group, receipt.generation)?,
+                None => db.startup_provenance(group)?,
+            };
+            anyhow::ensure!(provenance == multiraft_core::StartupProvenance::Persisted,
                 "RocksDB group has no local log basis but persisted FileLog or snapshot history exists; explicit migration or recovery required");
         }
         #[cfg(test)]
@@ -341,7 +353,10 @@ impl<S: StateMachine> MultiRaft<S> {
             }
             return legacy();
         };
-        let provenance = db.startup_provenance(group)?;
+        let provenance = match db.lifecycle_receipt(group)? {
+            Some(receipt) => db.startup_provenance_generation(group, receipt.generation)?,
+            None => db.startup_provenance(group)?,
+        };
         if provenance == StartupProvenance::Pristine {
             let snapshots = SnapshotCatalog::new(self.config.data_dir.join("snapshots"), 1)
                 .startup_provenance(group, self.config.max_snapshot_bytes)?;
@@ -366,8 +381,14 @@ impl<S: StateMachine> MultiRaft<S> {
         if let Some(db) = db {
             self.log_provenance(group)
                 .map_err(|error| MultiRaftError::Other(error.into()))?;
-            return db
-                .group(group)
+            let store = match db
+                .lifecycle_receipt(group)
+                .map_err(|error| MultiRaftError::Other(error.into()))?
+            {
+                Some(receipt) => db.group_generation(group, receipt.generation),
+                None => db.group(group),
+            };
+            return store
                 .map(NativeRaftLogStore::Rocks)
                 .map_err(|error| MultiRaftError::Other(error.into()));
         }

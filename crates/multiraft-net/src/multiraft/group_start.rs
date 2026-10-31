@@ -6,7 +6,56 @@ impl<S: StateMachine> MultiRaft<S> {
         &self,
         group: GroupId,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
+        self.spawn_local_group_authorized(group, false, false).await
+    }
+    pub(super) async fn spawn_controlled_local_group(
+        &self,
+        group: GroupId,
+        quarantine: bool,
+    ) -> Result<tokio::time::Instant, MultiRaftError> {
+        self.spawn_local_group_authorized(group, true, quarantine)
+            .await
+    }
+    async fn spawn_local_group_authorized(
+        &self,
+        group: GroupId,
+        controlled_admission: bool,
+        quarantine: bool,
+    ) -> Result<tokio::time::Instant, MultiRaftError> {
+        let _construction = self.controlled_construction.read().await;
+        if self
+            .snapshot_rt
+            .stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "native node is stopping"
+            )));
+        }
         self.ensure_node_log().await?;
+        let controlled = self
+            .controlled_db()
+            .ok()
+            .map(|db| db.lifecycle_receipt(group))
+            .transpose()
+            .map_err(|error| MultiRaftError::Other(error.into()))?
+            .flatten()
+            .is_some();
+        if controlled != controlled_admission {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "controlled group requires its private durable startup path"
+            )));
+        }
+        let membership_policy = if controlled {
+            openraft::MembershipChangePolicy::RequireGuard
+        } else {
+            openraft::MembershipChangePolicy::Unrestricted
+        };
+        if controlled {
+            if let NetBackend::Grpc { router } = &self.net {
+                router.enable_controlled_group(group);
+            }
+        }
         // Every admitted mode is manual-only. Native protocol snapshots still
         // use the configured provider; Disabled has no legacy 5000-log policy.
         let snapshot_policy = openraft::SnapshotPolicy::Never;
@@ -45,6 +94,8 @@ impl<S: StateMachine> MultiRaft<S> {
             "starting local Raft group"
         );
         let config = Config {
+            enable_elect: !quarantine,
+            enable_leader_restore: if quarantine { Some(false) } else { None },
             heartbeat_interval: self.config.heartbeat_interval_ms,
             election_timeout_min: self.config.election_timeout_min_ms,
             election_timeout_max: self.config.election_timeout_max_ms,
@@ -93,7 +144,7 @@ impl<S: StateMachine> MultiRaft<S> {
             node_id: self.node_id,
             group_id: group,
         };
-        let fsm = self.fsm_factory.create(context).map_err(|source| {
+        let mut fsm = self.fsm_factory.create(context).map_err(|source| {
             tracing::error!(
                 target: "multiraft::recovery",
                 operation = "group_start",
@@ -112,6 +163,10 @@ impl<S: StateMachine> MultiRaft<S> {
                 context.group_id(),
             )))
         })?;
+        if controlled {
+            self.controlled_validate_fsm(group, &mut fsm)
+                .map_err(|error| MultiRaftError::Other(anyhow::Error::new(error)))?;
+        }
         // StandbyOffload: never hot-dump FSM in openraft build_snapshot (voters or standby).
         let allow_hot_build = self.config.snapshot_mode != SnapshotMode::StandbyOffload;
 
@@ -202,6 +257,11 @@ impl<S: StateMachine> MultiRaft<S> {
                 },
             )
         };
+        if controlled && !state_machine_store.is_disk_backed() {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "controlled group requires a disk-backed FSM"
+            )));
+        }
         if state_machine_store.is_disk_backed() {
             // Disk mode (docs/specs/2026-10-18-disk-backed-fsm-mode.md) recovers its
             // applied position from the FSM store and replays a durable local log.
@@ -293,11 +353,11 @@ impl<S: StateMachine> MultiRaft<S> {
         let raft = match &self.net {
             NetBackend::InProcess { router, .. } => {
                 let network = crate::election_source::ObservedFactory::new(NetworkFactory::new(router.clone(), group), group, self.election_source.clone());
-                openraft::Raft::new_with_election_observer(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>)).await
+                openraft::Raft::new_with_election_observer_and_membership_policy(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>), membership_policy).await
             }
             NetBackend::Grpc { router } => {
                 let network = crate::election_source::ObservedFactory::new(GrpcNetworkFactory::new(router.clone(), group), group, self.election_source.clone());
-                openraft::Raft::new_with_election_observer(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>)).await
+                openraft::Raft::new_with_election_observer_and_membership_policy(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>), membership_policy).await
             }
         }
         .map_err(|error| {
@@ -321,7 +381,12 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         let registered_at;
         {
-            let mut g = self.groups.lock().unwrap();
+            let destination = if quarantine {
+                &self.quarantined_groups
+            } else {
+                &self.groups
+            };
+            let mut g = destination.lock().unwrap();
             g.insert(
                 group,
                 GroupApp {
@@ -334,8 +399,10 @@ impl<S: StateMachine> MultiRaft<S> {
             registered_at = tokio::time::Instant::now();
         }
 
-        self.spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
-        self.spawn_standby_throttle_watch(raft, self.standby_throttle.clone());
+        if !quarantine {
+            self.spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
+            self.spawn_standby_throttle_watch(group, raft, self.standby_throttle.clone());
+        }
         tracing::info!(
             target: "multiraft::recovery",
             operation = "group_start",
@@ -377,7 +444,9 @@ impl<S: StateMachine> MultiRaft<S> {
             return;
         }
         let local_node_id = self.node_id;
-        self.tasks.spawn(async move {
+        let owner = self.group_owner(group);
+        let mut stopping = owner.stopping();
+        owner.watchers.spawn(async move {
             let mut rx = raft.metrics();
             let mut last: Option<(Option<NodeId>, crate::VoteObservation)> = None;
             loop {
@@ -401,15 +470,22 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                 }
                 last = Some((cur, vote));
-                if rx.changed().await.is_err() { break; }
+                tokio::select! { _ = stopping.changed() => break, result = rx.changed() => if result.is_err() { break; } }
             }
         });
     }
 
     /// Keep standby throttle in sync with committed learner membership so every
     /// potential leader throttles dynamically added Standbys after failover.
-    pub(super) fn spawn_standby_throttle_watch(&self, raft: Raft<S>, throttle: StandbyThrottle) {
-        self.tasks.spawn(async move {
+    pub(super) fn spawn_standby_throttle_watch(
+        &self,
+        group: GroupId,
+        raft: Raft<S>,
+        throttle: StandbyThrottle,
+    ) {
+        let owner = self.group_owner(group);
+        let mut stopping = owner.stopping();
+        owner.watchers.spawn(async move {
             let mut rx = raft.metrics();
             let mut last_learners: Option<BTreeSet<NodeId>> = None;
             loop {
@@ -427,9 +503,7 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                     last_learners = Some(learners);
                 }
-                if rx.changed().await.is_err() {
-                    break;
-                }
+                tokio::select! { _ = stopping.changed() => break, result = rx.changed() => if result.is_err() { break; } }
             }
         });
     }

@@ -92,6 +92,11 @@ use openraft::ReadPolicy;
 use tokio::sync::Notify;
 
 mod application;
+mod controlled;
+pub use controlled::{
+    ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,
+    ControlledSeed, ControlledTerminal,
+};
 mod control;
 mod election_source;
 mod group_start;
@@ -207,8 +212,11 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     log_open_tasks: tasks::OwnedTasks,
     net: NetBackend,
     groups: GroupMap<S>,
+    quarantined_groups: GroupMap<S>,
     tasks: tasks::OwnedTasks,
     control_slot: tokio::sync::Semaphore,
+    group_owners: Mutex<BTreeMap<GroupId, Arc<controlled::GroupOwner>>>,
+    controlled_construction: tokio::sync::RwLock<()>,
     leader_watch_groups: Mutex<BTreeSet<GroupId>>,
     fsm_releases: Mutex<Vec<multiraft_store::StateMachineRelease>>,
     // Immutable native storage basis captured before successful Group construction.

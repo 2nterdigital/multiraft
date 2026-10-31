@@ -6,8 +6,10 @@ impl<S: StateMachine> MultiRaft<S> {
         self.snapshot_rt
             .validation_closed
             .store(true, std::sync::atomic::Ordering::Release);
-        for group in self.groups.lock().unwrap().values() {
-            group.state_machine.cancel_pending_validation();
+        for registry in [&self.groups, &self.quarantined_groups] {
+            for group in registry.lock().unwrap().values() {
+                group.state_machine.cancel_pending_validation();
+            }
         }
     }
 
@@ -17,6 +19,14 @@ impl<S: StateMachine> MultiRaft<S> {
             .store(true, std::sync::atomic::Ordering::Release);
         self.snapshot_rt.maintenance_tasks.close();
         self.log_open_tasks.close();
+        for owner in self
+            .group_owners
+            .lock()
+            .expect("group owner lock poisoned")
+            .values()
+        {
+            owner.close();
+        }
         self.ingress_accepting
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
@@ -38,6 +48,14 @@ impl<S: StateMachine> MultiRaft<S> {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.snapshot_rt.maintenance_tasks.close();
         self.log_open_tasks.close();
+        for owner in self
+            .group_owners
+            .lock()
+            .expect("group owner lock poisoned")
+            .values()
+        {
+            owner.close();
+        }
         self.ingress_accepting
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
@@ -49,6 +67,7 @@ impl<S: StateMachine> MultiRaft<S> {
         if let NetBackend::Grpc { router } = &self.net {
             router.close();
         }
+        let construction = self.controlled_construction.write().await;
         let rafts: Vec<(GroupId, Raft<S>, StateMachineStore<S>)> = self
             .groups
             .lock()
@@ -56,6 +75,15 @@ impl<S: StateMachine> MultiRaft<S> {
             .iter()
             .map(|(&group_id, group)| (group_id, group.raft.clone(), group.state_machine.clone()))
             .collect();
+        let quarantined: Vec<_> = self
+            .quarantined_groups
+            .lock()
+            .expect("quarantined group lock poisoned")
+            .iter()
+            .map(|(&group_id, group)| (group_id, group.raft.clone(), group.state_machine.clone()))
+            .collect();
+        let rafts: Vec<_> = rafts.into_iter().chain(quarantined).collect();
+        drop(construction);
         tracing::info!(target: "multiraft::recovery", operation = "node_shutdown", phase = "start",
             node_id = self.node_id, group_count = rafts.len() as u64, "shutting down Multi-Raft node");
         let mut first_error = None;
@@ -72,6 +100,18 @@ impl<S: StateMachine> MultiRaft<S> {
         if let NetBackend::Grpc { router } = &self.net {
             if let Err(error) = router.join().await {
                 first_error.get_or_insert(MultiRaftError::Other(error));
+            }
+        }
+        let group_owners: Vec<_> = self
+            .group_owners
+            .lock()
+            .expect("group owner lock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for owner in group_owners {
+            if let Err(error) = owner.join().await {
+                first_error.get_or_insert(MultiRaftError::Other(anyhow::Error::new(error)));
             }
         }
         // Stop/join listener, watchers and in-process ingress INCLUDING their children.
@@ -100,6 +140,10 @@ impl<S: StateMachine> MultiRaft<S> {
             .await
             .map_err(|error| MultiRaftError::Other(error.into()))?;
         self.groups.lock().unwrap().clear();
+        self.quarantined_groups
+            .lock()
+            .expect("quarantined group lock poisoned")
+            .clear();
         self.construction_recovery.lock().unwrap().clear();
         drop(rafts);
         // Core shutdown does not join the SM worker. Successful stop promises that

@@ -4,17 +4,18 @@
 //! carries `group_id` + path + bincode payload (native Raft request/response types).
 
 mod channel_pool;
+mod controlled_append;
 mod fingerprint;
 pub mod router;
 pub mod server;
 
 // Generated tonic signatures return their required concrete Status.
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::double_must_use)]
 pub mod proto {
     tonic::include_proto!("multiraft");
 }
 
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::double_must_use)]
 pub mod node_rpc {
     tonic::include_proto!("multiraft.node_rpc");
 }

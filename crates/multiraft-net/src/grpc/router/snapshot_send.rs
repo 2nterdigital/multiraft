@@ -6,13 +6,18 @@ use tokio::time::Instant;
 
 pub(super) struct SnapshotSender {
     slots: Arc<Semaphore>,
-    jobs: OwnedTasks,
+    groups: std::sync::Mutex<GroupState>,
+}
+#[derive(Default)]
+struct GroupState {
+    closed: bool,
+    jobs: std::collections::BTreeMap<GroupId, Arc<OwnedTasks>>,
 }
 impl Default for SnapshotSender {
     fn default() -> Self {
         Self {
             slots: Arc::new(Semaphore::new(1)),
-            jobs: OwnedTasks::default(),
+            groups: std::sync::Mutex::default(),
         }
     }
 }
@@ -20,16 +25,77 @@ fn refused(reason: &'static str) -> StreamingError<TypeConfig> {
     StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(reason)))
 }
 impl SnapshotSender {
+    fn group_jobs(&self, group: GroupId) -> Result<Arc<OwnedTasks>, StreamingError<TypeConfig>> {
+        let mut groups = self
+            .groups
+            .lock()
+            .expect("snapshot group owner lock poisoned");
+        if groups.closed {
+            return Err(refused("native snapshot owner closed"));
+        }
+        Ok(groups.jobs.entry(group).or_default().clone())
+    }
     pub(super) fn close(&self) {
         self.slots.close();
-        self.jobs.close();
+        let mut groups = self
+            .groups
+            .lock()
+            .expect("snapshot group owner lock poisoned");
+        groups.closed = true;
+        for jobs in groups.jobs.values() {
+            jobs.close();
+        }
     }
     pub(super) fn abort(&self) {
         self.close();
-        self.jobs.abort();
+        for jobs in self
+            .groups
+            .lock()
+            .expect("snapshot group owner lock poisoned")
+            .jobs
+            .values()
+        {
+            jobs.abort();
+        }
     }
     pub(super) async fn join(&self) -> anyhow::Result<()> {
-        self.jobs.join().await
+        self.close();
+        let jobs: Vec<_> = self
+            .groups
+            .lock()
+            .expect("snapshot group owner lock poisoned")
+            .jobs
+            .values()
+            .cloned()
+            .collect();
+        let mut first_error = None;
+        for jobs in jobs {
+            if let Err(error) = jobs.join().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+    pub(super) async fn join_group(&self, group: GroupId) -> anyhow::Result<()> {
+        let jobs = {
+            let mut groups = self
+                .groups
+                .lock()
+                .expect("snapshot group owner lock poisoned");
+            let jobs = groups.jobs.entry(group).or_default().clone();
+            jobs.close();
+            jobs
+        };
+        jobs.join().await
+    }
+    pub(super) fn reopen_group(&self, group: GroupId) {
+        let mut groups = self
+            .groups
+            .lock()
+            .expect("snapshot group owner lock poisoned");
+        if !groups.closed {
+            groups.jobs.insert(group, Arc::new(OwnedTasks::default()));
+        }
     }
 
     pub(super) async fn send(
@@ -75,7 +141,8 @@ impl SnapshotSender {
             return Err(refused("native snapshot deadline expired before dispatch"));
         }
         let (reply, receiver) = oneshot::channel();
-        let registered = self.jobs.spawn(async move {
+        let jobs = self.group_jobs(group_id)?;
+        let registered = jobs.spawn(async move {
             let _permit = permit;
             if Instant::now() >= deadline {
                 let _ = reply.send(Err(refused(
@@ -131,7 +198,8 @@ impl SnapshotSender {
         }
         let ttl = option.hard_ttl();
         let (reply, receiver) = oneshot::channel();
-        let registered = self.jobs.spawn(async move {
+        let jobs = self.group_jobs(group_id)?;
+        let registered = jobs.spawn(async move {
             let _permit = permit;
             let result = super::disk_snapshot_send::stream(
                 &transport,
