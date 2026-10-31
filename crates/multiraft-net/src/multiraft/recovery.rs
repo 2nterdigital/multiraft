@@ -341,7 +341,10 @@ impl<S: StateMachine> MultiRaft<S> {
             }
             return legacy();
         };
-        let provenance = db.startup_provenance(group)?;
+        let provenance = match db.lifecycle_receipt(group)? {
+            Some(receipt) => db.startup_provenance_generation(group, receipt.generation)?,
+            None => db.startup_provenance(group)?,
+        };
         if provenance == StartupProvenance::Pristine {
             let snapshots = SnapshotCatalog::new(self.config.data_dir.join("snapshots"), 1)
                 .startup_provenance(group, self.config.max_snapshot_bytes)?;
@@ -366,8 +369,14 @@ impl<S: StateMachine> MultiRaft<S> {
         if let Some(db) = db {
             self.log_provenance(group)
                 .map_err(|error| MultiRaftError::Other(error.into()))?;
-            return db
-                .group(group)
+            let store = match db
+                .lifecycle_receipt(group)
+                .map_err(|error| MultiRaftError::Other(error.into()))?
+            {
+                Some(receipt) => db.group_generation(group, receipt.generation),
+                None => db.group(group),
+            };
+            return store
                 .map(NativeRaftLogStore::Rocks)
                 .map_err(|error| MultiRaftError::Other(error.into()));
         }

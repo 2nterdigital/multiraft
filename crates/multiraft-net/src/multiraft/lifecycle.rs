@@ -17,6 +17,14 @@ impl<S: StateMachine> MultiRaft<S> {
             .store(true, std::sync::atomic::Ordering::Release);
         self.snapshot_rt.maintenance_tasks.close();
         self.log_open_tasks.close();
+        for owner in self
+            .group_owners
+            .lock()
+            .expect("group owner lock poisoned")
+            .values()
+        {
+            owner.close();
+        }
         self.ingress_accepting
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
@@ -38,6 +46,14 @@ impl<S: StateMachine> MultiRaft<S> {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.snapshot_rt.maintenance_tasks.close();
         self.log_open_tasks.close();
+        for owner in self
+            .group_owners
+            .lock()
+            .expect("group owner lock poisoned")
+            .values()
+        {
+            owner.close();
+        }
         self.ingress_accepting
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(stop) = self.listener_stop.lock().unwrap().take() {
@@ -72,6 +88,18 @@ impl<S: StateMachine> MultiRaft<S> {
         if let NetBackend::Grpc { router } = &self.net {
             if let Err(error) = router.join().await {
                 first_error.get_or_insert(MultiRaftError::Other(error));
+            }
+        }
+        let group_owners: Vec<_> = self
+            .group_owners
+            .lock()
+            .expect("group owner lock poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for owner in group_owners {
+            if let Err(error) = owner.join().await {
+                first_error.get_or_insert(MultiRaftError::Other(anyhow::Error::new(error)));
             }
         }
         // Stop/join listener, watchers and in-process ingress INCLUDING their children.

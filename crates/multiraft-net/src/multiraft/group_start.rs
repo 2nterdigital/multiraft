@@ -7,6 +7,35 @@ impl<S: StateMachine> MultiRaft<S> {
         group: GroupId,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
         self.ensure_node_log().await?;
+        let controlled = self
+            .controlled_db()
+            .ok()
+            .map(|db| db.lifecycle_receipt(group))
+            .transpose()
+            .map_err(|error| MultiRaftError::Other(error.into()))?
+            .flatten()
+            .is_some();
+        if controlled
+            && !self
+                .controlled_opening
+                .lock()
+                .expect("controlled opening lock poisoned")
+                .contains(&group)
+        {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "controlled group requires durable startup admission"
+            )));
+        }
+        let membership_policy = if controlled {
+            openraft::MembershipChangePolicy::RequireGuard
+        } else {
+            openraft::MembershipChangePolicy::Unrestricted
+        };
+        if controlled {
+            if let NetBackend::Grpc { router } = &self.net {
+                router.enable_controlled_group(group);
+            }
+        }
         // Every admitted mode is manual-only. Native protocol snapshots still
         // use the configured provider; Disabled has no legacy 5000-log policy.
         let snapshot_policy = openraft::SnapshotPolicy::Never;
@@ -202,6 +231,11 @@ impl<S: StateMachine> MultiRaft<S> {
                 },
             )
         };
+        if controlled && !state_machine_store.is_disk_backed() {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "controlled group requires a disk-backed FSM"
+            )));
+        }
         if state_machine_store.is_disk_backed() {
             // Disk mode (docs/specs/2026-10-18-disk-backed-fsm-mode.md) recovers its
             // applied position from the FSM store and replays a durable local log.
@@ -293,11 +327,11 @@ impl<S: StateMachine> MultiRaft<S> {
         let raft = match &self.net {
             NetBackend::InProcess { router, .. } => {
                 let network = crate::election_source::ObservedFactory::new(NetworkFactory::new(router.clone(), group), group, self.election_source.clone());
-                openraft::Raft::new_with_election_observer(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>)).await
+                openraft::Raft::new_with_election_observer_and_membership_policy(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>), membership_policy).await
             }
             NetBackend::Grpc { router } => {
                 let network = crate::election_source::ObservedFactory::new(GrpcNetworkFactory::new(router.clone(), group), group, self.election_source.clone());
-                openraft::Raft::new_with_election_observer(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>)).await
+                openraft::Raft::new_with_election_observer_and_membership_policy(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>), membership_policy).await
             }
         }
         .map_err(|error| {
@@ -335,7 +369,7 @@ impl<S: StateMachine> MultiRaft<S> {
         }
 
         self.spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
-        self.spawn_standby_throttle_watch(raft, self.standby_throttle.clone());
+        self.spawn_standby_throttle_watch(group, raft, self.standby_throttle.clone());
         tracing::info!(
             target: "multiraft::recovery",
             operation = "group_start",
@@ -377,7 +411,9 @@ impl<S: StateMachine> MultiRaft<S> {
             return;
         }
         let local_node_id = self.node_id;
-        self.tasks.spawn(async move {
+        let owner = self.group_owner(group);
+        let mut stopping = owner.stopping();
+        owner.watchers.spawn(async move {
             let mut rx = raft.metrics();
             let mut last: Option<(Option<NodeId>, crate::VoteObservation)> = None;
             loop {
@@ -401,15 +437,17 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                 }
                 last = Some((cur, vote));
-                if rx.changed().await.is_err() { break; }
+                tokio::select! { _ = stopping.changed() => break, result = rx.changed() => if result.is_err() { break; } }
             }
         });
     }
 
     /// Keep standby throttle in sync with committed learner membership so every
     /// potential leader throttles dynamically added Standbys after failover.
-    pub(super) fn spawn_standby_throttle_watch(&self, raft: Raft<S>, throttle: StandbyThrottle) {
-        self.tasks.spawn(async move {
+    pub(super) fn spawn_standby_throttle_watch(&self, group: GroupId, raft: Raft<S>, throttle: StandbyThrottle) {
+        let owner = self.group_owner(group);
+        let mut stopping = owner.stopping();
+        owner.watchers.spawn(async move {
             let mut rx = raft.metrics();
             let mut last_learners: Option<BTreeSet<NodeId>> = None;
             loop {
@@ -427,9 +465,7 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                     last_learners = Some(learners);
                 }
-                if rx.changed().await.is_err() {
-                    break;
-                }
+                tokio::select! { _ = stopping.changed() => break, result = rx.changed() => if result.is_err() { break; } }
             }
         });
     }
