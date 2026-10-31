@@ -209,6 +209,10 @@ impl<S: StateMachine> RuntimeShared<S> {
 
     pub(super) fn begin_cleanup(self: &Arc<Self>) {
         self.accepting.store(false, Ordering::Release);
+        self.ready
+            .lock()
+            .expect("runtime readiness lock poisoned")
+            .clear();
         self.closed.send_replace(true);
         self.controlled_endpoints
             .lock()
@@ -288,6 +292,10 @@ impl<S: StateMachine> RuntimeShared<S> {
                             let proposal_result = shared.proposals.join().await.map_err(|error| {
                                 RuntimeError::Source(MultiRaftError::Other(error))
                             });
+                            let controlled_result =
+                                shared.controlled_jobs.join().await.map_err(|error| {
+                                    RuntimeError::Source(MultiRaftError::Other(error))
+                                });
                             // Keep this full stop/join future IN PLACE across every native
                             // budget window. A timer expiration abandons only that poll,
                             // never retained tasks, blocking children or FSM witnesses.
@@ -306,6 +314,7 @@ impl<S: StateMachine> RuntimeShared<S> {
                             let retained = source_result
                                 .and(startup_result)
                                 .and(proposal_result)
+                                .and(controlled_result)
                                 .and(native_result);
                             // A real graceful source failure remains the original cause.
                             // For an expired graceful wait, a subsequently observed source

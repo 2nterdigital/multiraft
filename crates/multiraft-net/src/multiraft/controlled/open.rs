@@ -383,6 +383,15 @@ impl<S: StateMachine> MultiRaft<S> {
                     return Ok(ControlledGroup::handle(&node, &request, authority));
                 }
             }
+            #[cfg(test)]
+            if crate::controlled_bootstrap_test_gate::wait(
+                &node.config.data_dir,
+                node.group_owner(request.group_id).stopping(),
+            )
+            .await
+            {
+                return Err(ControlledError::Closed);
+            }
             db.advance_controlled(
                 request.group_id,
                 request.generation,
