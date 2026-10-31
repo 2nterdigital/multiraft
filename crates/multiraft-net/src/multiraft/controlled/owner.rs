@@ -34,18 +34,13 @@ impl GroupOwner {
         self.stopped.subscribe()
     }
     pub(in crate::multiraft) async fn join(&self) -> Result<(), ControlledError> {
-        self.commands
-            .join()
-            .await
-            .map_err(|error| ControlledError::Native(error.to_string()))?;
-        self.watchers
-            .join()
-            .await
-            .map_err(|error| ControlledError::Native(error.to_string()))?;
-        self.maintenance
-            .join()
-            .await
-            .map_err(|error| ControlledError::Native(error.to_string()))
+        let mut first_error = None;
+        for registry in [&self.commands, &self.watchers, &self.maintenance] {
+            if let Err(error) = registry.join().await {
+                first_error.get_or_insert_with(|| ControlledError::Native(error.to_string()));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 impl<S: StateMachine> MultiRaft<S> {
