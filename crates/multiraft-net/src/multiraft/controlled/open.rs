@@ -147,6 +147,14 @@ impl<S: StateMachine> MultiRaft<S> {
         seed: Option<ControlledSeed>,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledGroup<S>, ControlledError> {
+        if seed
+            .as_ref()
+            .is_some_and(|seed| seed.fingerprint != self.config.raft_transport_fingerprint)
+        {
+            return Err(ControlledError::Rejected(
+                "seed transport domain does not match the target",
+            ));
+        }
         if request.generation == 0 || request.identity.is_empty() {
             return Err(ControlledError::Rejected(
                 "controlled generation and identity must be nonempty",
@@ -203,7 +211,17 @@ impl<S: StateMachine> MultiRaft<S> {
                         }
                     }
                     if old.is_none()
-                        && (voters.len() != 3
+                        && (catalog.membership.log_id().is_some()
+                            || catalog.active_operation.is_some()
+                            || !catalog.completed.is_empty()
+                            || catalog.membership.membership().get_joint_config().len() != 1
+                            || catalog
+                                .membership
+                                .membership()
+                                .learner_ids()
+                                .next()
+                                .is_some()
+                            || voters.len() != 3
                             || !voters.contains(&node.node_id)
                             || *voters != catalog.membership.membership().voter_ids().collect()
                             || node.log_provenance(request.group_id)?

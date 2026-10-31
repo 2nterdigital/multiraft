@@ -74,6 +74,7 @@ pub struct ControlledSeed {
     specification: ReplacementSpec,
     record: multiraft_core::OperationRecord,
     vote: multiraft_core::typ::Vote,
+    fingerprint: Option<[u8; 32]>,
     meta: multiraft_core::typ::SnapshotMeta,
     manifest: Vec<u8>,
 }
