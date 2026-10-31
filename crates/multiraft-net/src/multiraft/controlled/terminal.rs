@@ -265,15 +265,19 @@ fn retirement_permit<S: StateMachine>(
     let receipt = this.checked_receipt()?;
     this.storage_owner()?;
     let (completed, source, proof) = checked_completed(catalog, this.group, operation)?;
+    let proof_bytes = serde_json::to_vec(&proof).map_err(std::io::Error::other)?;
+    let receipt_matches = match receipt.stage {
+        multiraft_store::ControlledGroupStage::Opened => receipt.terminal_proof.is_none(),
+        multiraft_store::ControlledGroupStage::Retired
+        | multiraft_store::ControlledGroupStage::LogsCleaned
+        | multiraft_store::ControlledGroupStage::Cleaned => {
+            receipt.terminal_proof.as_ref() == Some(&proof_bytes)
+        }
+        _ => false,
+    };
     if source != node.node_id
         || completed.source_generation != this.generation
-        || !matches!(
-            receipt.stage,
-            multiraft_store::ControlledGroupStage::Opened
-                | multiraft_store::ControlledGroupStage::Retired
-                | multiraft_store::ControlledGroupStage::LogsCleaned
-                | multiraft_store::ControlledGroupStage::Cleaned
-        )
+        || !receipt_matches
         || catalog.authorized.get(&node.node_id) == Some(&this.generation)
         || catalog.active_operation.as_ref().is_some_and(|binding| {
             binding.group_id != this.group

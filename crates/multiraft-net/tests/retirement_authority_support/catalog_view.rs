@@ -97,6 +97,12 @@ impl StartupAuthority for CatalogView {
                         .expected_start
                         .clone()
                 }
+                15 => {
+                    let completed = &mut catalog.completed[0];
+                    let terminal = completed.native_record.terminal.as_mut().unwrap();
+                    terminal.barrier.index += 1;
+                    completed.applied_log = terminal.barrier;
+                }
                 13 => {
                     catalog.membership = catalog.completed[0]
                         .native_record

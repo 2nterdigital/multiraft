@@ -169,6 +169,8 @@ async fn cold_source_resolves_fresh_retirement_without_core_quorum_or_catalog_wr
         handle.receipt().unwrap().stage,
         multiraft_store::ControlledGroupStage::Retired
     );
+    authority.mode.store(15, Ordering::SeqCst);
+    assert!(handle.retirement_from_authority(spec.operation, deadline()).await.is_err(), "retired local proof must agree with retained authority even when a changed proof is internally consistent");
     authority.mode.store(1, Ordering::SeqCst);
     assert!(
         handle.cleanup(&permit, deadline()).await.is_err(),
