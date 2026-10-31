@@ -19,6 +19,8 @@ mod lifecycle;
 mod process;
 #[path = "controlled_protocol_support/recovery.rs"]
 mod recovery;
+#[path = "controlled_protocol_support/seed_publication.rs"]
+mod seed_publication;
 #[path = "controlled_protocol_support/session.rs"]
 mod session;
 #[path = "controlled_protocol_support/terminal_gate.rs"]
@@ -120,7 +122,11 @@ async fn controlled_protocol_child() {
     );
     let phase = std::env::var("CONTROLLED_PROTOCOL_SCENARIO").expect("child protocol phase");
     let resume = std::env::var("CONTROLLED_PROTOCOL_RESUME").expect("child boot mode") == "1";
-    crash::run(&root, &phase, resume).await;
+    if phase == "seed_install" {
+        seed_publication::child(&root, resume).await;
+    } else {
+        crash::run(&root, &phase, resume).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -268,4 +274,19 @@ async fn learner_installs_typed_ledger_snapshot_and_tail_before_exact_terminal()
         "terminal cannot reactivate with a higher executor epoch"
     );
     session.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn installed_checkpoint_stays_quarantined_until_seed_anchor_and_open_are_durable() {
+    let root = cluster::scratch("seed-publication-");
+    seed_publication::initial(&root, false).await;
+}
+
+#[test]
+fn installed_checkpoint_before_seed_anchor_sigkill_resumes_same_operation_with_fresh_admission() {
+    let root = cluster::scratch("seed-install-sigkill-");
+    let initial = process::Process::start(&root, "seed_install", false);
+    initial.wait_phase("seed_install");
+    initial.kill();
+    process::Process::start(&root, "seed_install", true).finish();
 }

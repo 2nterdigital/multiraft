@@ -9,6 +9,7 @@ use std::{
 pub struct DiskImage {
     db: DiskFsmDb,
     gate_root: PathBuf,
+    seed_gate: PathBuf,
 }
 
 impl DiskImage {
@@ -20,6 +21,7 @@ impl DiskImage {
                 DiskFsmOptions::new(b"controlled-protocol-opaque-v1".to_vec()),
             )?,
             gate_root: root.join("application-gate"),
+            seed_gate: root.join("seed-install-gate").join(group.to_string()),
         })
     }
 
@@ -111,6 +113,22 @@ impl DiskState for DiskImage {
         self.db.inspect_checkpoint(dir)
     }
     fn install_checkpoint(&mut self, dir: &Path) -> io::Result<()> {
-        self.db.install_checkpoint(dir)
+        self.db.install_checkpoint(dir)?;
+        if self.seed_gate.join("armed").exists() {
+            let applied = self.db.applied_record()?.ok_or_else(|| {
+                io::Error::other("installed seed checkpoint has no durable applied record")
+            })?;
+            std::fs::write(self.seed_gate.join("installed"), applied)?;
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !self.seed_gate.join("release").exists() {
+                if std::time::Instant::now() >= limit {
+                    return Err(io::Error::other(
+                        "bounded seed installation gate was not released",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        Ok(())
     }
 }
