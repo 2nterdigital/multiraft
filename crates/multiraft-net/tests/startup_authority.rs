@@ -298,3 +298,19 @@ async fn caller_claimed_target_consumption_is_not_a_durable_receipt() {
         .active_operation
         .is_none());
 }
+
+#[tokio::test]
+async fn bootstrap_provisioning_records_native_identity_once_before_binding() {
+    let directory = directory();
+    let path = directory.path().join("catalog.json");
+    let authority = provision(&path);
+    let actual = membership(3, &[1, 2, 3]);
+    authority.bootstrap_membership(actual.clone()).unwrap();
+    drop(authority);
+    let reopened = FileAuthority::open(&path);
+    assert_eq!(reopened.read(7).await.unwrap().membership, actual);
+    let mut binding = binding();
+    binding.specification.expected_start = actual.clone();
+    applied(reopened.bind_active(binding).await.unwrap());
+    assert!(reopened.bootstrap_membership(actual).is_err());
+}

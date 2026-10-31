@@ -19,6 +19,7 @@ struct State {
     catalog: StartupCatalog,
     denials: Vec<Denial>,
     consumed_targets: Vec<StartupTargetGeneration>,
+    bootstrap_finalized: bool,
 }
 
 pub struct FileAuthority {
@@ -41,6 +42,7 @@ impl FileAuthority {
                 catalog,
                 denials: vec![],
                 consumed_targets: vec![],
+                bootstrap_finalized: false,
             })
             .unwrap();
         adapter
@@ -50,6 +52,33 @@ impl FileAuthority {
             path: path.to_owned(),
             lose_handoff_reply: AtomicBool::new(false),
         }
+    }
+    /// Explicit fixture provisioning synchronizes the first native committed membership.
+    /// It is one-shot and cannot repair an ordinary startup or an existing operation.
+    pub fn bootstrap_membership(
+        &self,
+        membership: multiraft_core::typ::StoredMembership,
+    ) -> Result<(), StartupAuthorityError> {
+        let _lock = self.lock()?;
+        let mut state = self.load()?;
+        let catalog = &mut state.catalog;
+        let configs = membership.membership().get_joint_config();
+        let voters = catalog.authorized.keys().copied().collect();
+        if state.bootstrap_finalized
+            || catalog.active_operation.is_some()
+            || !catalog.completed.is_empty()
+            || membership.log_id().is_none()
+            || configs.len() != 1
+            || configs[0] != voters
+        {
+            return Err(error(
+                "bootstrap provisioning identity is unavailable or already finalized",
+            ));
+        }
+        catalog.membership = membership;
+        catalog.revision += 1;
+        state.bootstrap_finalized = true;
+        self.save(&state)
     }
     /// Fixture registry setup: durably consume an immutable target generation before binding.
     pub fn consume_target(
