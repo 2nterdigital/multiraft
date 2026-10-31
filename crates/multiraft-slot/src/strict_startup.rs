@@ -69,10 +69,19 @@ impl StrictSlotStartup {
     }
 
     pub(crate) fn validate(&self, layout: &ClusterLayout, local: u64) -> Result<(), RuntimeError> {
+        self.validate_profile(layout, local, SLOT_PROTOCOL_VERSION)
+    }
+
+    pub(crate) fn validate_profile(
+        &self,
+        layout: &ClusterLayout,
+        local: u64,
+        protocol: u32,
+    ) -> Result<(), RuntimeError> {
         let directory = &self.directory;
         if self.identity.data_space_id == 0
             || self.identity.data_dir_uuid == [0; 16]
-            || self.identity.protocol_version != SLOT_PROTOCOL_VERSION
+            || self.identity.protocol_version != protocol
             || self.identity.compatibility_digest == [0; 32]
             || directory.version == 0
             || directory.data_space_id != self.identity.data_space_id

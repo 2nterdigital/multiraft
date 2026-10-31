@@ -82,6 +82,11 @@ pub(crate) fn prepare(
         if startup.disposition == SlotStartupDisposition::Genesis || read(&path)? != expected {
             return Err(reject());
         }
+        if startup.identity.protocol_version == crate::CONTROLLED_SLOT_PROTOCOL_VERSION {
+            // Controlled native receipts and anchors independently validate every recovery.
+            // Candidate identities may now contain an authorized learner generation.
+            return Ok(());
+        }
         if expected.candidate {
             // Candidate has no native state, receipts, snapshots or creation debris to adopt.
             for entry in io(fs::read_dir(dir))? {

@@ -137,11 +137,7 @@ impl<S: SlotStateMachine> ApplicationRpcHandler for Handler<S> {
                 if slot != request.slot {
                     return Err(RuntimeError::InvalidRequest);
                 }
-                let voters = shared
-                    .layout
-                    .voters(slot)
-                    .map_err(|_| RuntimeError::InvalidRequest)?;
-                if !voters.contains(&shared.node_id) {
+                if !shared.locally_routable(slot, context.deadline).await? {
                     return Err(RuntimeError::NotLeader { hint: None });
                 }
                 match request.operation {
@@ -208,11 +204,8 @@ pub(crate) async fn route_hint<S: SlotStateMachine>(
     deadline: Instant,
 ) -> Result<Option<NodeId>, RuntimeError> {
     shared.check(deadline)?;
-    let voters = shared
-        .layout
-        .voters(slot)
-        .map_err(|_| RuntimeError::InvalidRequest)?;
-    let hint = if voters.contains(&shared.node_id) {
+    let voters = shared.routing_voters(slot, deadline).await?;
+    let hint = if shared.locally_routable(slot, deadline).await? {
         local_hint(shared, slot, deadline).await?
     } else {
         probe_voters(shared, slot, None, deadline).await?
@@ -230,10 +223,7 @@ async fn probe_voters<S: SlotStateMachine>(
     key: Option<&[u8]>,
     deadline: Instant,
 ) -> Result<Option<NodeId>, RuntimeError> {
-    let voters = shared
-        .layout
-        .voters(slot)
-        .map_err(|_| RuntimeError::InvalidRequest)?;
+    let voters = shared.routing_voters(slot, deadline).await?;
     let mut observed = false;
     for (index, voter) in voters.iter().enumerate() {
         shared.check(deadline)?;
@@ -267,11 +257,8 @@ async fn destination<S: SlotStateMachine>(
     deadline: Instant,
 ) -> Result<NodeId, RuntimeError> {
     shared.check(deadline)?;
-    let voters = shared
-        .layout
-        .voters(slot)
-        .map_err(|_| RuntimeError::InvalidRequest)?;
-    let hint = if voters.contains(&shared.node_id) {
+    let voters = shared.routing_voters(slot, deadline).await?;
+    let hint = if shared.locally_routable(slot, deadline).await? {
         local_hint(shared, slot, deadline).await?
     } else {
         probe_voters(shared, slot, Some(key), deadline).await?
