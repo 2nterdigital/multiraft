@@ -7,7 +7,8 @@ use authority::{
 use cluster::{deadline, DiskImage, GROUP, VOTERS};
 use multiraft_core::{typ::StoredMembership, OperationId, ReplacementSpec};
 use multiraft_net::{
-    ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode, MultiRaft,
+    ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode, ControlledSeed,
+    MultiRaft,
 };
 use openraft::{BasicNode, Membership};
 use std::{
@@ -21,6 +22,7 @@ pub struct Session {
     pub groups: Vec<Option<ControlledGroup<DiskImage>>>,
     pub authority: Arc<FileAuthority>,
     pub creations: Vec<Arc<AtomicUsize>>,
+    pub target_seed: Option<ControlledSeed>,
     identities: Vec<Vec<u8>>,
 }
 
@@ -52,6 +54,7 @@ impl Session {
             nodes: vec![],
             groups: vec![None; 4],
             authority,
+            target_seed: None,
             identities: (1..=4).map(|id| vec![id]).collect(),
             creations: (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect(),
         };
@@ -108,6 +111,7 @@ impl Session {
             nodes: vec![],
             groups: vec![None; 4],
             authority,
+            target_seed: None,
             identities: (1..=4).map(|id| vec![id]).collect(),
             creations: (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect(),
         };
@@ -276,9 +280,12 @@ impl Session {
             .begin(specification.clone(), 1, &target, deadline())
             .await
             .expect("bind startup directory then commit native Begin");
-        // The catch-up snapshot contains the actual typed-v2 operation ledger;
-        // the target has no Core yet and cannot receive the pre-purge log prefix.
-        let cut = cluster::compact(&self.nodes[leader]).await;
+        let seed = self
+            .group(leader)
+            .prepare_seed(&executor, deadline())
+            .await
+            .expect("capture actual current-operation checkpoint before target publication");
+        self.target_seed = Some(seed.clone());
         let admission = admitted(
             self.authority
                 .admit(self.request(3, 1))
@@ -291,10 +298,17 @@ impl Session {
             .identity;
         self.groups[3] = Some(
             target
-                .open_target(specification.operation, admission, deadline())
+                .open_target(seed, admission, deadline())
                 .await
                 .expect("durably open consumed target once"),
         );
+        // A later control-only entry and checkpoint force ordinary gRPC snapshot
+        // catch-up beyond the quarantine seed, without changing application rows.
+        self.group(leader)
+            .claim(specification.operation, 1, deadline())
+            .await
+            .expect("durably replay epoch before later catch-up checkpoint");
+        let cut = cluster::compact(&self.nodes[leader]).await;
         assert!(self.nodes[3].create_group(GROUP, &[4]).await.is_err(), "legacy create_group cannot initialize an already opened controlled learner as a singleton");
         self.group(leader)
             .add_learner(&executor, self.group(3), deadline())

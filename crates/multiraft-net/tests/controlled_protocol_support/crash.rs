@@ -232,6 +232,27 @@ async fn recover(root: &Path, phase: &str) {
             "late old executor epoch rejected after recovery"
         );
         if phase == "opening" {
+            let seed = session
+                .group(leader)
+                .prepare_seed(&executor, deadline())
+                .await
+                .expect(
+                    "recover unfinished target only from a fresh committed-operation checkpoint",
+                );
+            let fresh_admission = super::admitted(
+                session
+                    .authority
+                    .admit(session.request(3, 2))
+                    .await
+                    .expect("fresh boot admission resumes quarantined target"),
+            );
+            let opened = session
+                .group(3)
+                .open_target(seed.clone(), fresh_admission, deadline())
+                .await
+                .expect("verify and publish recovered target seed before ordinary RPC");
+            session.groups[3] = Some(opened);
+            session.target_seed = Some(seed.clone());
             let count = session.creations[3].load(std::sync::atomic::Ordering::SeqCst);
             let admission = super::admitted(
                 session
@@ -242,7 +263,7 @@ async fn recover(root: &Path, phase: &str) {
             );
             session
                 .group(3)
-                .open_target(specification.operation, admission, deadline())
+                .open_target(seed, admission, deadline())
                 .await
                 .expect("duplicate old open only replays after recovery");
             assert_eq!(

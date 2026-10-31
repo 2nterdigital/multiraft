@@ -41,6 +41,10 @@ pub async fn run() {
         .await
         .expect("commit sibling application rows");
     let (executing, specification, old_executor) = session.prepare(true).await;
+    let original_seed = session
+        .target_seed
+        .clone()
+        .expect("original one-shot target seed");
     assert_eq!(
         executing, source,
         "moving source is the actual committed leader"
@@ -130,7 +134,7 @@ pub async fn run() {
     );
     let duplicate = session
         .group(3)
-        .open_target(specification.operation, original_admission, deadline())
+        .open_target(original_seed.clone(), original_admission, deadline())
         .await
         .expect("postterminal duplicate replays the consumed target open");
     assert_eq!(
@@ -234,6 +238,11 @@ pub async fn run() {
         .begin(next.clone(), 1, &first, deadline())
         .await
         .expect("bind second operation after exact previous terminal");
+    let next_seed = session
+        .group(leader)
+        .prepare_seed(&next_executor, deadline())
+        .await
+        .expect("fresh checkpoint binds the new generation before rejoin");
     let admission = admitted(
         session
             .authority
@@ -247,8 +256,8 @@ pub async fn run() {
             .expect("admit rejoined source as new target generation"),
     );
     let (opened, replayed) = tokio::join!(
-        first.open_target(next.operation, admission.clone(), deadline()),
-        second.open_target(next.operation, admission, deadline())
+        first.open_target(next_seed.clone(), admission.clone(), deadline()),
+        second.open_target(next_seed, admission, deadline())
     );
     let opened = opened.expect("open rejoined generation");
     replayed.expect("concurrent open replays same consumed receipt");
@@ -275,7 +284,7 @@ pub async fn run() {
     let count_before_replay = session.creations[3].load(Ordering::SeqCst);
     if let Ok(replayed) = session
         .group(3)
-        .open_target(specification.operation, old_target_admission, deadline())
+        .open_target(original_seed, old_target_admission, deadline())
         .await
     {
         assert_eq!(
