@@ -154,6 +154,17 @@ impl<S: StateMachine> MultiRaft<S> {
         seed: Option<ControlledSeed>,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledGroup<S>, ControlledError> {
+        self.open_controlled_group_completion(request, authority, admission, seed, Some(deadline))
+            .await
+    }
+    pub(super) async fn open_controlled_group_completion(
+        self: &Arc<Self>,
+        request: ControlledOpen,
+        authority: Arc<dyn StartupAuthority>,
+        admission: StartupAdmission,
+        seed: Option<ControlledSeed>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ControlledGroup<S>, ControlledError> {
         if seed
             .as_ref()
             .is_some_and(|seed| seed.fingerprint != self.config.raft_transport_fingerprint)
@@ -169,18 +180,20 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         self.controlled_require_storage()?;
         self.ensure_node_log().await?;
-        let replay = tokio::time::timeout_at(
-            deadline,
-            self.controlled_open_replay(&request, &authority, &admission, seed.is_none()),
-        )
-        .await
-        .map_err(|_| ControlledError::Deadline {
-            outcome_unknown: false,
-        })??;
+        let replaying =
+            self.controlled_open_replay(&request, &authority, &admission, seed.is_none());
+        let replay = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, replaying)
+                .await
+                .map_err(|_| ControlledError::Deadline {
+                    outcome_unknown: false,
+                })??,
+            None => replaying.await?,
+        };
         if let Some(handle) = replay {
             return Ok(handle);
         }
-        self.controlled_run(request.group_id, deadline, move |node| async move {
+        self.controlled_run_completion(request.group_id, deadline, move |node| async move {
             node.controlled_require_storage()?;
             node.ensure_node_log().await?;
             if admission.request.group_id != request.group_id

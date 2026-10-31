@@ -205,11 +205,10 @@ impl<S: StateMachine> ControlledGroup<S> {
         &self,
         seed: ControlledSeed,
         admission: StartupAdmission,
-        deadline: tokio::time::Instant,
     ) -> Result<Self, ControlledError> {
         let operation = seed.specification.operation;
         self.node()?
-            .open_controlled_group_inner(
+            .open_controlled_group_completion(
                 ControlledOpen {
                     group_id: self.group,
                     generation: self.generation,
@@ -219,7 +218,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 self.authority.clone(),
                 admission,
                 Some(seed),
-                deadline,
+                None,
             )
             .await
     }

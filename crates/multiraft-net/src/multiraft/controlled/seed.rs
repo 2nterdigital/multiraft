@@ -207,7 +207,18 @@ pub(super) async fn install<S: StateMachine>(
             chunk = tokio::time::timeout(Duration::from_secs(30), stream.recv()) => chunk.map_err(|_| ControlledError::Rejected("seed stream idle timeout"))?,
         };
         match chunk {
-            Some(Ok(Some(chunk))) => sm.receive_disk_chunk(chunk).await?,
+            Some(Ok(Some(chunk))) => {
+                let begin = matches!(
+                    &chunk,
+                    multiraft_store::disk_snapshot::DiskChunk::Begin { .. }
+                );
+                sm.receive_disk_chunk(chunk).await?;
+                if begin {
+                    // Begin owns a fresh nonce staging directory even when transfer ids repeat.
+                    // Join destruction of the superseded directory before accepting file data.
+                    sm.wait_native_quiescent().await;
+                }
+            }
             Some(Ok(None)) => break,
             Some(Err(error)) => return Err(ControlledError::Native(error)),
             None => {

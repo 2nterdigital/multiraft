@@ -61,6 +61,20 @@ async fn encoded_scope_rejection_cannot_construct_target_and_real_port_completes
     let mut session = Session::fresh(root.as_path()).await;
     let (leader, spec, target) = session.reserve(false).await;
     let endpoint = NativeTargetEndpoint::new(target.clone(), spec.clone()).unwrap();
+    let inspected = session.nodes[3]
+        .inspect_controlled_group(
+            GROUP,
+            target.generation(),
+            target.receipt().unwrap().identity,
+            session.authority.clone(),
+        )
+        .await
+        .unwrap();
+    let inspected_port = inspected.target_port(spec.clone()).unwrap();
+    assert!(
+        inspected_port.status().await.is_err(),
+        "cold reservation without authoritative active binding cannot grant Begin"
+    );
     let scope = NativeTargetScope {
         version: NATIVE_TARGET_VERSION,
         target: endpoint.identity().clone(),
@@ -123,6 +137,11 @@ async fn encoded_scope_rejection_cannot_construct_target_and_real_port_completes
         .begin_with_port(spec.clone(), 1, &port, deadline())
         .await
         .unwrap();
+    assert_eq!(
+        inspected_port.status().await.unwrap().stage,
+        NativeTargetStage::Reserved,
+        "exact active binding authenticates cold reservation observation"
+    );
     let seed = session
         .group(leader)
         .prepare_seed(&executor, deadline())

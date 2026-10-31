@@ -25,7 +25,8 @@ struct Installation {
     scope: NativeTargetScope,
     header: NativeSeedHeader,
     admission: StartupAdmission,
-    sender: mpsc::Sender<ChunkResult>,
+    sender: Option<mpsc::Sender<ChunkResult>>,
+    accepting: bool,
     next: u64,
     last: Option<(u64, Vec<u8>)>,
     outcome: Arc<Mutex<Option<Result<(), NativeTargetTransportError>>>>,
@@ -39,6 +40,7 @@ pub struct NativeTargetEndpoint<S: StateMachine> {
     specification: ReplacementSpec,
     identity: NativeTargetIdentity,
     installation: Arc<tokio::sync::Mutex<Option<Installation>>>,
+    restarting: Arc<tokio::sync::Mutex<()>>,
 }
 impl<S: StateMachine> std::fmt::Debug for NativeTargetEndpoint<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -54,6 +56,7 @@ impl<S: StateMachine> Clone for NativeTargetEndpoint<S> {
             specification: self.specification.clone(),
             identity: self.identity.clone(),
             installation: self.installation.clone(),
+            restarting: self.restarting.clone(),
         }
     }
 }
@@ -75,9 +78,7 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
             .difference(&old)
             .copied()
             .collect();
-        if (receipt.stage == ControlledGroupStage::Reserved
-            && target.target_specification.as_ref() != Some(&specification))
-            || added != [node.node_id]
+        if added != [node.node_id]
             || target.generation != specification.target_generation
             || target
                 .target_specification
@@ -100,6 +101,7 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
             specification,
             identity,
             installation: Arc::default(),
+            restarting: Arc::default(),
         })
     }
     pub fn identity(&self) -> &NativeTargetIdentity {
@@ -170,7 +172,7 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                 let state = state
                     .as_mut()
                     .ok_or(ControlledError::Rejected("seed stream was not started"))?;
-                if state.scope != request.scope {
+                if state.scope != request.scope || !state.accepting {
                     return Err(ControlledError::Rejected(
                         "seed transfer correlation mismatch",
                     ));
@@ -182,7 +184,14 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                 if *sequence != state.next {
                     return Err(ControlledError::Rejected("seed chunk sequence mismatch"));
                 }
-                if state.sender.send(Ok(chunk.clone())).await.is_err() {
+                if state
+                    .sender
+                    .as_ref()
+                    .ok_or(ControlledError::Rejected("superseded seed input"))?
+                    .send(Ok(chunk.clone()))
+                    .await
+                    .is_err()
+                {
                     let outcome = state.outcome.clone();
                     let changed = state.changed.clone();
                     loop {
@@ -212,7 +221,7 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                     let state = state
                         .as_ref()
                         .ok_or(ControlledError::Rejected("seed stream was not started"))?;
-                    if state.scope != request.scope {
+                    if state.scope != request.scope || !state.accepting {
                         return Err(ControlledError::Rejected(
                             "seed transfer correlation mismatch",
                         ));
@@ -248,6 +257,7 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
         if manifest.meta != header.meta
             || header.record.specification != self.specification
             || header.record.terminal.is_some()
+            || header.record.executor_epoch == 0
             || header.meta.last_membership != self.specification.expected_start
             || !header.vote.committed
             || header
@@ -259,8 +269,10 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                 "seed header operation or configuration mismatch",
             ));
         }
+        let _restarting = self.restarting.lock().await;
         let catalog = self.target.authority.read(self.identity.group).await?;
-        if !catalog.admissions.contains(&admission)
+        if catalog.group_id != self.identity.group
+            || !catalog.admissions.contains(&admission)
             || admission.request.node_id != self.identity.node
             || admission.request.group_id != self.identity.group
             || admission.request.generation != self.identity.generation
@@ -270,7 +282,8 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
             ));
         }
         let bound = catalog.active_operation.as_ref().is_some_and(|binding| {
-            binding.specification == self.specification
+            binding.group_id == self.identity.group
+                && binding.specification == self.specification
                 && binding.target.node_id == self.identity.node
                 && binding.target.generation == self.identity.generation
                 && binding.target.consumption_id == self.identity.consumption
@@ -292,16 +305,136 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
                 Some(self.observe(None, None).await?),
             ));
         }
-        let mut state = self.installation.lock().await;
-        if let Some(existing) = state.as_ref() {
-            if existing.scope != scope
-                || existing.header != header
-                || existing.admission != admission
+        let old =
             {
-                return Err(ControlledError::Rejected("seed transfer identity conflict"));
+                let mut state = self.installation.lock().await;
+                if let Some(existing) = state.as_mut() {
+                    if existing.scope == scope
+                        && existing.header == header
+                        && existing.admission == admission
+                        && existing.accepting
+                    {
+                        return Ok((NativeTargetOutcome::InProgress, None));
+                    }
+                    if existing.scope.correlation == scope.correlation {
+                        return Err(ControlledError::Rejected(
+                            "seed correlation was consumed or changed",
+                        ));
+                    }
+                    let outcome = existing.outcome.lock().expect("seed outcome lock poisoned");
+                    // Failed unverified input cannot permanently raise the native operation fence.
+                    if outcome.as_ref().is_none_or(|outcome| outcome.is_ok())
+                        && (header.record.executor_epoch < existing.header.record.executor_epoch
+                            || !super::super::seed::covers(
+                                header
+                                    .meta
+                                    .last_log_id
+                                    .ok_or(ControlledError::Rejected("seed floor missing"))?,
+                                existing.header.meta.last_log_id.ok_or(
+                                    ControlledError::Rejected("accepted seed floor missing"),
+                                )?,
+                            ))
+                    {
+                        return Err(ControlledError::Rejected(
+                            "seed retry regresses accepted epoch or floor",
+                        ));
+                    }
+                    drop(outcome);
+                    existing.accepting = false;
+                    Some((
+                        existing.sender.take(),
+                        existing.outcome.clone(),
+                        existing.changed.clone(),
+                    ))
+                } else {
+                    None
+                }
+            };
+        if let Some((sender, outcome, changed)) = old {
+            if let Some(sender) = sender {
+                let _ = sender
+                    .send(Err("seed transfer explicitly superseded".to_owned()))
+                    .await;
             }
-            return Ok((NativeTargetOutcome::InProgress, None));
+            // This is the real owned command completion, with no waiter deadline.
+            loop {
+                let notified = changed.notified();
+                if outcome
+                    .lock()
+                    .expect("seed outcome lock poisoned")
+                    .is_some()
+                {
+                    break;
+                }
+                notified.await;
+            }
+            let node = self.target.node()?;
+            let owner = node.group_owner(self.identity.group);
+            let anchor_ready = {
+                let _command = owner.serial.lock().await;
+                let receipt = self.target.checked_receipt()?;
+                if receipt.stage == ControlledGroupStage::Opened {
+                    return Ok((
+                        NativeTargetOutcome::Durable,
+                        Some(self.observe(None, None).await?),
+                    ));
+                }
+                if !matches!(
+                    receipt.stage,
+                    ControlledGroupStage::Reserved | ControlledGroupStage::Opening
+                ) {
+                    return Err(ControlledError::Rejected(
+                        "superseded target is no longer constructible",
+                    ));
+                }
+                if let Ok((_, mut sm)) = node.controlled_parts(self.identity.group) {
+                    sm.wait_native_quiescent().await;
+                    let actual = sm.controlled_ledger().await?.current;
+                    if let Some(actual) =
+                        actual.filter(|actual| actual.specification == self.specification)
+                    {
+                        let (applied, _) = sm
+                            .applied_state()
+                            .await
+                            .map_err(|error| ControlledError::Native(error.to_string()))?;
+                        if header.record.executor_epoch < actual.executor_epoch
+                            || applied.is_some_and(|floor| {
+                                header
+                                    .meta
+                                    .last_log_id
+                                    .is_none_or(|cut| !super::super::seed::covers(cut, floor))
+                            })
+                        {
+                            return Err(ControlledError::Rejected(
+                                "seed retry regresses actual native operation",
+                            ));
+                        }
+                    }
+                    super::super::seed::recover_anchor(&node, &self.open_request()).await?
+                } else {
+                    false
+                }
+            };
+            if anchor_ready {
+                let mut request = self.open_request();
+                request.mode = ControlledOpenMode::Recover;
+                node.open_controlled_group_completion(
+                    request,
+                    self.target.authority.clone(),
+                    admission.clone(),
+                    None,
+                    None,
+                )
+                .await?;
+                return Ok((
+                    NativeTargetOutcome::Durable,
+                    Some(self.observe(None, None).await?),
+                ));
+            }
         }
+        // Publish the session in the same poll as native task registration: losing the
+        // RPC waiter cannot leave an admitted command without its retained completion.
+        let mut state = self.installation.lock().await;
         let (sender, receiver) = mpsc::channel(1);
         let outcome = Arc::new(Mutex::new(None));
         let changed = Arc::new(Notify::new());
@@ -324,11 +457,7 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
             .watchers
             .spawn(async move {
                 let result = target
-                    .open_target_input(
-                        seed,
-                        opening_admission,
-                        tokio::time::Instant::now() + Duration::from_secs(120),
-                    )
+                    .open_target_input(seed, opening_admission)
                     .await
                     .map(|_| ())
                     .map_err(|error| NativeTargetTransportError {
@@ -345,13 +474,24 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
             scope,
             header,
             admission,
-            sender,
+            sender: Some(sender),
+            accepting: true,
             next: 0,
             last: None,
             outcome,
             changed,
         });
         Ok((NativeTargetOutcome::InProgress, None))
+    }
+    fn open_request(&self) -> ControlledOpen {
+        ControlledOpen {
+            group_id: self.identity.group,
+            generation: self.identity.generation,
+            identity: self.identity.consumption.clone(),
+            mode: ControlledOpenMode::Target {
+                operation: self.specification.operation,
+            },
+        }
     }
     async fn observe(
         &self,
@@ -374,6 +514,22 @@ impl<S: StateMachine> NativeTargetEndpoint<S> {
             ControlledGroupStage::LogsCleaned => NativeTargetStage::LogsCleaned,
             ControlledGroupStage::Cleaned => NativeTargetStage::Cleaned,
         };
+        if stage == NativeTargetStage::Reserved && self.target.target_specification.is_none() {
+            let catalog = self.target.authority.read(self.identity.group).await?;
+            if catalog.group_id != self.identity.group
+                || catalog.active_operation.as_ref().is_none_or(|binding| {
+                    binding.group_id != self.identity.group
+                        || binding.specification != self.specification
+                        || binding.target.node_id != self.identity.node
+                        || binding.target.generation != self.identity.generation
+                        || binding.target.consumption_id != receipt.identity
+                })
+            {
+                return Err(ControlledError::Rejected(
+                    "inspected reservation lacks exact active native binding",
+                ));
+            }
+        }
         if stage != NativeTargetStage::Opened {
             if configuration.is_some() {
                 return Err(ControlledError::Rejected("target core not opened"));
