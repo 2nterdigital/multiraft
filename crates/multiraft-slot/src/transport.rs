@@ -20,7 +20,10 @@ pub struct SlotTransportConfig {
 }
 impl SlotTransportConfig {
     pub fn validate(&self, layout: &ClusterLayout) -> Result<(), RuntimeError> {
-        if self.nodes.len() != layout.nodes().len()
+        self.validate_nodes(layout.nodes())
+    }
+    pub(crate) fn validate_nodes(&self, nodes: &[crate::NodeAddress]) -> Result<(), RuntimeError> {
+        if self.nodes.len() != nodes.len()
             || self.raft_bind.port() == 0
             || self.application_rpc_bind.port() == 0
         {
@@ -41,7 +44,7 @@ impl SlotTransportConfig {
                     )
                 })
                 .collect::<Vec<_>>();
-            multiraft_core::validate_dial_catalog(&peers, layout.nodes().iter().map(|n| n.node_id))
+            multiraft_core::validate_dial_catalog(&peers, nodes.iter().map(|n| n.node_id))
                 .map_err(|_| RuntimeError::InvalidConfig)?;
         }
         Ok(())
@@ -56,4 +59,18 @@ impl SlotTransportConfig {
             listen_address: self.raft_bind,
         }
     }
+}
+
+/// Local sockets confirmed by successful strict startup, separate from advertised peer addresses.
+/// These facts can become stale immediately and do not establish remote reachability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotTransportAddresses {
+    /// Local advertised identity from the supplied directory snapshot.
+    pub advertised: crate::NodeAddress,
+    /// Nonzero native Raft listener socket; a wildcard bind stays a wildcard.
+    pub raft_bind: SocketAddr,
+    /// Nonzero application RPC listener socket, independent from its advertised address.
+    pub application_rpc_bind: SocketAddr,
+    /// Source directory revision used when this owner started.
+    pub directory_version: u64,
 }

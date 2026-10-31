@@ -16,7 +16,7 @@ use tokio::time::Instant;
 
 const SERVICE: u32 = 0x534c4f54;
 const METHOD: u32 = 1;
-// 2: 256-bucket route table and layout v2 digest.
+// 2: 256-bucket route table and compatibility digest (strict startup binds the data space).
 const VERSION: u32 = 2;
 // Reserve ample room for protobuf tags, IDs and transport framing.
 const MAX_ENVELOPE: usize = APPLICATION_RPC_OUTER_BYTES - 1024;
@@ -114,7 +114,7 @@ impl<S: SlotStateMachine> ApplicationRpcHandler for Handler<S> {
                 let request: Envelope = decode(&call.payload)?;
                 if request.version != VERSION
                     || request.cluster != shared.layout.cluster_id()
-                    || request.digest != shared.layout.digest()
+                    || request.digest != shared.transport_digest
                 {
                     return Err(RuntimeError::LayoutMismatch);
                 }
@@ -176,7 +176,7 @@ impl<S: SlotStateMachine> ApplicationRpcHandler for Handler<S> {
             .await;
             let bytes = encode(&Reply {
                 version: VERSION,
-                digest: shared.layout.digest(),
+                digest: shared.transport_digest,
                 result,
             })
             .map_err(|_| {
@@ -371,7 +371,7 @@ async fn remote<S: SlotStateMachine>(
     let payload = encode(&Envelope {
         version: VERSION,
         cluster: shared.layout.cluster_id().to_owned(),
-        digest: shared.layout.digest(),
+        digest: shared.transport_digest,
         slot,
         key,
         operation,
@@ -398,7 +398,7 @@ async fn remote<S: SlotStateMachine>(
             RuntimeError::Unavailable
         }
     })?;
-    if reply.version != VERSION || reply.digest != shared.layout.digest() {
+    if reply.version != VERSION || reply.digest != shared.transport_digest {
         return Err(if write {
             RuntimeError::Unknown
         } else {
