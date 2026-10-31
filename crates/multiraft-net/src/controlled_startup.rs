@@ -47,18 +47,23 @@ pub struct StartupBinding {
     pub group_id: GroupId,
     pub specification: ReplacementSpec,
     pub source: NodeId,
+    /// Exact old source generation retained for cleanup after retirement.
+    pub source_generation: u64,
     pub target: StartupTargetGeneration,
 }
 
 /// Exact native committed/applied terminal evidence, verified by the controlled runtime.
 ///
 /// Implementations must validate the full native operation, final single voter config,
-/// complete committed/applied membership identity and target durable Opened receipt. A
+/// complete committed/applied membership identity, native terminal barrier and target
+/// durable Opened receipt. `native_record.terminal` must be present and match this proof. A
 /// management status, local stop, effective-only config, or source acknowledgement is
 /// insufficient. The adapter accepts this only from the trusted native proof verifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartupTerminalProof {
     pub group_id: GroupId,
+    /// Retired source generation; old terminal evidence cannot clean a later generation.
+    pub source_generation: u64,
     pub native_record: OperationRecord,
     pub committed_membership: StoredMembership,
     pub applied_membership: StoredMembership,

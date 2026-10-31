@@ -23,7 +23,7 @@ fn membership(index: u64, voters: &[u64]) -> StoredMembership {
     )
 }
 fn provision(path: &Path) -> FileAuthority {
-    FileAuthority::provision(
+    let authority = FileAuthority::provision(
         path,
         StartupCatalog {
             group_id: 7,
@@ -34,7 +34,9 @@ fn provision(path: &Path) -> FileAuthority {
             admissions: vec![],
             completed: vec![],
         },
-    )
+    );
+    authority.consume_target(binding().target).unwrap();
+    authority
 }
 fn request(node_id: u64, generation: u64, nonce: u8) -> StartupRequest {
     StartupRequest {
@@ -57,6 +59,7 @@ fn binding() -> StartupBinding {
             target_generation: 40,
         },
         source: 1,
+        source_generation: 10,
         target: StartupTargetGeneration {
             node_id: 4,
             generation: 40,
@@ -67,9 +70,21 @@ fn binding() -> StartupBinding {
 fn terminal(binding: &StartupBinding) -> StartupTerminalProof {
     StartupTerminalProof {
         group_id: 7,
+        source_generation: binding.source_generation,
         native_record: OperationRecord {
             specification: binding.specification.clone(),
             executor_epoch: 2,
+            terminal: Some(multiraft_core::TerminalProof {
+                configuration: membership(8, &[2, 3, 4]),
+                barrier: log_id::<multiraft_core::TypeConfig>(1, 1, 9),
+                target_open: multiraft_core::TargetOpenReceipt {
+                    operation: binding.specification.operation,
+                    target_node: 4,
+                    generation: 40,
+                    applied: log_id::<multiraft_core::TypeConfig>(1, 1, 8),
+                    receipt: binding.target.consumption_id.clone(),
+                },
+            }),
         },
         committed_membership: membership(8, &[2, 3, 4]),
         applied_membership: membership(8, &[2, 3, 4]),
@@ -152,6 +167,7 @@ async fn uncertain_terminal_handoff_reopens_with_atomic_retirement_and_cold_star
     assert_eq!(readback.active_operation, None);
     assert_eq!(readback.authorized, [(2, 20), (3, 30), (4, 40)].into());
     assert_eq!(readback.completed, vec![proof.clone()]);
+    assert_eq!(readback.completed[0].source_generation, 10);
     assert!(
         readback.admissions.contains(&delayed),
         "late physical source open is still tracked; native config provides exclusion"
@@ -212,9 +228,20 @@ async fn effective_only_or_wrong_operation_or_unconsumed_generation_cannot_final
     wrong_operation.native_record.specification.operation.nonce = [8; 16];
     let mut wrong_target = proof.clone();
     wrong_target.target_opened.generation = 41;
+    let mut wrong_source_generation = proof.clone();
+    wrong_source_generation.source_generation = 11;
+    let mut no_native_terminal = proof.clone();
+    no_native_terminal.native_record.terminal = None;
     let mut wrong_log = proof;
     wrong_log.applied_log = log_id::<multiraft_core::TypeConfig>(2, 2, 8);
-    for invalid in [unapplied, wrong_operation, wrong_target, wrong_log] {
+    for invalid in [
+        unapplied,
+        wrong_operation,
+        wrong_target,
+        wrong_log,
+        no_native_terminal,
+        wrong_source_generation,
+    ] {
         assert_eq!(
             authority.terminal_handoff(invalid).await.unwrap(),
             StartupAuthorityResult::Rejected(StartupAuthorityRejection::InvalidProof)
@@ -257,4 +284,52 @@ fn independent_handles_linearize_source_start_against_binding() {
             other => panic!("unexpected raced outcome {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn caller_claimed_target_consumption_is_not_a_durable_receipt() {
+    let directory = directory();
+    let path = directory.path().join("catalog.json");
+    let authority = provision(&path);
+    let mut forged = binding();
+    forged.target.consumption_id = b"not-in-durable-registry".to_vec();
+    assert_eq!(
+        authority.bind_active(forged).await.unwrap(),
+        StartupAuthorityResult::Rejected(StartupAuthorityRejection::IdentityConflict)
+    );
+    assert!(FileAuthority::open(&path)
+        .read(7)
+        .await
+        .unwrap()
+        .active_operation
+        .is_none());
+}
+
+#[tokio::test]
+async fn bootstrap_provisioning_records_native_identity_once_before_binding() {
+    let directory = directory();
+    let path = directory.path().join("catalog.json");
+    let authority = provision(&path);
+    let actual = membership(3, &[1, 2, 3]);
+    authority.bootstrap_membership(actual.clone()).unwrap();
+    drop(authority);
+    let reopened = FileAuthority::open(&path);
+    assert_eq!(reopened.read(7).await.unwrap().membership, actual);
+    let mut binding = binding();
+    binding.specification.expected_start = actual.clone();
+    applied(reopened.bind_active(binding).await.unwrap());
+    assert!(reopened.bootstrap_membership(actual).is_err());
+}
+
+#[tokio::test]
+async fn binding_cannot_claim_a_different_source_generation() {
+    let directory = directory();
+    let path = directory.path().join("catalog.json");
+    let authority = provision(&path);
+    let mut forged = binding();
+    forged.source_generation = 11;
+    assert_eq!(
+        authority.bind_active(forged).await.unwrap(),
+        StartupAuthorityResult::Rejected(StartupAuthorityRejection::IdentityConflict)
+    );
 }
