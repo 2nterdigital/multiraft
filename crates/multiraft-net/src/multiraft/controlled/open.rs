@@ -61,6 +61,9 @@ impl<S: StateMachine> MultiRaft<S> {
                         &identity,
                     )?;
                     owners.insert(group, Arc::new(GroupOwner::default()));
+                    if let NetBackend::Grpc { router } = &self.net {
+                        router.reopen_group_sends(group);
+                    }
                 }
             }
         }
@@ -412,7 +415,11 @@ impl<S: StateMachine> MultiRaft<S> {
         let disk = fsm.disk_state().ok_or(ControlledError::Rejected(
             "controlled group requires a disk-backed FSM",
         ))?;
-        if disk.snapshot_workspace()? != workspace || !live.join("CURRENT").is_file() {
+        let declared = disk.storage_paths()?;
+        if declared.live != live
+            || declared.workspace != workspace
+            || disk.snapshot_workspace()? != workspace
+        {
             return Err(ControlledError::Rejected(
                 "controlled FSM must own the canonical DiskFsmDb namespace",
             ));

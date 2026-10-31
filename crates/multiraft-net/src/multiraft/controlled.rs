@@ -9,6 +9,7 @@ mod cleanup;
 mod open;
 mod owner;
 mod source;
+mod terminal;
 pub(super) use owner::GroupOwner;
 
 /// A controlled open always distinguishes a new bootstrap from durable recovery.
