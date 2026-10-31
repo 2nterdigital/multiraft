@@ -74,6 +74,7 @@ pub struct ControlledSeed {
     specification: ReplacementSpec,
     record: multiraft_core::OperationRecord,
     vote: multiraft_core::typ::Vote,
+    fingerprint: Option<[u8; 32]>,
     meta: multiraft_core::typ::SnapshotMeta,
     manifest: Vec<u8>,
 }
@@ -100,6 +101,7 @@ pub struct ControlledTerminal {
     group: GroupId,
     source: NodeId,
     source_generation: u64,
+    fingerprint: Option<[u8; 32]>,
     proof: TerminalProof,
     specification: ReplacementSpec,
 }

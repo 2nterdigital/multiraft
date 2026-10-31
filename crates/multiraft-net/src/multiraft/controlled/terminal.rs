@@ -8,6 +8,8 @@ use multiraft_core::OperationRecord;
 impl<S: StateMachine> ControlledGroup<S> {
     /// Reconcile an immutable native terminal or retained completed handoff after a crash.
     /// A new ReadIndex and durable native high-water mark precede sealing cleanup evidence.
+    /// The configured startup authority must bind catalog and completed facts to this
+    /// runtime's data space; the high-water mark does not authenticate another catalog.
     pub async fn reconcile_terminal(
         &self,
         operation: OperationId,
@@ -144,6 +146,7 @@ pub(super) async fn handoff<S: StateMachine>(
         group: this.group,
         source: source[0],
         source_generation,
+        fingerprint: this.node()?.config.raft_transport_fingerprint,
         proof,
         specification: record.specification,
     })

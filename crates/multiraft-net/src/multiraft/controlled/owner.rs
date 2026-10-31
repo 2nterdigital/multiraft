@@ -7,6 +7,7 @@ pub(in crate::multiraft) struct GroupOwner {
     pub(in crate::multiraft) commands: tasks::OwnedTasks,
     pub(in crate::multiraft) watchers: tasks::OwnedTasks,
     pub(in crate::multiraft) maintenance: tasks::OwnedTasks,
+    pub(in crate::multiraft) fsm_release: Mutex<Option<multiraft_store::StateMachineRelease>>,
     stopped: tokio::sync::watch::Sender<bool>,
 }
 impl Default for GroupOwner {
@@ -16,6 +17,7 @@ impl Default for GroupOwner {
             commands: tasks::OwnedTasks::default(),
             watchers: tasks::OwnedTasks::default(),
             maintenance: tasks::OwnedTasks::default(),
+            fsm_release: Mutex::default(),
             stopped: tokio::sync::watch::channel(false).0,
         }
     }
@@ -34,18 +36,13 @@ impl GroupOwner {
         self.stopped.subscribe()
     }
     pub(in crate::multiraft) async fn join(&self) -> Result<(), ControlledError> {
-        self.commands
-            .join()
-            .await
-            .map_err(|error| ControlledError::Native(error.to_string()))?;
-        self.watchers
-            .join()
-            .await
-            .map_err(|error| ControlledError::Native(error.to_string()))?;
-        self.maintenance
-            .join()
-            .await
-            .map_err(|error| ControlledError::Native(error.to_string()))
+        let mut first_error = None;
+        for registry in [&self.commands, &self.watchers, &self.maintenance] {
+            if let Err(error) = registry.join().await {
+                first_error.get_or_insert_with(|| ControlledError::Native(error.to_string()));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 impl<S: StateMachine> MultiRaft<S> {
@@ -174,7 +171,11 @@ impl<S: StateMachine> MultiRaft<S> {
             .clone()
             .map_err(|error| ControlledError::Native(error.to_string()))
     }
-    pub(super) fn publish_controlled_group(&self, group: GroupId) -> Result<(), ControlledError> {
+    pub(super) async fn publish_controlled_group(
+        &self,
+        group: GroupId,
+    ) -> Result<(), ControlledError> {
+        let _construction = self.controlled_construction.read().await;
         if self
             .snapshot_rt
             .stopping

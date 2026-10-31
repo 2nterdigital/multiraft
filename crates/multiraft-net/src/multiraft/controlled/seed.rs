@@ -14,6 +14,7 @@ struct SeedAnchor {
     specification: ReplacementSpec,
     record: multiraft_core::OperationRecord,
     vote: Vote,
+    fingerprint: Option<[u8; 32]>,
     meta: SnapshotMeta,
 }
 fn anchor_path(root: &std::path::Path, group: GroupId, generation: u64) -> PathBuf {
@@ -87,6 +88,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                     specification: record.specification.clone(),
                     record,
                     vote,
+                    fingerprint: node.config.raft_transport_fingerprint,
                     meta: snapshot.meta,
                     manifest,
                 })
@@ -97,7 +99,7 @@ impl<S: StateMachine> ControlledGroup<S> {
 fn native(error: impl std::fmt::Display) -> ControlledError {
     ControlledError::Native(error.to_string())
 }
-fn covers(actual: LogId, floor: LogId) -> bool {
+pub(super) fn covers(actual: LogId, floor: LogId) -> bool {
     actual >= floor
         && actual.index >= floor.index
         && (actual.index != floor.index || actual == floor)
@@ -123,6 +125,7 @@ fn validate_anchor<S: StateMachine>(
         || anchor.group != request.group_id
         || anchor.generation != request.generation
         || anchor.identity != request.identity
+        || anchor.fingerprint != node.config.raft_transport_fingerprint
         || anchor.specification.target_generation != request.generation
         || target != [node.node_id]
         || anchor.record.specification != anchor.specification
@@ -155,6 +158,7 @@ pub(super) async fn install<S: StateMachine>(
         specification: seed.specification,
         record: seed.record,
         vote: seed.vote,
+        fingerprint: seed.fingerprint,
         meta: seed.meta,
     };
     let cut = validate_anchor(node, request, &anchor)?;

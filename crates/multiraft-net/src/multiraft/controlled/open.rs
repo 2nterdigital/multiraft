@@ -40,6 +40,13 @@ impl<S: StateMachine> MultiRaft<S> {
             .map_err(|error| ControlledError::Native(error.to_string()))?;
         let mut digest = sha2::Sha256::new();
         digest.update(b"multiraft-target-consumption-v1");
+        match self.config.raft_transport_fingerprint {
+            Some(fingerprint) => {
+                digest.update([1]);
+                digest.update(fingerprint);
+            }
+            None => digest.update([0]),
+        }
         digest.update((specification_bytes.len() as u64).to_be_bytes());
         digest.update(specification_bytes);
         digest.update(&identity);
@@ -147,6 +154,14 @@ impl<S: StateMachine> MultiRaft<S> {
         seed: Option<ControlledSeed>,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledGroup<S>, ControlledError> {
+        if seed
+            .as_ref()
+            .is_some_and(|seed| seed.fingerprint != self.config.raft_transport_fingerprint)
+        {
+            return Err(ControlledError::Rejected(
+                "seed transport domain does not match the target",
+            ));
+        }
         if request.generation == 0 || request.identity.is_empty() {
             return Err(ControlledError::Rejected(
                 "controlled generation and identity must be nonempty",
@@ -203,7 +218,17 @@ impl<S: StateMachine> MultiRaft<S> {
                         }
                     }
                     if old.is_none()
-                        && (voters.len() != 3
+                        && (catalog.membership.log_id().is_some()
+                            || catalog.active_operation.is_some()
+                            || !catalog.completed.is_empty()
+                            || catalog.membership.membership().get_joint_config().len() != 1
+                            || catalog
+                                .membership
+                                .membership()
+                                .learner_ids()
+                                .next()
+                                .is_some()
+                            || voters.len() != 3
                             || !voters.contains(&node.node_id)
                             || *voters != catalog.membership.membership().voter_ids().collect()
                             || node.log_provenance(request.group_id)?
@@ -285,6 +310,7 @@ impl<S: StateMachine> MultiRaft<S> {
                         ));
                     }
                     if old.stage == ControlledGroupStage::Opening
+                        && !bootstrap::owns_generation(&node, &request)?
                         && catalog.active_operation.as_ref().is_none_or(|binding| {
                             binding.target.node_id != node.node_id
                                 || binding.target.generation != request.generation
@@ -297,8 +323,9 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                 }
             }
+            let bootstrap_generation = bootstrap::owns_generation(&node, &request)?;
             let quarantine = !matches!(&request.mode, ControlledOpenMode::BootstrapNew { .. })
-                && !bootstrap::owns_generation(&node, &request)?;
+                || bootstrap::has_anchor(&node, request.group_id)?;
             if node.controlled_parts(request.group_id).is_err() {
                 let root = node.config.data_dir.clone();
                 let consumed_admission = admission.clone();
@@ -333,6 +360,9 @@ impl<S: StateMachine> MultiRaft<S> {
                 let ready = if let Some(seed) = seed {
                     super::seed::install(&node, &request, &authority, seed).await?;
                     true
+                } else if bootstrap_generation {
+                    bootstrap::recover_anchor(&node, &request).await?;
+                    true
                 } else {
                     super::seed::recover_anchor(&node, &request).await?
                 };
@@ -348,7 +378,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 ControlledGroupStage::Opened,
             )?;
             if quarantine {
-                node.publish_controlled_group(request.group_id)?;
+                node.publish_controlled_group(request.group_id).await?;
             }
             Ok(ControlledGroup::handle(&node, &request, authority))
         })

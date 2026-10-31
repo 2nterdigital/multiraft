@@ -142,7 +142,8 @@ impl<S: StateMachine> StateMachineStore<S> {
             .is_some_and(|native| native.closing.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    /// Called after native core shutdown; wait for owned transition/capture work.
+    /// Wait for admitted transition, capture and receive work to finish.
+    /// Closing owners also drain staged transfers; open owners preserve them for install.
     pub async fn wait_native_quiescent(&self) {
         let _validation = self.validation.transition.lock().await;
         let _work = self.validation.work.clone().acquire_owned().await;
@@ -152,6 +153,12 @@ impl<S: StateMachine> StateMachineStore<S> {
         };
         let _disk = self.disk_rt.transition.lock().await;
         let _receiving = self.disk_rt.receiving.lock().await;
+        // A receive/verification admitted before close may have restored its
+        // transfer after close's first drain. No receiver can restore it now.
+        if self.native_is_closing() {
+            let incoming = self.disk_rt.incoming.lock().unwrap().take();
+            drop(incoming);
+        }
         self.disk_rt.cleanup.wait().await;
         let _application = self.inner.lock().await;
     }

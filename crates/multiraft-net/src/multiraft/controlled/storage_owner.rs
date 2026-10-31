@@ -9,6 +9,7 @@ struct StorageOwner {
     group: GroupId,
     generation: u64,
     identity: Vec<u8>,
+    fingerprint: Option<[u8; 32]>,
     live: PathBuf,
     workspace: PathBuf,
 }
@@ -64,6 +65,7 @@ impl<S: StateMachine> MultiRaft<S> {
             group,
             generation: receipt.generation,
             identity: receipt.identity,
+            fingerprint: self.config.raft_transport_fingerprint,
             live,
             workspace,
         };
@@ -92,6 +94,7 @@ impl<S: StateMachine> ControlledGroup<S> {
             || record.group != self.group
             || record.generation != self.generation
             || record.identity != self.identity
+            || record.fingerprint != node.config.raft_transport_fingerprint
             || record.live != live
             || record.workspace != workspace
         {

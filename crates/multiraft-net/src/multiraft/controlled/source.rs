@@ -22,6 +22,13 @@ impl<S: StateMachine> ControlledGroup<S> {
                 let (raft, sm) = node.controlled_parts(this.group)?;
                 let leader = current_leader(&raft, node.node_id).await?;
                 let target_node = target.node()?;
+                if target_node.config.raft_transport_fingerprint
+                    != node.config.raft_transport_fingerprint
+                {
+                    return Err(ControlledError::Rejected(
+                        "target transport domain does not match the source",
+                    ));
+                }
                 let target_receipt = target.checked_receipt()?;
                 if this.group != target.group
                     || specification.target_generation != target.generation
@@ -165,6 +172,13 @@ impl<S: StateMachine> ControlledGroup<S> {
                 let (raft, sm) = node.controlled_parts(this.group)?;
                 let record = checked_executor(&raft, &sm, &executor, node.node_id).await?;
                 let target_node = target.node()?;
+                if target_node.config.raft_transport_fingerprint
+                    != node.config.raft_transport_fingerprint
+                {
+                    return Err(ControlledError::Rejected(
+                        "target transport domain does not match the source",
+                    ));
+                }
                 let receipt = target.checked_receipt()?;
                 let old: BTreeSet<_> = record
                     .specification
@@ -497,6 +511,11 @@ async fn target_receipt_at<S: StateMachine>(
     configuration: &multiraft_core::typ::StoredMembership,
 ) -> Result<TargetOpenReceipt, ControlledError> {
     let target_node = target.node()?;
+    if target_node.config.raft_transport_fingerprint != source.config.raft_transport_fingerprint {
+        return Err(ControlledError::Rejected(
+            "target transport domain does not match the source",
+        ));
+    }
     let old: BTreeSet<_> = specification
         .expected_start
         .membership()
