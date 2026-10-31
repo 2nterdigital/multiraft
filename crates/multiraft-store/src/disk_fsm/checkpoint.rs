@@ -45,6 +45,11 @@ impl DiskFsmDb {
         let mut options = self.options.db_options.clone();
         options.create_if_missing(false);
         options.create_missing_column_families(false);
+        // Read-only RocksDB opens may emit diagnostic logs. Keep them outside
+        // the immutable manifest-bound checkpoint that senders will transfer.
+        let diagnostics = self.snapshot_workspace()?.join("inspection-logs");
+        std::fs::create_dir_all(&diagnostics)?;
+        options.set_db_log_dir(diagnostics);
         if !dir.join("CURRENT").try_exists()? {
             return Err(invalid("received checkpoint is not a database"));
         }
