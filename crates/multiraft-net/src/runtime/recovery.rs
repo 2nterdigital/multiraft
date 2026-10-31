@@ -8,11 +8,19 @@ pub(super) enum StartupTiming {
     NativeWait(Duration),
 }
 
+/// Legacy creation may initialize; strict recovery never does.
+#[derive(Clone, Copy)]
+pub(super) enum StartupKind {
+    Legacy,
+    PersistedOnly,
+}
+
 impl<S: StateMachine> RuntimeShared<S> {
     pub(super) async fn recover_group(
         &self,
         group: GroupConfig,
         timing: StartupTiming,
+        kind: StartupKind,
     ) -> Result<(), RuntimeError> {
         if *self.abort_requests.borrow() || !self.accepting.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
@@ -29,7 +37,7 @@ impl<S: StateMachine> RuntimeShared<S> {
         // One constructor/basis/validator pipeline for both contracts. The
         // compatibility timeout covers only the native wait, as legacy consumers
         // required; it never disables validation or changes the native basis.
-        let pipeline = self.construct_wait_validate(&group, timing);
+        let pipeline = self.construct_wait_validate(&group, timing, kind);
         match timing {
             StartupTiming::Absolute(deadline) => {
                 tokio::time::timeout_at(deadline, pipeline)
@@ -60,10 +68,16 @@ impl<S: StateMachine> RuntimeShared<S> {
         &self,
         group: &GroupConfig,
         timing: StartupTiming,
+        kind: StartupKind,
     ) -> Result<(), RuntimeError> {
-        self.node
-            .create_group(group.group_id, &group.voters)
-            .await?;
+        match kind {
+            StartupKind::Legacy => {
+                self.node
+                    .create_group(group.group_id, &group.voters)
+                    .await?
+            }
+            StartupKind::PersistedOnly => self.node.recover_existing_group(group.group_id).await?,
+        }
         let timeout = match timing {
             StartupTiming::Absolute(deadline) => deadline.saturating_duration_since(Instant::now()),
             StartupTiming::NativeWait(timeout) => timeout,
