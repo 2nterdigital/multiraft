@@ -46,6 +46,19 @@ fn unsupported(operation: &str) -> io::Error {
     )
 }
 
+/// Exclusive, deletable directories explicitly owned by one disk-backed Group.
+///
+/// Reporting this capability promises that all live durable FSM data is under
+/// `live` and all snapshot/install data is under `workspace`. Neither directory
+/// may own another Group's or shared data. Callers must independently validate
+/// both paths against their canonical Group ownership before admitting controlled
+/// work, and join all Core/FSM/task owners before deleting either directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskStoragePaths {
+    pub live: PathBuf,
+    pub workspace: PathBuf,
+}
+
 /// Disk-backed mode: the state machine owns its durable store and commits each
 /// entry's rows together with the applied position. Restart recovers both from
 /// that store; no whole-image restore is involved.
@@ -61,6 +74,15 @@ pub trait DiskState {
     /// The last record committed by [`Self::apply_durable`], or `None` for a
     /// new store. Called before the first entry is applied.
     fn durable_applied(&self) -> io::Result<Option<Vec<u8>>>;
+
+    /// Opt into controlled retirement using the actual live database and workspace.
+    ///
+    /// This is separate from snapshot support: a workspace or `CURRENT` sentinel
+    /// alone never proves ownership of the live store. The default keeps existing
+    /// custom state machines usable, while refusing controlled filesystem cleanup.
+    fn storage_paths(&self) -> io::Result<DiskStoragePaths> {
+        Err(unsupported("controlled storage ownership"))
+    }
 
     /// Apply one entry exactly once. `data` is `None` for entries without an
     /// application payload (blank, membership, internal). Before returning,

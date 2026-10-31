@@ -3,7 +3,7 @@
 mod counter_fsm;
 mod disk;
 pub use counter_fsm::CounterFsm;
-pub use disk::{AppliedState, DiskState};
+pub use disk::{AppliedState, DiskState, DiskStoragePaths};
 
 pub type GroupId = u64;
 pub type NodeId = u64;

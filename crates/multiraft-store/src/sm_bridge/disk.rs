@@ -178,6 +178,22 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
 }
 
 impl<S: StateMachine> StateMachineStore<S> {
+    /// Read the FSM's explicit live-store ownership capability before Core startup.
+    ///
+    /// Snapshot support never substitutes for this declaration. The caller must
+    /// validate canonical Group ownership and establish release barriers itself.
+    pub async fn disk_storage_paths(&self) -> io::Result<multiraft_fsm::DiskStoragePaths> {
+        if !self.disk {
+            return Err(unsupported("controlled storage ownership"));
+        }
+        let mut inner = self.inner.lock().await;
+        inner
+            .fsm
+            .disk_state()
+            .ok_or_else(|| invalid("state machine left disk-backed mode"))?
+            .storage_paths()
+    }
+
     /// Whether the FSM selected disk-backed mode at construction.
     pub fn is_disk_backed(&self) -> bool {
         self.disk

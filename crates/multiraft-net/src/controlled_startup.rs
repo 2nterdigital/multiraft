@@ -54,7 +54,8 @@ pub struct StartupBinding {
 
 /// Exact native committed/applied terminal evidence, verified by the controlled runtime.
 ///
-/// Implementations must validate the full native operation, final single voter config,
+/// Implementations must validate the full native operation, final exact-three voter config
+/// with no learners,
 /// complete committed/applied membership identity, native terminal barrier and target
 /// durable Opened receipt. `native_record.terminal` must be present and match this proof. A
 /// management status, local stop, effective-only config, or source acknowledgement is
@@ -121,7 +122,8 @@ impl std::error::Error for StartupAuthorityError {}
 /// is admitted. Every admission before binding is retained as potentially live. No lease
 /// timeout or missing source acknowledgement can bypass this rule.
 ///
-/// `bind_active` compares the exact native starting membership, authorizations and immutable
+/// `bind_active` requires an initialized uniform three-member native starting configuration
+/// with no learners and compares its exact identity, authorizations and immutable
 /// consumption receipt. Same-operation retries replay; changed identities and stale sequences
 /// reject. The application's catalog provisioning is separate from ordinary startup and
 /// must not recreate a missing catalog from local disk or management intent.

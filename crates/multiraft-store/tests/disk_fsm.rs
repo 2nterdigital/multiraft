@@ -34,6 +34,49 @@ fn options() -> DiskFsmOptions {
     options
 }
 
+#[test]
+fn concrete_storage_paths_identify_the_actual_database_across_reopen() {
+    let root = scratch();
+    let actual = root.path().join("custom-live-database");
+    let db = DiskFsmDb::open(&actual, GROUP, options()).unwrap();
+    let paths = db.storage_paths().unwrap();
+    assert_eq!(paths.live, actual);
+    assert_eq!(
+        paths.workspace,
+        root.path().join("custom-live-database.snapshots")
+    );
+    assert_ne!(
+        paths.live,
+        DiskFsmDb::group_path(root.path(), GROUP),
+        "capability must not guess a conventional group path"
+    );
+    drop(db);
+    let reopened = DiskFsmDb::open(&actual, GROUP, options()).unwrap();
+    assert_eq!(reopened.storage_paths().unwrap(), paths);
+}
+
+#[tokio::test]
+async fn bridge_does_not_infer_cleanup_ownership_for_existing_custom_disk_state() {
+    let root = scratch();
+    let actual = root.path().join("custom-live-database");
+    let store = StateMachineStore::new(GROUP, DiskCounter::open(&actual));
+    assert_eq!(
+        store.disk_storage_paths().await.unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        store.try_with_fsm(DiskCounter::value).await.unwrap(),
+        0,
+        "ordinary legacy disk access remains available"
+    );
+    drop(store);
+    assert_eq!(
+        DiskCounter::open(&actual).value(),
+        0,
+        "capability refusal does not delete the database"
+    );
+}
+
 /// Counter whose value and apply count live only in RocksDB.
 struct DiskCounter {
     db: DiskFsmDb,
