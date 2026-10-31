@@ -90,6 +90,7 @@ pub use multiraft::{
     ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,
     ControlledSeed, ControlledTerminal,
 };
+pub use multiraft::{LocalAuthoritativeMembership, LocalAuthorityError};
 pub use multiraft_core::ObservationClosed;
 pub use network::GrpcNetworkFactory;
 pub use network::NetworkFactory;

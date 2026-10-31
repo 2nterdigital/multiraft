@@ -18,3 +18,6 @@ multiraft-core = { path = "../multiraft-core" }
 multiraft-net = { path = "../multiraft-net" }
 multiraft-fsm = { path = "../multiraft-fsm" }
 tracing = { workspace = true }
+
+[dev-dependencies]
+multiraft-store = { path = "../multiraft-store" }

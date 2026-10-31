@@ -91,6 +91,8 @@ use openraft::ReadPolicy;
 #[cfg(test)]
 use tokio::sync::Notify;
 
+mod authority;
+pub use authority::{LocalAuthoritativeMembership, LocalAuthorityError};
 mod application;
 mod controlled;
 pub use controlled::{
