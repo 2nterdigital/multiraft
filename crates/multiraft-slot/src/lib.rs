@@ -51,3 +51,12 @@ pub use strict_startup::{
     SlotLocalIdentity, SlotStartupDisposition, StrictSlotStartup, TrustedSlotDirectory,
     SLOT_PROTOCOL_VERSION,
 };
+
+mod controlled_startup;
+pub use controlled_startup::{
+    ControlledSlotReplica, ControlledSlotStartup, CONTROLLED_SLOT_PROTOCOL_VERSION,
+};
+pub use runtime::{
+    LocalSlotRole, SlotControlError, SlotControlledGroup, SlotManagedOperation,
+    SlotRoleObservation, SlotTargetEndpoint,
+};

@@ -27,7 +27,8 @@ pub struct SlotLocalIdentity {
     pub data_space_id: u64,
     /// Application-provided, persistent UUID for this data directory.
     pub data_dir_uuid: [u8; 16],
-    /// Must equal [`SLOT_PROTOCOL_VERSION`].
+    /// The selected profile: ordinary [`SLOT_PROTOCOL_VERSION`] or
+    /// [`crate::CONTROLLED_SLOT_PROTOCOL_VERSION`] for explicit controlled startup.
     pub protocol_version: u32,
     /// Application storage/command compatibility tuple, hashed by the application.
     pub compatibility_digest: [u8; 32],
@@ -69,10 +70,19 @@ impl StrictSlotStartup {
     }
 
     pub(crate) fn validate(&self, layout: &ClusterLayout, local: u64) -> Result<(), RuntimeError> {
+        self.validate_profile(layout, local, SLOT_PROTOCOL_VERSION)
+    }
+
+    pub(crate) fn validate_profile(
+        &self,
+        layout: &ClusterLayout,
+        local: u64,
+        protocol: u32,
+    ) -> Result<(), RuntimeError> {
         let directory = &self.directory;
         if self.identity.data_space_id == 0
             || self.identity.data_dir_uuid == [0; 16]
-            || self.identity.protocol_version != SLOT_PROTOCOL_VERSION
+            || self.identity.protocol_version != protocol
             || self.identity.compatibility_digest == [0; 32]
             || directory.version == 0
             || directory.data_space_id != self.identity.data_space_id

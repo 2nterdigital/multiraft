@@ -2,6 +2,14 @@
 use crate::limits::{Budget, MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES};
 use crate::runtime_error::native;
 mod authority;
+mod control;
+mod controlled_start;
+mod leadership_control;
+mod roles;
+pub use control::{
+    SlotControlError, SlotControlledGroup, SlotManagedOperation, SlotTargetEndpoint,
+};
+pub use roles::{LocalSlotRole, SlotRoleObservation};
 mod genesis;
 mod node_config;
 mod observation;
@@ -89,6 +97,7 @@ pub(crate) struct Shared<S: SlotStateMachine> {
     owners: Mutex<Option<Owners<S>>>,
     accepting: AtomicBool,
     business_enabled: bool,
+    controlled: Option<controlled_start::ControlledState<S>>,
     transport_addresses: Option<crate::SlotTransportAddresses>,
     cleaning: AtomicBool,
     pub(crate) budget: Arc<Budget>,
@@ -149,7 +158,7 @@ impl<S: SlotStateMachine> Shared<S> {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
-        if !self.business_enabled {
+        if !self.business_enabled && self.controlled.is_none() {
             return Err(RuntimeError::Unavailable);
         }
         if Instant::now() >= deadline {

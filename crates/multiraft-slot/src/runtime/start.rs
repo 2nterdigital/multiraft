@@ -41,7 +41,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         factory: impl StateMachineFactory<S>,
         deadline: Instant,
     ) -> Result<Self, RuntimeError> {
-        Self::start_inner(config, None, factory, deadline).await
+        Self::start_inner(config, None, None, factory, deadline).await
     }
 
     /// Start with explicit creation/recovery authority and a separately versioned peer directory.
@@ -62,17 +62,50 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         factory: impl StateMachineFactory<S>,
         deadline: Instant,
     ) -> Result<Self, RuntimeError> {
-        Self::start_inner(config, Some(startup), factory, deadline).await
+        Self::start_inner(config, Some(startup), None, factory, deadline).await
+    }
+
+    /// Start only catalog-authorized controlled replicas, with no ordinary startup fallback.
+    ///
+    /// Catalog availability is checked before creating local state or listeners. Genesis
+    /// basis collection and quorum-confirmed finalization are separate operations.
+    pub async fn start_controlled(
+        config: SlotNodeConfig,
+        startup: crate::ControlledSlotStartup,
+        factory: impl StateMachineFactory<S>,
+        deadline: Instant,
+    ) -> Result<Self, RuntimeError> {
+        let catalogs = startup
+            .catalogs(&config.layout, config.node_id, deadline)
+            .await?;
+        let strict = startup.startup.clone();
+        Self::start_inner(
+            config,
+            Some(strict),
+            Some((startup, catalogs)),
+            factory,
+            deadline,
+        )
+        .await
     }
 
     async fn start_inner(
         config: SlotNodeConfig,
         strict: Option<StrictSlotStartup>,
+        controlled: Option<(
+            crate::ControlledSlotStartup,
+            Vec<(
+                crate::SlotId,
+                multiraft_net::controlled_startup::StartupCatalog,
+            )>,
+        )>,
         factory: impl StateMachineFactory<S>,
         deadline: Instant,
     ) -> Result<Self, RuntimeError> {
         if let Some(startup) = &strict {
-            startup.validate(&config.layout, config.node_id)?;
+            if controlled.is_none() {
+                startup.validate(&config.layout, config.node_id)?;
+            }
             config.validate_strict(&startup.directory.nodes)?;
         } else {
             config.validate()?;
@@ -124,11 +157,10 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             }
         });
         let mut groups = Vec::new();
-        for assignment in layout
-            .config()
-            .slots
-            .iter()
-            .filter(|a| !candidate && a.voters.contains(&config.node_id))
+        for assignment in
+            layout.config().slots.iter().filter(|a| {
+                controlled.is_none() && !candidate && a.voters.contains(&config.node_id)
+            })
         {
             let group = GroupConfig {
                 group_id: layout
@@ -154,6 +186,26 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         let native_owner = NodeOwner::start(runtime, factory, deadline)
             .await
             .map_err(|e| native(e, false))?;
+        let controlled_state = if let Some((input, catalogs)) = controlled {
+            match super::controlled_start::open(
+                &native_owner.handle(),
+                &layout,
+                config.node_id,
+                input,
+                catalogs,
+                deadline,
+            )
+            .await
+            {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let startup = if groups.is_empty() {
             // A router-only node hosts no voter slot and has nothing to recover.
             StartupReport {
@@ -213,9 +265,10 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
                 }
             }
         };
-        if strict
-            .as_ref()
-            .is_some_and(|s| s.disposition == SlotStartupDisposition::Genesis)
+        if controlled_state.is_none()
+            && strict
+                .as_ref()
+                .is_some_and(|s| s.disposition == SlotStartupDisposition::Genesis)
         {
             if let Err(error) =
                 super::genesis::wait_for_basis(&native_owner.handle(), &layout, &startup, deadline)
@@ -235,6 +288,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             owners: Mutex::new(None),
             accepting: AtomicBool::new(true),
             business_enabled: !candidate,
+            controlled: controlled_state,
             transport_addresses,
             cleaning: AtomicBool::new(false),
             tasks: Mutex::new(JoinSet::new()),
