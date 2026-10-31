@@ -144,6 +144,7 @@ pub(super) async fn handoff<S: StateMachine>(
         group: this.group,
         source: source[0],
         source_generation,
+        fingerprint: this.node()?.config.raft_transport_fingerprint,
         proof,
         specification: record.specification,
     })

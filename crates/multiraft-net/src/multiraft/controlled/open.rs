@@ -40,6 +40,13 @@ impl<S: StateMachine> MultiRaft<S> {
             .map_err(|error| ControlledError::Native(error.to_string()))?;
         let mut digest = sha2::Sha256::new();
         digest.update(b"multiraft-target-consumption-v1");
+        match self.config.raft_transport_fingerprint {
+            Some(fingerprint) => {
+                digest.update([1]);
+                digest.update(fingerprint);
+            }
+            None => digest.update([0]),
+        }
         digest.update((specification_bytes.len() as u64).to_be_bytes());
         digest.update(specification_bytes);
         digest.update(&identity);

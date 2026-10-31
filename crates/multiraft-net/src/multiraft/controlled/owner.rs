@@ -7,6 +7,7 @@ pub(in crate::multiraft) struct GroupOwner {
     pub(in crate::multiraft) commands: tasks::OwnedTasks,
     pub(in crate::multiraft) watchers: tasks::OwnedTasks,
     pub(in crate::multiraft) maintenance: tasks::OwnedTasks,
+    pub(in crate::multiraft) fsm_release: Mutex<Option<multiraft_store::StateMachineRelease>>,
     stopped: tokio::sync::watch::Sender<bool>,
 }
 impl Default for GroupOwner {
@@ -16,6 +17,7 @@ impl Default for GroupOwner {
             commands: tasks::OwnedTasks::default(),
             watchers: tasks::OwnedTasks::default(),
             maintenance: tasks::OwnedTasks::default(),
+            fsm_release: Mutex::default(),
             stopped: tokio::sync::watch::channel(false).0,
         }
     }

@@ -101,6 +101,7 @@ pub struct ControlledTerminal {
     group: GroupId,
     source: NodeId,
     source_generation: u64,
+    fingerprint: Option<[u8; 32]>,
     proof: TerminalProof,
     specification: ReplacementSpec,
 }

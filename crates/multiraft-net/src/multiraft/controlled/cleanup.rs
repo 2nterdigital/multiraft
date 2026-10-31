@@ -52,6 +52,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 if terminal.group != this.group
                     || terminal.source != node.node_id
                     || terminal.source_generation != this.generation
+                    || terminal.fingerprint != node.config.raft_transport_fingerprint
                 {
                     return Err(ControlledError::Rejected(
                         "terminal does not exclude this local replica",
@@ -64,6 +65,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 }) {
                     return Err(ControlledError::Rejected("terminal handoff is not durable"));
                 }
+                let storage_owner = this.storage_owner()?;
                 let db = node.controlled_db()?;
                 let receipt = this.checked_receipt()?;
                 let proof = serde_json::to_vec(&terminal.proof)
@@ -89,7 +91,6 @@ impl<S: StateMachine> ControlledGroup<S> {
                 {
                     return Err(ControlledError::Rejected("retirement identity mismatch"));
                 }
-                let storage_owner = this.storage_owner()?;
                 let owner = node.group_owner(this.group);
                 owner.retire();
                 let app = node
@@ -105,6 +106,10 @@ impl<S: StateMachine> ControlledGroup<S> {
                 });
                 if let Some(app) = app {
                     let release = app.state_machine.release_observer();
+                    *owner
+                        .fsm_release
+                        .lock()
+                        .expect("FSM release owner lock poisoned") = Some(release.clone());
                     app.state_machine.close_native_intake();
                     app.raft
                         .shutdown()
@@ -140,6 +145,14 @@ impl<S: StateMachine> ControlledGroup<S> {
                         .join_group_sends(this.group)
                         .await
                         .map_err(|error| ControlledError::Native(error.to_string()))?;
+                }
+                let pending_release = owner
+                    .fsm_release
+                    .lock()
+                    .expect("FSM release owner lock poisoned")
+                    .clone();
+                if let Some(release) = pending_release {
+                    release.wait().await;
                 }
                 node.leader_watch_groups
                     .lock()
