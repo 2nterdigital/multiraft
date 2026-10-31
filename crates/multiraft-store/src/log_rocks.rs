@@ -15,10 +15,13 @@ use openraft::RaftTypeConfig;
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+mod lifecycle;
 mod storage;
+pub use lifecycle::{ControlledGroupReceipt, ControlledGroupStage};
 
 const SCHEMA_KEY: &[u8] = b"schema";
 const SCHEMA: &[u8] = b"multiraft-rocks-log-v1";
+const CONTROLLED_SCHEMA: &[u8] = b"multiraft-rocks-log-v2-controlled";
 
 struct Engine {
     db: DB,
@@ -38,6 +41,7 @@ pub struct RocksLogStore<C: RaftTypeConfig> {
     owner: RocksLogDb<C>,
     group: u64,
     gate: Arc<Mutex<()>>,
+    generation: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +51,8 @@ where
     LogIdOf<C>: Serialize + DeserializeOwned,
     VoteOf<C>: Serialize + DeserializeOwned,
 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    controlled_generation: Option<u64>,
     ever_written: bool,
     vote: Option<VoteOf<C>>,
     committed: Option<LogIdOf<C>>,
@@ -130,7 +136,7 @@ where
         options.set_use_fsync(sync_all);
         let db = DB::open(&options, path).map_err(db_error)?;
         match db.get(SCHEMA_KEY).map_err(db_error)? {
-            Some(value) if value == SCHEMA => {}
+            Some(value) if value == SCHEMA || value == CONTROLLED_SCHEMA => {}
             Some(_) => return Err(invalid("unknown rocks log schema")),
             None => {
                 if let Some(row) = db.iterator(IteratorMode::Start).next() {
@@ -158,12 +164,15 @@ where
         let store = RocksLogStore {
             owner: self.clone(),
             group,
+            generation: None,
             gate: self.engine.gate(group)?,
         };
         {
             let _guard = lock(&store.gate)?;
+            store.check_generation()?;
             if store.metadata()?.is_none() {
                 let metadata = Metadata::<C> {
+                    controlled_generation: None,
                     ever_written: false,
                     vote: None,
                     committed: None,
@@ -185,9 +194,11 @@ where
         let store = RocksLogStore {
             owner: self.clone(),
             group,
+            generation: None,
             gate: self.engine.gate(group)?,
         };
         let _guard = lock(&store.gate)?;
+        store.check_generation()?;
         match store.validate()? {
             Some(meta) if meta.ever_written => Ok(StartupProvenance::Persisted),
             _ => Ok(StartupProvenance::Pristine),
@@ -200,9 +211,11 @@ where
         let store = RocksLogStore {
             owner: self.clone(),
             group,
+            generation: None,
             gate: self.engine.gate(group)?,
         };
         let _guard = lock(&store.gate)?;
+        store.check_generation()?;
         Ok(store.metadata()?.map_or(0, |meta| meta.bytes))
     }
 }
@@ -236,7 +249,11 @@ where
                     return Err(invalid(format!("missing group metadata field {field}")));
                 }
             }
-            return decode(&raw).map(Some);
+            let meta: Metadata<C> = decode(&raw)?;
+            if meta.controlled_generation != self.generation {
+                return Err(invalid("group metadata generation mismatch"));
+            }
+            return Ok(Some(meta));
         }
         let group_prefix = prefix(self.group);
         if let Some(row) = self
@@ -377,6 +394,7 @@ where
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             let _guard = lock(&store.gate)?;
+            store.check_generation()?;
             operation(store.clone())
         })
         .await
