@@ -63,3 +63,21 @@ fn binary_legacy_application_layout_is_unchanged_and_cannot_carry_control() {
         "legacy binary transport must fail closed"
     );
 }
+
+#[test]
+fn mixed_native_and_application_request_is_refused_before_encoding() {
+    let request = Request {
+        data: vec![1],
+        control: Some(NativeControl::Claim {
+            operation: OperationId {
+                sequence: 1,
+                nonce: [1; 16],
+            },
+            executor_epoch: 1,
+        }),
+    };
+    assert!(
+        serde_json::to_vec(&request).is_err(),
+        "serializer must never persist a request its decoder refuses"
+    );
+}

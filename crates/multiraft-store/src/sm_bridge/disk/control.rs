@@ -149,7 +149,12 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
                     {
                         Some(ControlRejection::IncompleteConfiguration)
                     } else if self.last_membership.log_id().is_none_or(|required| {
-                        target_open.applied < required || target_open.applied.index >= barrier.index
+                        target_open.applied.index < required.index
+                            || target_open.applied < required
+                            || (target_open.applied.index == required.index
+                                && target_open.applied != required)
+                            || target_open.applied.index >= barrier.index
+                            || target_open.applied >= barrier
                     }) || target_open.operation != *operation
                         || target != Some(&target_open.target_node)
                         || target_open.generation != record.specification.target_generation
@@ -168,7 +173,7 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
             },
         };
         let reply = rejection.map_or_else(
-            || ControlReply::Applied(ledger.clone()),
+            || ControlReply::Applied(Box::new(ledger.clone())),
             ControlReply::Rejected,
         );
         (ledger, reply)

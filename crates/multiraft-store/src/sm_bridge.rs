@@ -408,6 +408,14 @@ where
             while let Some((entry, responder)) = entries.try_next().await? {
                 tracing::trace!(%entry.log_id, "replicate to sm");
 
+                if matches!(&entry.payload, EntryPayload::Normal(request) if request.control.is_some() && !request.data.is_empty())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native entry also contains application bytes",
+                    ));
+                }
+
                 if self.disk {
                     self.validation.changed();
                     let response = inner.apply_disk_entry(&entry)?;
