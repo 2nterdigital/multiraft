@@ -168,6 +168,7 @@ where
         tokio::task::spawn_blocking(move || {
             let result = (|| {
                 let _guard = super::lock(&store.gate)?;
+                store.check_generation()?;
                 store.append_entries(entries)
             })();
             callback.io_completed(
