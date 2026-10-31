@@ -1,5 +1,5 @@
 //! Durable, typed native control entries, separate from opaque application bytes.
-use crate::typ::StoredMembership;
+use crate::typ::{LogId, StoredMembership};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -20,6 +20,11 @@ pub enum NativeControl {
     Claim {
         operation: OperationId,
         executor_epoch: u64,
+    },
+    Complete {
+        operation: OperationId,
+        executor_epoch: u64,
+        target_open: TargetOpenReceipt,
     },
 }
 
@@ -44,6 +49,25 @@ pub struct NativeLedger {
 pub struct OperationRecord {
     pub specification: ReplacementSpec,
     pub executor_epoch: u64,
+    pub terminal: Option<TerminalProof>,
+}
+
+/// Target durable lifecycle receipt, authenticated against its registry by the actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetOpenReceipt {
+    pub operation: OperationId,
+    pub target_node: u64,
+    pub generation: u64,
+    pub applied: LogId,
+    pub receipt: Vec<u8>,
+}
+
+/// Exact final configuration and durable application barrier for one operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalProof {
+    pub configuration: StoredMembership,
+    pub barrier: LogId,
+    pub target_open: TargetOpenReceipt,
 }
 
 /// Deterministic native admission rejection; the enclosing Raft entry still applies.
@@ -55,6 +79,9 @@ pub enum ControlRejection {
     StaleOperation,
     StaleExecutor,
     NoOperation,
+    TerminalOperation,
+    IncompleteConfiguration,
+    TargetNotApplied,
 }
 
 /// Exact result encoded in the native proposal's effects.

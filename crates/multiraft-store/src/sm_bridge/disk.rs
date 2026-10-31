@@ -126,8 +126,10 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
         let (data, membership) = match &entry.payload {
             EntryPayload::Blank => (None, self.last_membership.clone()),
             EntryPayload::Normal(req) if req.control.is_some() => {
-                let (next, reply) =
-                    self.control_transition(req.control.as_ref().expect("matched native control"));
+                let (next, reply) = self.control_transition(
+                    req.control.as_ref().expect("matched native control"),
+                    entry.log_id,
+                );
                 control = Some(next);
                 control_response = Some(reply);
                 (None, self.last_membership.clone())
