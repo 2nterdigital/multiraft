@@ -12,6 +12,11 @@ impl<S: StateMachine> ControlledGroup<S> {
     /// nor lifecycle state. The configured authority must authenticate and bind its retained
     /// facts to this runtime's data space. Decoded RPC catalogs are never accepted here.
     /// The returned token is permission only; [`Self::retire`] establishes actual local stop.
+    /// Retirement and cleanup independently recheck the retained authority before acting.
+    ///
+    /// # Errors
+    /// Rejects missing/inconsistent completion, mismatched local ownership, live authorization,
+    /// unavailable authority, or an expired caller deadline.
     pub async fn retirement_from_authority(
         &self,
         operation: OperationId,
