@@ -152,6 +152,10 @@ impl<S: StateMachine> StateMachineStore<S> {
         };
         let _disk = self.disk_rt.transition.lock().await;
         let _receiving = self.disk_rt.receiving.lock().await;
+        // A receive/verification admitted before close may have restored its
+        // transfer after close's first drain. No receiver can restore it now.
+        let incoming = self.disk_rt.incoming.lock().unwrap().take();
+        drop(incoming);
         self.disk_rt.cleanup.wait().await;
         let _application = self.inner.lock().await;
     }

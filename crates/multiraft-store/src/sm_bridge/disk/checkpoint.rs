@@ -1,4 +1,4 @@
-//! Inspect the native ledger inside an owned published disk checkpoint.
+//! Inspect actual native applied records in live stores and published checkpoints.
 use super::{invalid, unsupported, AppliedRecord};
 use crate::{disk_snapshot::DiskManifest, StateMachineStore};
 use multiraft_core::{
@@ -38,7 +38,7 @@ fn validate_files(manifest: &DiskManifest) -> io::Result<()> {
     Ok(())
 }
 
-/// Durable applied facts read from the checkpoint database, not the live FSM.
+/// Durable native facts decoded from an actual disk applied record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlledCheckpointState {
     pub applied: LogId,
@@ -47,6 +47,52 @@ pub struct ControlledCheckpointState {
 }
 
 impl<S: StateMachine> StateMachineStore<S> {
+    /// Reread native facts from the live durable store, independently of cached state.
+    ///
+    /// Bootstrap v1 records have an empty native ledger. A pristine store, missing
+    /// membership identity or malformed applied record cannot authorize recovery.
+    pub async fn inspect_controlled_applied(&self) -> io::Result<ControlledCheckpointState> {
+        if !self.disk {
+            return Err(unsupported("controlled applied inspection"));
+        }
+        let _transition = self.disk_rt.transition.lock().await;
+        if self.native_is_closing() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "native applied owner closed",
+            ));
+        }
+        let bytes = self
+            .inner
+            .lock()
+            .await
+            .fsm
+            .disk_state()
+            .ok_or_else(|| invalid("state machine left disk-backed mode"))?
+            .durable_applied()?
+            .ok_or_else(|| invalid("store has no durable applied record"))?;
+        let record = AppliedRecord::decode(&bytes)?;
+        let membership_id = record
+            .membership
+            .log_id()
+            .ok_or_else(|| invalid("durable applied record has no native membership identity"))?;
+        if membership_id.index > record.last_applied.index
+            || membership_id > record.last_applied
+            || (membership_id.index == record.last_applied.index
+                && membership_id != record.last_applied)
+            || record.membership.membership().voter_ids().next().is_none()
+        {
+            return Err(invalid(
+                "durable native membership is inconsistent with applied position",
+            ));
+        }
+        Ok(ControlledCheckpointState {
+            applied: record.last_applied,
+            membership: record.membership,
+            ledger: record.control.unwrap_or_default(),
+        })
+    }
+
     /// Inspect this Group's exact current published checkpoint and native ledger.
     ///
     /// Publication/install is serialized through the inspection. Replaced or

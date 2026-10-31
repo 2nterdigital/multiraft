@@ -42,6 +42,14 @@ fn options(format: &[u8]) -> DiskFsmOptions {
 struct DiskBlobs {
     db: DiskFsmDb,
     workspace_ready: Option<Arc<tokio::sync::Notify>>,
+    inspection: Option<Arc<InspectionGate>>,
+}
+
+#[derive(Default)]
+struct InspectionGate {
+    entered: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
 }
 
 impl DiskBlobs {
@@ -52,6 +60,7 @@ impl DiskBlobs {
         Self {
             db: DiskFsmDb::open(path, GROUP, options(format)).unwrap(),
             workspace_ready: None,
+            inspection: None,
         }
     }
     fn sum(&self) -> u64 {
@@ -122,11 +131,48 @@ impl DiskState for DiskBlobs {
         self.db.checkpoint(dir)
     }
     fn inspect_checkpoint(&self, dir: &Path) -> io::Result<Option<Vec<u8>>> {
+        if let Some(gate) = &self.inspection {
+            gate.entered.notify_one();
+            let mut released = gate.released.lock().unwrap();
+            while !*released {
+                released = gate.changed.wait(released).unwrap();
+            }
+        }
         self.db.inspect_checkpoint(dir)
     }
     fn install_checkpoint(&mut self, dir: &Path) -> io::Result<()> {
         self.db.install_checkpoint(dir)
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_racing_verified_transfer_destroys_restored_incoming_before_quiescence() {
+    let source_root = scratch();
+    let (_source, meta, manifest) = leader(source_root.path(), 0).await;
+    let root = scratch();
+    let gate = Arc::new(InspectionGate::default());
+    let mut fsm = DiskBlobs::open(&path(root.path()));
+    fsm.inspection = Some(gate.clone());
+    let receiver = store(root.path(), fsm);
+    transfer(&receiver, manifest.clone(), None).await.unwrap();
+    let verifying = receiver.clone();
+    let verification =
+        tokio::spawn(async move { verifying.verify_disk_snapshot(&meta, &manifest).await });
+    gate.entered.notified().await;
+    receiver.close_native_intake();
+    *gate.released.lock().unwrap() = true;
+    gate.changed.notify_all();
+    verification.await.unwrap().unwrap();
+    receiver.wait_native_quiescent().await;
+    let workspace = DiskFsmDb::workspace_path(&path(root.path())).unwrap();
+    assert!(
+        !std::fs::read_dir(workspace).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("staging-")),
+        "quiescence must drain an incoming restored after the first close drain"
+    );
 }
 
 #[test]
