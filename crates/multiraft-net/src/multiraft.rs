@@ -97,7 +97,7 @@ mod application;
 mod controlled;
 pub use controlled::{
     ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,
-    ControlledSeed, ControlledTerminal,
+    ControlledSeed, ControlledTerminal, ManagedGenesisBasis,
 };
 mod control;
 mod election_source;
@@ -218,6 +218,7 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     tasks: tasks::OwnedTasks,
     control_slot: tokio::sync::Semaphore,
     group_owners: Mutex<BTreeMap<GroupId, Arc<controlled::GroupOwner>>>,
+    controlled_publication: Mutex<Option<controlled::Publication>>,
     controlled_construction: tokio::sync::RwLock<()>,
     leader_watch_groups: Mutex<BTreeSet<GroupId>>,
     fsm_releases: Mutex<Vec<multiraft_store::StateMachineRelease>>,

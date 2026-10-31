@@ -157,7 +157,7 @@ impl<S: StateMachine> MultiRaft<S> {
         self.open_controlled_group_completion(request, authority, admission, seed, Some(deadline))
             .await
     }
-    pub(super) async fn open_controlled_group_completion(
+    pub(crate) async fn open_controlled_group_completion(
         self: &Arc<Self>,
         request: ControlledOpen,
         authority: Arc<dyn StartupAuthority>,
@@ -393,6 +393,7 @@ impl<S: StateMachine> MultiRaft<S> {
             if quarantine {
                 node.publish_controlled_group(request.group_id).await?;
             }
+            node.notify_controlled_publication(request.group_id, request.generation, true);
             Ok(ControlledGroup::handle(&node, &request, authority))
         })
         .await

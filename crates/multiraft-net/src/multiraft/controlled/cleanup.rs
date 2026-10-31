@@ -156,6 +156,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                     .lock()
                     .expect("construction basis lock poisoned")
                     .remove(&this.group);
+                node.notify_controlled_publication(this.group, this.generation, false);
                 if mode == CleanupMode::Retire {
                     return Ok(());
                 }

@@ -6,6 +6,10 @@
 
 mod authority;
 mod control;
+mod controlled;
+pub use controlled::{
+    ManagedControlError, ManagedControlledGroup, ManagedOperation, ManagedTargetEndpoint,
+};
 mod election_source;
 mod local;
 mod maintenance;
@@ -163,7 +167,12 @@ impl<S: StateMachine> Clone for RuntimeHandle<S> {
 }
 
 pub(super) struct RuntimeShared<S: StateMachine> {
-    pub(super) node: MultiRaft<S>,
+    node: Arc<MultiRaft<S>>,
+    controlled_generations: Mutex<std::collections::BTreeMap<GroupId, u64>>,
+    controlled_jobs: OwnedTasks,
+    controlled_endpoints:
+        Mutex<std::collections::BTreeMap<u64, crate::portable::NativeTargetEndpoint<S>>>,
+    next_controlled_endpoint: std::sync::atomic::AtomicU64,
     accepting: AtomicBool,
     pub(super) admission: Arc<RwLock<()>>,
     pub(super) slots: Arc<Semaphore>,
