@@ -353,7 +353,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 ControlledGroupStage::Opened,
             )?;
             if quarantine {
-                node.publish_controlled_group(request.group_id)?;
+                node.publish_controlled_group(request.group_id).await?;
             }
             Ok(ControlledGroup::handle(&node, &request, authority))
         })

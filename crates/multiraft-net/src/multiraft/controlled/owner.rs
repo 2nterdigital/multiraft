@@ -174,7 +174,11 @@ impl<S: StateMachine> MultiRaft<S> {
             .clone()
             .map_err(|error| ControlledError::Native(error.to_string()))
     }
-    pub(super) fn publish_controlled_group(&self, group: GroupId) -> Result<(), ControlledError> {
+    pub(super) async fn publish_controlled_group(
+        &self,
+        group: GroupId,
+    ) -> Result<(), ControlledError> {
+        let _construction = self.controlled_construction.read().await;
         if self
             .snapshot_rt
             .stopping
