@@ -82,7 +82,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                     ));
                 }
                 super::source::checked_executor(&raft, &sm, &executor, node.node_id).await?;
-                let vote = raft.metrics().borrow_watched().vote;
+                let vote = Vote::new_committed(executor.leader.term, executor.leader.node_id);
                 Ok(ControlledSeed {
                     specification: record.specification.clone(),
                     record,
