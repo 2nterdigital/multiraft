@@ -28,18 +28,24 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
                 specification,
                 executor_epoch,
             } => {
-                if let Some(current) = &ledger.current {
-                    if current.specification.operation == specification.operation {
-                        if current.specification != *specification {
-                            Some(ControlRejection::OperationConflict)
-                        } else if current.executor_epoch != *executor_epoch {
-                            Some(ControlRejection::StaleExecutor)
-                        } else {
-                            None
-                        }
-                    } else {
+                if let Some(current) = ledger
+                    .current
+                    .as_ref()
+                    .filter(|current| current.specification.operation == specification.operation)
+                {
+                    if current.specification != *specification {
                         Some(ControlRejection::OperationConflict)
+                    } else if current.executor_epoch != *executor_epoch {
+                        Some(ControlRejection::StaleExecutor)
+                    } else {
+                        None
                     }
+                } else if ledger
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.terminal.is_none())
+                {
+                    Some(ControlRejection::OperationConflict)
                 } else if specification.operation.sequence <= ledger.high_water {
                     Some(ControlRejection::StaleOperation)
                 } else if *executor_epoch == 0
