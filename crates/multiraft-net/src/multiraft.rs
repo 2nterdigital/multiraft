@@ -95,7 +95,7 @@ mod application;
 mod controlled;
 pub use controlled::{
     ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,
-    ControlledTerminal,
+    ControlledSeed, ControlledTerminal,
 };
 mod control;
 mod election_source;
@@ -212,6 +212,7 @@ pub struct MultiRaft<S: StateMachine = CounterFsm> {
     log_open_tasks: tasks::OwnedTasks,
     net: NetBackend,
     groups: GroupMap<S>,
+    quarantined_groups: GroupMap<S>,
     tasks: tasks::OwnedTasks,
     control_slot: tokio::sync::Semaphore,
     group_owners: Mutex<BTreeMap<GroupId, Arc<controlled::GroupOwner>>>,

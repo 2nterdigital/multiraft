@@ -97,6 +97,12 @@ impl<S: StateMachine> ControlledGroup<S> {
                     .lock()
                     .expect("native group lock poisoned")
                     .remove(&this.group);
+                let app = app.or_else(|| {
+                    node.quarantined_groups
+                        .lock()
+                        .expect("quarantined group lock poisoned")
+                        .remove(&this.group)
+                });
                 if let Some(app) = app {
                     let release = app.state_machine.release_observer();
                     app.state_machine.close_native_intake();

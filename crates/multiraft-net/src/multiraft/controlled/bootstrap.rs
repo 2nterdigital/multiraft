@@ -61,6 +61,24 @@ pub(super) async fn persist<S: StateMachine>(
         .map_err(|error| ControlledError::Native(error.to_string()))??;
     Ok(())
 }
+pub(super) fn owns_generation<S: StateMachine>(
+    node: &MultiRaft<S>,
+    request: &ControlledOpen,
+) -> Result<bool, ControlledError> {
+    match std::fs::read(path(&node.config.data_dir, request.group_id)) {
+        Ok(bytes) => {
+            let intent: BootstrapIntent =
+                serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+            Ok(intent.node == node.node_id
+                && intent.group == request.group_id
+                && intent.generation == request.generation
+                && intent.identity == request.identity)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(super) async fn reconcile<S: StateMachine>(
     node: &MultiRaft<S>,
     request: &ControlledOpen,

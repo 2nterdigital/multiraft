@@ -136,6 +136,17 @@ impl<S: StateMachine> MultiRaft<S> {
         admission: StartupAdmission,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledGroup<S>, ControlledError> {
+        self.open_controlled_group_inner(request, authority, admission, None, deadline)
+            .await
+    }
+    pub(super) async fn open_controlled_group_inner(
+        self: &Arc<Self>,
+        request: ControlledOpen,
+        authority: Arc<dyn StartupAuthority>,
+        admission: StartupAdmission,
+        seed: Option<ControlledSeed>,
+        deadline: tokio::time::Instant,
+    ) -> Result<ControlledGroup<S>, ControlledError> {
         if request.generation == 0 || request.identity.is_empty() {
             return Err(ControlledError::Rejected(
                 "controlled generation and identity must be nonempty",
@@ -145,7 +156,7 @@ impl<S: StateMachine> MultiRaft<S> {
         self.ensure_node_log().await?;
         let replay = tokio::time::timeout_at(
             deadline,
-            self.controlled_open_replay(&request, &authority, &admission),
+            self.controlled_open_replay(&request, &authority, &admission, seed.is_none()),
         )
         .await
         .map_err(|_| ControlledError::Deadline {
@@ -220,7 +231,10 @@ impl<S: StateMachine> MultiRaft<S> {
                     let receipt = old.as_ref().ok_or(ControlledError::Rejected(
                         "target generation is not reserved",
                     ))?;
-                    if receipt.stage != ControlledGroupStage::Reserved {
+                    if !matches!(
+                        receipt.stage,
+                        ControlledGroupStage::Reserved | ControlledGroupStage::Opening
+                    ) {
                         let known = catalog.active_operation.as_ref().is_some_and(|binding| {
                             binding.specification.operation == *operation
                                 && binding.target.node_id == node.node_id
@@ -252,11 +266,10 @@ impl<S: StateMachine> MultiRaft<S> {
                             "target consumption is not bound to this operation",
                         ));
                     }
-                    let old = old.as_ref().ok_or(ControlledError::Rejected(
-                        "target generation is not reserved",
-                    ))?;
-                    if old.stage != ControlledGroupStage::Reserved {
-                        return Ok(ControlledGroup::handle(&node, &request, authority));
+                    if seed.is_none() {
+                        return Err(ControlledError::Rejected(
+                            "a sealed fresh checkpoint is required before target construction",
+                        ));
                     }
                 }
                 ControlledOpenMode::Recover => {
@@ -284,50 +297,49 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                 }
             }
-            if node.raft(request.group_id).is_some() {
-                if let ControlledOpenMode::BootstrapNew { voters } = &request.mode {
-                    bootstrap::reconcile(&node, &request, voters).await?;
+            let quarantine = !matches!(&request.mode, ControlledOpenMode::BootstrapNew { .. })
+                && !bootstrap::owns_generation(&node, &request)?;
+            if node.controlled_parts(request.group_id).is_err() {
+                let root = node.config.data_dir.clone();
+                let consumed_admission = admission.clone();
+                let consumed = tokio::task::spawn_blocking(move || {
+                    consume_startup(&root, &consumed_admission)
+                })
+                .await
+                .map_err(|error| ControlledError::Native(error.to_string()))??;
+                if !consumed {
+                    return Ok(ControlledGroup::handle(&node, &request, authority));
+                }
+                let current = db
+                    .lifecycle_receipt(request.group_id)?
+                    .ok_or(ControlledError::Rejected("generation receipt missing"))?;
+                if current.stage == ControlledGroupStage::Reserved {
                     db.advance_controlled(
                         request.group_id,
                         request.generation,
                         &request.identity,
+                        ControlledGroupStage::Reserved,
                         ControlledGroupStage::Opening,
-                        ControlledGroupStage::Opened,
                     )?;
                 }
-                return Ok(ControlledGroup::handle(&node, &request, authority));
+                node.spawn_controlled_local_group(request.group_id, quarantine)
+                    .await?;
+                node.controlled_wait_ready(request.group_id).await?;
             }
-            let root = node.config.data_dir.clone();
-            let consumed_admission = admission.clone();
-            let consumed =
-                tokio::task::spawn_blocking(move || consume_startup(&root, &consumed_admission))
-                    .await
-                    .map_err(|error| ControlledError::Native(error.to_string()))??;
-            if !consumed {
-                return Ok(ControlledGroup::handle(&node, &request, authority));
-            }
-            let current = db
-                .lifecycle_receipt(request.group_id)?
-                .ok_or(ControlledError::Rejected("generation receipt missing"))?;
-            if current.stage == ControlledGroupStage::Reserved {
-                db.advance_controlled(
-                    request.group_id,
-                    request.generation,
-                    &request.identity,
-                    ControlledGroupStage::Reserved,
-                    ControlledGroupStage::Opening,
-                )?;
-            }
-            let opened = node.spawn_controlled_local_group(request.group_id).await;
-            opened?;
-            node.wait_for_owned_recovery(request.group_id, Duration::from_secs(30))
-                .await?;
-            node.validate_recovered(request.group_id).await?;
-            node.ensure_recovery_running(request.group_id)?;
             if let ControlledOpenMode::BootstrapNew { voters } = &request.mode {
                 bootstrap::reconcile(&node, &request, voters).await?;
             }
-            // The receipt follows real native construction, never an RPC waiter.
+            if quarantine {
+                let ready = if let Some(seed) = seed {
+                    super::seed::install(&node, &request, &authority, seed).await?;
+                    true
+                } else {
+                    super::seed::recover_anchor(&node, &request).await?
+                };
+                if !ready {
+                    return Ok(ControlledGroup::handle(&node, &request, authority));
+                }
+            }
             db.advance_controlled(
                 request.group_id,
                 request.generation,
@@ -335,6 +347,9 @@ impl<S: StateMachine> MultiRaft<S> {
                 ControlledGroupStage::Opening,
                 ControlledGroupStage::Opened,
             )?;
+            if quarantine {
+                node.publish_controlled_group(request.group_id)?;
+            }
             Ok(ControlledGroup::handle(&node, &request, authority))
         })
         .await
@@ -344,6 +359,7 @@ impl<S: StateMachine> MultiRaft<S> {
         request: &ControlledOpen,
         authority: &Arc<dyn StartupAuthority>,
         admission: &StartupAdmission,
+        opening_replay: bool,
     ) -> Result<Option<ControlledGroup<S>>, ControlledError> {
         let Some(receipt) = self.controlled_db()?.lifecycle_receipt(request.group_id)? else {
             return Ok(None);
@@ -354,7 +370,10 @@ impl<S: StateMachine> MultiRaft<S> {
             ));
         }
         let replay = match &request.mode {
-            ControlledOpenMode::Target { .. } => receipt.stage != ControlledGroupStage::Reserved,
+            ControlledOpenMode::Target { .. } => {
+                receipt.stage != ControlledGroupStage::Reserved
+                    && (opening_replay || receipt.stage != ControlledGroupStage::Opening)
+            }
             ControlledOpenMode::BootstrapNew { voters }
                 if !matches!(
                     receipt.stage,

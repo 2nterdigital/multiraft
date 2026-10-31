@@ -88,7 +88,7 @@ pub use multiraft::{
 };
 pub use multiraft::{
     ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,
-    ControlledTerminal,
+    ControlledSeed, ControlledTerminal,
 };
 pub use multiraft_core::ObservationClosed;
 pub use network::GrpcNetworkFactory;

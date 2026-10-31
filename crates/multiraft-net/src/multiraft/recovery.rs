@@ -6,10 +6,6 @@ impl<S: StateMachine> MultiRaft<S> {
     /// first await `wait_for_recovery`; owned runtime startup does this automatically.
     /// Rejection fences the application until shutdown/restart.
     pub async fn validate_recovered(&self, group: GroupId) -> Result<(), MultiRaftError> {
-        let context = FsmFactoryContext {
-            node_id: self.node_id,
-            group_id: group,
-        };
         let sm = self
             .groups
             .lock()
@@ -17,6 +13,17 @@ impl<S: StateMachine> MultiRaft<S> {
             .get(&group)
             .map(|group| group.state_machine.clone())
             .ok_or(MultiRaftError::UnknownGroup(group))?;
+        self.validate_recovered_store(group, sm).await
+    }
+    pub(super) async fn validate_recovered_store(
+        &self,
+        group: GroupId,
+        sm: StateMachineStore<S>,
+    ) -> Result<(), MultiRaftError> {
+        let context = FsmFactoryContext {
+            node_id: self.node_id,
+            group_id: group,
+        };
         let result = sm
             .validate_recovery(|fsm| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
