@@ -366,5 +366,5 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
 mod ownership_tests;
 
 #[cfg(test)]
-#[path = "../../tests/controlled_append_transport/mod.rs"]
+#[path = "../../tests/controlled_append_transport/wire.rs"]
 mod controlled_append_tests;

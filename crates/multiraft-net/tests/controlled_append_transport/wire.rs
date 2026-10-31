@@ -111,3 +111,65 @@ async fn controlled_append_uses_json_and_old_peer_never_receives_binary_fallback
         server.await.unwrap().unwrap();
     }
 }
+
+#[tokio::test]
+async fn controlled_ingress_rejects_legacy_binary_without_native_dispatch() {
+    use crate::grpc::proto::raft_service_client::RaftServiceClient;
+    use crate::grpc::server::IngressProtocol;
+    use crate::multiraft::tasks::OwnedTasks;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::{atomic::AtomicBool, RwLock},
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let protocol = IngressProtocol {
+        fingerprint: None,
+        controlled_groups: Arc::new(RwLock::new(BTreeSet::from([7]))),
+    };
+    let groups: crate::node::GroupMap<multiraft_fsm::CounterFsm> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+    let server = tokio::spawn(crate::GrpcServer::serve_owned_protocol(
+        listener,
+        groups,
+        1024,
+        Arc::new(OwnedTasks::default()),
+        Arc::new(AtomicBool::new(true)),
+        protocol,
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let mut client = RaftServiceClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    let error = client
+        .call(RaftRequest {
+            group_id: 7,
+            path: "/raft/append".into(),
+            payload: vec![255],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        tonic::Code::FailedPrecondition,
+        "legacy bytes must be rejected before any decoder/native dispatch"
+    );
+    let error = client
+        .call(RaftRequest {
+            group_id: 7,
+            path: "/raft/append-json/v1".into(),
+            payload: vec![],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        tonic::Code::Unavailable,
+        "versioned unknown group must not return a binary result"
+    );
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}

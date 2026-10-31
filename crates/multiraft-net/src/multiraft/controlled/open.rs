@@ -134,6 +134,11 @@ impl<S: StateMachine> MultiRaft<S> {
         admission: StartupAdmission,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledGroup<S>, ControlledError> {
+        if request.generation == 0 || request.identity.is_empty() {
+            return Err(ControlledError::Rejected(
+                "controlled generation and identity must be nonempty",
+            ));
+        }
         self.controlled_require_storage()?;
         self.ensure_node_log().await?;
         let replay = tokio::time::timeout_at(
