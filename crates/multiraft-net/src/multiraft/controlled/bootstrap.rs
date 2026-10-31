@@ -345,7 +345,11 @@ impl<S: StateMachine> ControlledGroup<S> {
                 let voters: BTreeSet<_> = anchor.intent.members.keys().copied().collect();
                 let configuration = &anchor.configuration;
                 let configs = configuration.membership().get_joint_config();
-                if voters.len() != 3
+                if anchor.vote.is_none()
+                    || configuration.log_id().is_none_or(|configuration| {
+                        !super::seed::covers(anchor.applied, configuration)
+                    })
+                    || voters.len() != 3
                     || !voters.contains(&node.node_id)
                     || anchor.intent != intent(&node, &request, &voters)
                     || configs.len() != 1

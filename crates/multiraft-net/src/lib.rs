@@ -10,6 +10,10 @@
 mod api;
 pub mod application_rpc;
 mod conn_metrics;
+#[cfg(test)]
+extern crate self as multiraft_net;
+#[cfg(test)]
+mod controlled_bootstrap_test_gate;
 pub mod controlled_startup;
 mod election_source;
 mod fsm_factory;
@@ -92,6 +96,7 @@ pub use multiraft::{
 };
 pub use multiraft::{LocalAuthoritativeMembership, LocalAuthorityError};
 pub use multiraft_core::ObservationClosed;
+pub use multiraft_store::{ControlledGroupReceipt, ControlledGroupStage};
 pub use network::GrpcNetworkFactory;
 pub use network::NetworkFactory;
 pub use node::create_node;

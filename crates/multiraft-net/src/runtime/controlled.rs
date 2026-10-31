@@ -100,10 +100,13 @@ impl<S: StateMachine> RuntimeShared<S> {
         }
     }
     pub(super) fn publish_controlled(&self, group: GroupId, generation: u64, opened: bool) {
-        let generations = self
+        let mut generations = self
             .controlled_generations
             .lock()
             .expect("controlled generations lock poisoned");
+        if opened {
+            generations.entry(group).or_insert(generation);
+        }
         if generations.get(&group) != Some(&generation) {
             return;
         }
@@ -139,13 +142,19 @@ impl<S: StateMachine> RuntimeHandle<S> {
             };
             let _ = reply.send(result);
         }) { return Err(RuntimeError::Closed.into()); }
-        tokio::time::timeout_at(deadline, receiver)
+        let result = tokio::time::timeout_at(deadline, receiver)
             .await
             .map_err(|_| ControlledError::Deadline {
                 outcome_unknown: true,
             })?
-            .map_err(|_| ControlledError::Closed)?
-            .map_err(Into::into)
+            .map_err(|_| ControlledError::Closed)?;
+        if Instant::now() >= deadline {
+            return Err(ControlledError::Deadline {
+                outcome_unknown: true,
+            }
+            .into());
+        }
+        result.map_err(Into::into)
     }
     /// Open an externally admitted controlled generation without exporting native ownership.
     pub async fn open_controlled_group(
@@ -157,7 +166,6 @@ impl<S: StateMachine> RuntimeHandle<S> {
     ) -> Result<ManagedControlledGroup<S>, ManagedControlError> {
         let runtime = self.clone();
         self.controlled_request(deadline, move |shared| async move {
-            shared.register_controlled(request.group_id, request.generation)?;
             let group = shared
                 .node
                 .open_controlled_group_completion(request, authority, admission, None, None)
@@ -168,6 +176,7 @@ impl<S: StateMachine> RuntimeHandle<S> {
             {
                 shared.publish_controlled(group.group_id(), group.generation(), true);
             }
+            shared.register_controlled(group.group_id(), group.generation())?;
             Ok(ManagedControlledGroup { runtime, group })
         })
         .await
@@ -183,11 +192,11 @@ impl<S: StateMachine> RuntimeHandle<S> {
     ) -> Result<ManagedControlledGroup<S>, ManagedControlError> {
         let runtime = self.clone();
         self.controlled_request(deadline, move |shared| async move {
-            shared.register_controlled(group, specification.target_generation)?;
             let group = shared
                 .node
                 .reserve_controlled_target(group, specification, identity, authority, deadline)
                 .await?;
+            shared.register_controlled(group.group_id(), group.generation())?;
             Ok(ManagedControlledGroup { runtime, group })
         })
         .await
@@ -203,11 +212,11 @@ impl<S: StateMachine> RuntimeHandle<S> {
     ) -> Result<ManagedControlledGroup<S>, ManagedControlError> {
         let runtime = self.clone();
         self.controlled_request(deadline, move |shared| async move {
-            shared.register_controlled(group, generation)?;
             let group = shared
                 .node
                 .inspect_controlled_group(group, generation, identity, authority)
                 .await?;
+            shared.register_controlled(group.group_id(), group.generation())?;
             Ok(ManagedControlledGroup { runtime, group })
         })
         .await
