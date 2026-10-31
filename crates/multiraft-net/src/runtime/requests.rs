@@ -1,5 +1,5 @@
 //! Bounded admission and existing opaque byte/ReadIndex operations.
-use super::recovery::StartupTiming;
+use super::recovery::{StartupKind, StartupTiming};
 use super::*;
 use futures::FutureExt;
 use multiraft_core::ProposeApplied;
@@ -72,8 +72,36 @@ impl<S: StateMachine> RuntimeHandle<S> {
     ) -> Result<(), RuntimeError> {
         let admitted = self.admit(deadline).await?;
         let deadline = deadline.min(Instant::now() + CLEANUP_TIMEOUT);
-        self.create_group_registered(group, admitted, StartupTiming::Absolute(deadline))
-            .await
+        self.create_group_registered(
+            group,
+            admitted,
+            StartupTiming::Absolute(deadline),
+            StartupKind::Legacy,
+        )
+        .await
+    }
+
+    /// Recover an existing durable native Group without dispatching initialize.
+    ///
+    /// Native provenance and initialized membership are checked before application
+    /// construction. Purged disk FSM history is validated after opening its local
+    /// state, before Core construction or route publication. Declaration voters are
+    /// ignored: persisted native membership is authoritative. Failure fences and
+    /// drains the owned node, just like [`Self::create_group`].
+    pub async fn recover_existing_group(
+        &self,
+        group: GroupConfig,
+        deadline: Instant,
+    ) -> Result<(), RuntimeError> {
+        let admitted = self.admit(deadline).await?;
+        let deadline = deadline.min(Instant::now() + CLEANUP_TIMEOUT);
+        self.create_group_registered(
+            group,
+            admitted,
+            StartupTiming::Absolute(deadline),
+            StartupKind::PersistedOnly,
+        )
+        .await
     }
 
     /// Construct a Group, then bound only its native recovery wait.
@@ -90,8 +118,13 @@ impl<S: StateMachine> RuntimeHandle<S> {
         recovery_timeout: Duration,
     ) -> Result<(), RuntimeError> {
         let admitted = self.admit(Instant::now() + CLEANUP_TIMEOUT).await?;
-        self.create_group_registered(group, admitted, StartupTiming::NativeWait(recovery_timeout))
-            .await
+        self.create_group_registered(
+            group,
+            admitted,
+            StartupTiming::NativeWait(recovery_timeout),
+            StartupKind::Legacy,
+        )
+        .await
     }
 
     async fn create_group_registered(
@@ -99,6 +132,7 @@ impl<S: StateMachine> RuntimeHandle<S> {
         group: GroupConfig,
         admitted: Admitted<S>,
         timing: StartupTiming,
+        kind: StartupKind,
     ) -> Result<(), RuntimeError> {
         let shared = admitted.shared.clone();
         let reservation = shared.reserve_legacy()?;
@@ -109,7 +143,7 @@ impl<S: StateMachine> RuntimeHandle<S> {
             let _admitted = admitted;
             let _reservation = reservation;
             let _serialized = shared.group_creation.lock().await;
-            let result = std::panic::AssertUnwindSafe(shared.recover_group(group, timing))
+            let result = std::panic::AssertUnwindSafe(shared.recover_group(group, timing, kind))
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| {

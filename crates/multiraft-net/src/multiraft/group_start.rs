@@ -6,14 +6,22 @@ impl<S: StateMachine> MultiRaft<S> {
         &self,
         group: GroupId,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
-        self.spawn_local_group_authorized(group, false, false).await
+        self.spawn_local_group_authorized(group, false, false, false)
+            .await
     }
     pub(super) async fn spawn_controlled_local_group(
         &self,
         group: GroupId,
         quarantine: bool,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
-        self.spawn_local_group_authorized(group, true, quarantine)
+        self.spawn_local_group_authorized(group, true, quarantine, false)
+            .await
+    }
+    pub(super) async fn spawn_persisted_local_group(
+        &self,
+        group: GroupId,
+    ) -> Result<tokio::time::Instant, MultiRaftError> {
+        self.spawn_local_group_authorized(group, false, false, true)
             .await
     }
     async fn spawn_local_group_authorized(
@@ -21,6 +29,7 @@ impl<S: StateMachine> MultiRaft<S> {
         group: GroupId,
         controlled_admission: bool,
         quarantine: bool,
+        persisted_only: bool,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
         let _construction = self.controlled_construction.read().await;
         if self
@@ -140,6 +149,11 @@ impl<S: StateMachine> MultiRaft<S> {
             MultiRaftError::Other(error.into())
         })?);
 
+        if persisted_only {
+            self.check_persisted_startup(group)
+                .await
+                .map_err(MultiRaftError::Other)?;
+        }
         let context = FsmFactoryContext {
             node_id: self.node_id,
             group_id: group,
@@ -345,6 +359,11 @@ impl<S: StateMachine> MultiRaft<S> {
                     self.node_id, group
                 )))
             })?;
+        if persisted_only {
+            self.check_persisted_fsm_basis(group, &mut log_store, &state_machine_store)
+                .await
+                .map_err(MultiRaftError::Other)?;
+        }
         let durable_basis = if recovery::durable_local_mode(&self.config) {
             Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?)
         } else {
