@@ -51,12 +51,18 @@ impl NativeTargetTransport for Interrupted {
     ) -> authority::StartupAuthorityFuture<'_, Result<Vec<u8>, NativeTargetTransportError>> {
         Box::pin(async move {
             let request: NativeTargetRequest = serde_json::from_slice(&bytes).unwrap();
-            let chosen = match (&request.command, self.fault) {
-                (NativeTargetCommand::StartSeed { .. }, Fault::Start) => true,
-                (NativeTargetCommand::SeedChunk { sequence: 1, .. }, Fault::Partial) => true,
-                (NativeTargetCommand::SeedChunk { chunk: None, .. }, Fault::Eof) => true,
-                _ => false,
-            };
+            let chosen = matches!(
+                (&request.command, self.fault),
+                (NativeTargetCommand::StartSeed { .. }, Fault::Start)
+                    | (
+                        NativeTargetCommand::SeedChunk { sequence: 1, .. },
+                        Fault::Partial
+                    )
+                    | (
+                        NativeTargetCommand::SeedChunk { chunk: None, .. },
+                        Fault::Eof
+                    )
+            );
             let reply = self.endpoint.exchange(bytes).await?;
             if chosen && !self.fired.swap(true, Ordering::SeqCst) {
                 *self.old.lock().unwrap() = Some(request.scope);
