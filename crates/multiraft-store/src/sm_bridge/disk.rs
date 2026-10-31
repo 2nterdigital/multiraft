@@ -5,7 +5,9 @@ use multiraft_fsm::AppliedState;
 use openraft::storage::{RaftLogReader, RaftLogStorage};
 use serde::{Deserialize, Serialize};
 
+mod checkpoint;
 mod control;
+pub use checkpoint::ControlledCheckpointState;
 mod install;
 mod snapshot;
 

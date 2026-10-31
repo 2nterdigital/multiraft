@@ -25,6 +25,7 @@ pub use log_mem::LogStore;
 pub use log_rocks::{ControlledGroupReceipt, ControlledGroupStage, RocksLogDb, RocksLogStore};
 pub use native_log::NativeRaftLogStore;
 pub use sm_bridge::build_standby_snapshot_async;
+pub use sm_bridge::ControlledCheckpointState;
 pub use sm_bridge::SmOptions;
 pub use sm_bridge::StateMachineStore;
 pub use sm_bridge::TriggerCb;

@@ -287,6 +287,15 @@ impl StateMachine for Disk {
     }
 }
 impl DiskState for Disk {
+    fn snapshot_workspace(&self) -> io::Result<std::path::PathBuf> {
+        self.db.snapshot_workspace()
+    }
+    fn checkpoint(&self, dir: &Path) -> io::Result<()> {
+        self.db.checkpoint(dir)
+    }
+    fn inspect_checkpoint(&self, dir: &Path) -> io::Result<Option<Vec<u8>>> {
+        self.db.inspect_checkpoint(dir)
+    }
     fn durable_applied(&self) -> io::Result<Option<Vec<u8>>> {
         self.db.applied_record()
     }
@@ -304,6 +313,132 @@ impl DiskState for Disk {
         self.db.commit(batch, applied)?;
         Ok(ApplyOut::default())
     }
+}
+
+#[tokio::test]
+async fn controlled_checkpoint_inspection_reads_the_published_database_not_live_ledger() {
+    use openraft::RaftSnapshotBuilder;
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/223-ledger");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let root = tempfile::tempdir_in(scratch).unwrap();
+    let disk = Disk {
+        db: DiskFsmDb::open(
+            root.path().join("live"),
+            7,
+            DiskFsmOptions::new(b"controlled-test-v1".to_vec()),
+        )
+        .unwrap(),
+    };
+    let mut store = StateMachineStore::with_native_options(
+        7,
+        disk,
+        multiraft_store::NativeSmOptions {
+            catalog: std::sync::Arc::new(multiraft_store::SnapshotCatalog::new(
+                root.path().join("catalog"),
+                2,
+            )),
+            max_snapshot_bytes: 1024 * 1024,
+            build_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        },
+    )
+    .unwrap();
+    let initial = Membership::new(
+        vec![BTreeSet::from([1, 2, 3])],
+        BTreeMap::from_iter([1, 2, 3].map(|id| (id, openraft::BasicNode::default()))),
+    )
+    .unwrap();
+    let specification = ReplacementSpec {
+        operation: OperationId {
+            sequence: 1,
+            nonce: [11; 16],
+        },
+        expected_start: StoredMembership::new(Some(id(0)), initial.clone()),
+        target_voters: BTreeSet::from([1, 2, 4]),
+        target_generation: 5,
+    };
+    apply(&mut store, 0, EntryPayload::Membership(initial)).await;
+    apply(
+        &mut store,
+        1,
+        EntryPayload::Normal(Request::native_control(NativeControl::Begin {
+            specification: specification.clone(),
+            executor_epoch: 1,
+        })),
+    )
+    .await;
+    let snapshot = store
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .unwrap();
+    apply(
+        &mut store,
+        2,
+        EntryPayload::Normal(Request::native_control(NativeControl::Claim {
+            operation: specification.operation,
+            executor_epoch: 9,
+        })),
+    )
+    .await;
+    let state = store
+        .inspect_controlled_checkpoint(&snapshot.meta, snapshot.snapshot.get_ref())
+        .await
+        .unwrap();
+    assert_eq!(state.applied, id(1));
+    assert_eq!(state.membership, specification.expected_start);
+    assert_eq!(
+        state.ledger.current.unwrap().executor_epoch,
+        1,
+        "published database was frozen before live Claim9"
+    );
+    assert_eq!(
+        store
+            .controlled_ledger()
+            .await
+            .unwrap()
+            .current
+            .unwrap()
+            .executor_epoch,
+        9
+    );
+    let mut descriptor =
+        multiraft_store::disk_snapshot::DiskManifest::decode(snapshot.snapshot.get_ref(), 7)
+            .unwrap();
+    descriptor.source = root.path().join("live");
+    assert!(
+        store
+            .inspect_controlled_checkpoint(&descriptor.meta, &descriptor.encode().unwrap())
+            .await
+            .is_err(),
+        "caller-controlled path cannot substitute the live database"
+    );
+    let manifest =
+        multiraft_store::disk_snapshot::DiskManifest::decode(snapshot.snapshot.get_ref(), 7)
+            .unwrap();
+    let changed = DiskFsmDb::open(
+        &manifest.source,
+        7,
+        DiskFsmOptions::new(b"controlled-test-v1".to_vec()),
+    )
+    .unwrap();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&changed.applied_record().unwrap().unwrap()).unwrap();
+    record["last_applied"] = serde_json::to_value(id(99)).unwrap();
+    changed
+        .commit(
+            WriteBatch::default(),
+            &AppliedState::new(99, 1, serde_json::to_vec(&record).unwrap()),
+        )
+        .unwrap();
+    drop(changed);
+    assert!(
+        store
+            .inspect_controlled_checkpoint(&snapshot.meta, snapshot.snapshot.get_ref())
+            .await
+            .is_err(),
+        "actual checkpoint applied record must match metadata"
+    );
 }
 fn open(root: &Path) -> StateMachineStore<Disk> {
     StateMachineStore::new(
