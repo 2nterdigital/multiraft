@@ -58,13 +58,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                         "terminal does not exclude this local replica",
                     ));
                 }
-                let catalog = this.authority.read(this.group).await?;
-                if !catalog.completed.iter().any(|completed| {
-                    completed.native_record.specification == terminal.specification
-                        && completed.native_record.terminal.as_ref() == Some(&terminal.proof)
-                }) {
-                    return Err(ControlledError::Rejected("terminal handoff is not durable"));
-                }
+                super::terminal::recheck_retirement(&this, &terminal).await?;
                 let storage_owner = this.storage_owner()?;
                 let db = node.controlled_db()?;
                 let receipt = this.checked_receipt()?;
