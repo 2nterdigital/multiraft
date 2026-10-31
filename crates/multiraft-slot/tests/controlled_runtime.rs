@@ -4,7 +4,7 @@ use controlled_support::*;
 use multiraft_slot::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn controlled_genesis_and_cold_provisional_single_source_need_no_quorum() {
+async fn controlled_genesis_and_cold_sources_need_no_quorum_in_both_catalog_phases() {
     let mut fixture = Fixture::fresh().await;
     let mut bases = std::collections::BTreeMap::new();
     for id in 1..=3 {
@@ -55,7 +55,65 @@ async fn controlled_genesis_and_cold_provisional_single_source_need_no_quorum() 
             .await
             .unwrap();
     }
+    let second = fixture
+        .start(2, SlotStartupDisposition::RecoverExisting, 2)
+        .await
+        .unwrap();
+    for a in &fixture.layout.config().slots {
+        let proof = second
+            .handle()
+            .controlled(a.slot)
+            .unwrap()
+            .genesis_basis(deadline())
+            .await
+            .unwrap();
+        assert_eq!(proof.configuration(), &bases[&a.slot]);
+        let group = fixture.layout.group_for_slot(a.slot).unwrap();
+        assert!(
+            fixture
+                .authority
+                .read(group)
+                .await
+                .unwrap()
+                .membership
+                .log_id()
+                .is_none(),
+            "cold recovery must never finalize a provisional catalog"
+        );
+    }
     fixture.owners.push(source);
+    fixture.owners.push(second);
+    fixture.stop_owners().await;
+    for a in &fixture.layout.config().slots {
+        let group = fixture.layout.group_for_slot(a.slot).unwrap();
+        fixture.authority.0[&group]
+            .bootstrap_membership(bases[&a.slot].clone())
+            .unwrap();
+    }
+    let finalized = fixture
+        .start(1, SlotStartupDisposition::RecoverExisting, 3)
+        .await
+        .unwrap();
+    for a in &fixture.layout.config().slots {
+        let proof = finalized
+            .handle()
+            .controlled(a.slot)
+            .unwrap()
+            .genesis_basis(deadline())
+            .await
+            .unwrap();
+        assert_eq!(proof.configuration(), &bases[&a.slot]);
+        assert_eq!(
+            finalized
+                .handle()
+                .local_role(a.slot, deadline())
+                .await
+                .unwrap()
+                .generation,
+            Some(10)
+        );
+    }
+    fixture.owners.push(finalized);
     fixture.stop().await;
 }
 
