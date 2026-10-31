@@ -5,6 +5,8 @@ use multiraft_core::{NativeLedger, OperationId, ReplacementSpec, TerminalProof};
 use std::sync::Weak;
 
 mod bootstrap;
+pub use bootstrap::ManagedGenesisBasis;
+pub(super) type Publication = Arc<dyn Fn(GroupId, u64, bool) + Send + Sync>;
 mod cleanup;
 mod durable_record;
 mod open;
@@ -259,5 +261,24 @@ impl<S: StateMachine> ControlledGroup<S> {
                     .map_err(|error| ControlledError::Native(error.to_string()))
             })
             .await
+    }
+}
+
+impl<S: StateMachine> MultiRaft<S> {
+    pub(crate) fn set_controlled_publication(&self, publication: Publication) {
+        *self
+            .controlled_publication
+            .lock()
+            .expect("controlled publication lock poisoned") = Some(publication);
+    }
+    fn notify_controlled_publication(&self, group: GroupId, generation: u64, opened: bool) {
+        let publication = self
+            .controlled_publication
+            .lock()
+            .expect("controlled publication lock poisoned")
+            .clone();
+        if let Some(publication) = publication {
+            publication(group, generation, opened);
+        }
     }
 }
