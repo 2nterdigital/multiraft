@@ -8,7 +8,11 @@ use std::{
 pub(super) fn publish(root: &Path, path: &Path, bytes: &[u8]) -> io::Result<bool> {
     use sha2::Digest;
     match fs::read(path) {
-        Ok(existing) if existing == bytes => return Ok(false),
+        Ok(existing) if existing == bytes => {
+            fs::File::open(path)?.sync_all()?;
+            sync_ancestors(root, path)?;
+            return Ok(false);
+        }
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -45,11 +49,20 @@ pub(super) fn publish(root: &Path, path: &Path, bytes: &[u8]) -> io::Result<bool
         Err(error) => return Err(error),
     };
     fs::remove_file(pending)?;
+    sync_ancestors(root, path)?;
+    Ok(created)
+}
+
+fn sync_ancestors(root: &Path, path: &Path) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|directory| directory.starts_with(root))
+        .ok_or_else(|| io::Error::other("control record directory is outside its owner"))?;
     for ancestor in directory
         .ancestors()
         .take_while(|ancestor| ancestor.starts_with(root))
     {
         fs::File::open(ancestor)?.sync_all()?;
     }
-    Ok(created)
+    Ok(())
 }

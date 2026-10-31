@@ -6,9 +6,11 @@ use std::sync::Weak;
 
 mod bootstrap;
 mod cleanup;
+mod durable_record;
 mod open;
 mod owner;
 mod source;
+mod storage_owner;
 mod terminal;
 pub(super) use owner::GroupOwner;
 
@@ -24,6 +26,8 @@ pub enum ControlledOpenMode {
 }
 
 /// Immutable local generation and one-shot construction request.
+/// Controlled FSMs must declare exclusive canonical live and snapshot storage paths.
+/// Unsupported or differently owned disk namespaces are refused before native core startup.
 #[derive(Debug, Clone)]
 pub struct ControlledOpen {
     pub group_id: GroupId,

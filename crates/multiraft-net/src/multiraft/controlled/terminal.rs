@@ -74,6 +74,12 @@ pub(super) async fn handoff<S: StateMachine>(
         .copied()
         .collect();
     let members = proof.configuration.membership();
+    let configuration_log = proof
+        .configuration
+        .log_id()
+        .ok_or(ControlledError::Rejected(
+            "native terminal configuration identity missing",
+        ))?;
     if source.len() != 1
         || target != [proof.target_open.target_node]
         || specification.target_voters.len() != 3
@@ -83,8 +89,10 @@ pub(super) async fn handoff<S: StateMachine>(
         || proof.target_open.operation != specification.operation
         || proof.target_open.generation != specification.target_generation
         || proof.target_open.receipt.is_empty()
-        || Some(proof.target_open.applied) < *proof.configuration.log_id()
+        || proof.target_open.applied < configuration_log
+        || proof.target_open.applied.index < configuration_log.index
         || proof.target_open.applied >= proof.barrier
+        || proof.target_open.applied.index >= proof.barrier.index
     {
         return Err(ControlledError::Rejected(
             "native terminal identity or application proof mismatch",
