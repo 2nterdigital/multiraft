@@ -55,58 +55,12 @@ pub(super) async fn persist<S: StateMachine>(
     let bytes =
         serde_json::to_vec(&intent(node, request, voters)).map_err(std::io::Error::other)?;
     let path = path(&node.config.data_dir, request.group_id);
-    tokio::task::spawn_blocking(move || persist_intent(&path, &bytes))
+    let root = node.config.data_dir.clone();
+    tokio::task::spawn_blocking(move || super::durable_record::publish(&root, &path, &bytes))
         .await
         .map_err(|error| ControlledError::Native(error.to_string()))??;
     Ok(())
 }
-fn persist_intent(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use sha2::Digest;
-    use std::io::Write;
-    match std::fs::read(path) {
-        Ok(existing) if existing == bytes => return Ok(()),
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "bootstrap intent identity conflict",
-            ))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let directory = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("bootstrap directory missing"))?;
-    std::fs::create_dir_all(directory)?;
-    // The unique content address permits recovery of a torn pre-publication write.
-    let suffix = format!("{:x}", sha2::Sha256::digest(bytes));
-    let pending = directory.join(format!(".{suffix}.pending"));
-    match std::fs::remove_file(&pending) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&pending)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    match std::fs::hard_link(&pending, path) {
-        Ok(()) => {}
-        Err(error)
-            if error.kind() == std::io::ErrorKind::AlreadyExists
-                && std::fs::read(path)? == bytes => {}
-        Err(error) => return Err(error),
-    }
-    std::fs::remove_file(pending)?;
-    std::fs::File::open(directory)?.sync_all()?;
-    if let Some(parent) = directory.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
 pub(super) async fn reconcile<S: StateMachine>(
     node: &MultiRaft<S>,
     request: &ControlledOpen,

@@ -2,7 +2,6 @@
 use super::*;
 use multiraft_core::StartupProvenance;
 use multiraft_store::ControlledGroupStage;
-use std::io::{ErrorKind, Write};
 
 impl<S: StateMachine> MultiRaft<S> {
     /// Reserve a target generation without constructing a core or initializing membership.
@@ -405,40 +404,6 @@ impl<S: StateMachine> MultiRaft<S> {
         )))
     }
 
-    pub(in crate::multiraft) fn controlled_validate_fsm(
-        &self,
-        group: GroupId,
-        fsm: &mut S,
-    ) -> Result<(), ControlledError> {
-        let live = multiraft_store::DiskFsmDb::group_path(&self.config.data_dir, group);
-        let workspace = multiraft_store::DiskFsmDb::workspace_path(&live)?;
-        let disk = fsm.disk_state().ok_or(ControlledError::Rejected(
-            "controlled group requires a disk-backed FSM",
-        ))?;
-        let declared = disk.storage_paths()?;
-        if declared.live != live
-            || declared.workspace != workspace
-            || disk.snapshot_workspace()? != workspace
-        {
-            return Err(ControlledError::Rejected(
-                "controlled FSM must own the canonical DiskFsmDb namespace",
-            ));
-        }
-        for path in [self.config.data_dir.join("fsm-rocksdb"), live, workspace] {
-            match std::fs::symlink_metadata(path) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(ControlledError::Rejected(
-                        "controlled FSM namespace may not be a symlink",
-                    ))
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
-    }
-
     fn controlled_require_storage(&self) -> Result<(), ControlledError> {
         if self.config.data_dir.as_os_str().is_empty()
             || self.config.log_storage_backend != LogStorageBackend::RocksDb
@@ -458,37 +423,7 @@ fn consume_startup(root: &std::path::Path, admission: &StartupAdmission) -> std:
         .join("controlled-startup")
         .join(format!("group-{}", admission.request.group_id))
         .join(format!("generation-{}", admission.request.generation));
-    std::fs::create_dir_all(&directory)?;
     let path = directory.join(format!("{}.json", admission.serial));
     let bytes = serde_json::to_vec(admission).map_err(std::io::Error::other)?;
-    match std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::fs::File::open(&directory)?.sync_all()?;
-            // Persist newly created ancestor links as well as the receipt itself.
-            for ancestor in directory
-                .ancestors()
-                .skip(1)
-                .take_while(|ancestor| ancestor.starts_with(root))
-            {
-                std::fs::File::open(ancestor)?.sync_all()?;
-            }
-            Ok(true)
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            if std::fs::read(path)? != bytes {
-                return Err(std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "startup receipt identity conflict",
-                ));
-            }
-            Ok(false)
-        }
-        Err(error) => Err(error),
-    }
+    super::durable_record::publish(root, &path, &bytes)
 }

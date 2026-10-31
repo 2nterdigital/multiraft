@@ -89,6 +89,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 {
                     return Err(ControlledError::Rejected("retirement identity mismatch"));
                 }
+                let storage_owner = this.storage_owner()?;
                 let owner = node.group_owner(this.group);
                 owner.retire();
                 let app = node
@@ -150,11 +151,9 @@ impl<S: StateMachine> ControlledGroup<S> {
                 let generation = this.generation;
                 tokio::task::spawn_blocking(move || {
                     db.cleanup_group(group, generation, &proof)?;
-                    let fsm = multiraft_store::DiskFsmDb::group_path(&root, group);
-                    let workspace = multiraft_store::DiskFsmDb::workspace_path(&fsm)?;
                     for path in [
-                        fsm,
-                        workspace,
+                        storage_owner.live,
+                        storage_owner.workspace,
                         root.join("snapshots").join(group.to_string()),
                         root.join(format!("group-{group}")),
                     ] {
