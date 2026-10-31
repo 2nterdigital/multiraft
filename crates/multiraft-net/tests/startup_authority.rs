@@ -333,3 +333,130 @@ async fn binding_cannot_claim_a_different_source_generation() {
         StartupAuthorityResult::Rejected(StartupAuthorityRejection::IdentityConflict)
     );
 }
+
+#[test]
+#[ignore = "self-spawned SIGKILL fixture child"]
+fn catalog_lock_child() {
+    let path = std::env::var_os("STARTUP_CRASH_CATALOG").expect("child catalog path");
+    let ready = std::env::var_os("STARTUP_CRASH_READY").expect("child readiness path");
+    let authority = FileAuthority::open(Path::new(&path));
+    let _lock = authority.lock().expect("child acquired catalog lock");
+    let mut pending = std::fs::File::create(Path::new(&path).with_extension("pending")).unwrap();
+    std::io::Write::write_all(&mut pending, b"{partial-unpublished-state").unwrap();
+    pending.sync_all().unwrap();
+    std::fs::write(ready, b"locked").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[tokio::test]
+async fn sigkill_releases_catalog_lock_and_discards_partial_unpublished_state() {
+    let directory = directory();
+    let path = directory.path().join("catalog.json");
+    let ready = directory.path().join("ready");
+    let authority = provision(&path);
+    applied(authority.bind_active(binding()).await.unwrap());
+    let before = authority.read(7).await.unwrap();
+    drop(authority);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "catalog_lock_child", "--ignored"])
+        .env("STARTUP_CRASH_CATALOG", &path)
+        .env("STARTUP_CRASH_READY", &ready)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn lock owner");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let locked = ready.exists();
+    child.kill().expect("SIGKILL child without Drop cleanup");
+    let status = child.wait().unwrap();
+    assert!(
+        locked,
+        "child did not acquire lock before deadline: {status}"
+    );
+    assert!(!status.success());
+    assert_eq!(
+        FileAuthority::open(&path)
+            .read(7)
+            .await
+            .expect("kernel released dead process lock"),
+        before
+    );
+    denied(
+        FileAuthority::open(&path)
+            .admit(request(1, 10, 99))
+            .await
+            .unwrap(),
+    );
+}
+
+fn membership_with_learner(index: u64, voters: &[u64], learner: u64) -> StoredMembership {
+    StoredMembership::new(
+        Some(log_id::<multiraft_core::TypeConfig>(1, 1, index)),
+        Membership::new(
+            vec![voters.iter().copied().collect()],
+            voters
+                .iter()
+                .copied()
+                .chain([learner])
+                .map(|id| (id, BasicNode::default()))
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .expect("valid fixture membership with learner"),
+    )
+}
+
+#[tokio::test]
+async fn binding_requires_initialized_uniform_three_without_learners() {
+    let directory = directory();
+    let initial_path = directory.path().join("initial.json");
+    let authority = provision(&initial_path);
+    let initial = authority.read(7).await.unwrap();
+    for (index, invalid) in [
+        membership_with_learner(1, &[1, 2, 3], 9),
+        StoredMembership::new(None, membership(1, &[1, 2, 3]).membership().clone()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut catalog = initial.clone();
+        catalog.membership = invalid.clone();
+        let path = directory.path().join(format!("invalid-{index}.json"));
+        let authority = FileAuthority::provision(&path, catalog);
+        let mut request = binding();
+        request.specification.expected_start = invalid;
+        authority.consume_target(request.target.clone()).unwrap();
+        assert_eq!(
+            authority.bind_active(request).await.unwrap(),
+            StartupAuthorityResult::Rejected(StartupAuthorityRejection::IdentityConflict)
+        );
+        assert!(authority.read(7).await.unwrap().active_operation.is_none());
+    }
+}
+
+#[tokio::test]
+async fn terminal_handoff_rejects_retired_source_or_other_node_remaining_as_learner() {
+    for learner in [1, 9] {
+        let directory = directory();
+        let path = directory.path().join("catalog.json");
+        let authority = provision(&path);
+        let binding = binding();
+        applied(authority.bind_active(binding.clone()).await.unwrap());
+        let mut proof = terminal(&binding);
+        let invalid = membership_with_learner(8, &[2, 3, 4], learner);
+        proof.committed_membership = invalid.clone();
+        proof.applied_membership = invalid.clone();
+        proof.native_record.terminal.as_mut().unwrap().configuration = invalid;
+        assert_eq!(
+            authority.terminal_handoff(proof).await.unwrap(),
+            StartupAuthorityResult::Rejected(StartupAuthorityRejection::InvalidProof)
+        );
+        let readback = FileAuthority::open(&path).read(7).await.unwrap();
+        assert_eq!(readback.active_operation, Some(binding));
+        assert_eq!(readback.authorized.get(&1), Some(&10));
+        assert!(readback.completed.is_empty());
+    }
+}
