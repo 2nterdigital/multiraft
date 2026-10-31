@@ -19,6 +19,9 @@ pub enum LocalSlotRole {
 pub struct SlotRoleObservation {
     pub role: LocalSlotRole,
     pub generation: Option<u64>,
+    /// Normalized native log identities and joint voter/learner sets. This omits
+    /// BasicNode metadata and is not a full membership authority proof; use the
+    /// ReadIndex API or sealed Genesis basis for authoritative full membership.
     pub membership: Option<GroupObservation>,
     /// Eligible only at the sampled actual native leader and voter state.
     pub leader_eligible: bool,

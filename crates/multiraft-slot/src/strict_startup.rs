@@ -27,7 +27,8 @@ pub struct SlotLocalIdentity {
     pub data_space_id: u64,
     /// Application-provided, persistent UUID for this data directory.
     pub data_dir_uuid: [u8; 16],
-    /// Must equal [`SLOT_PROTOCOL_VERSION`].
+    /// The selected profile: ordinary [`SLOT_PROTOCOL_VERSION`] or
+    /// [`crate::CONTROLLED_SLOT_PROTOCOL_VERSION`] for explicit controlled startup.
     pub protocol_version: u32,
     /// Application storage/command compatibility tuple, hashed by the application.
     pub compatibility_digest: [u8; 32],

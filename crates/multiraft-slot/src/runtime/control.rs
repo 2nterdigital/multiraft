@@ -1,6 +1,7 @@
 //! Slot-addressed managed control; raw native ownership and sealed mutation evidence never escape.
 use super::{Shared, SlotHandle, SlotStateMachine};
 use crate::{RuntimeError, SlotId};
+use futures::FutureExt;
 use multiraft_core::{NativeLedger, OperationId, ReplacementSpec, TerminalProof};
 use multiraft_net::{
     controlled_startup::StartupAdmission,
@@ -8,6 +9,7 @@ use multiraft_net::{
     ControlledGroupReceipt, ManagedControlError, ManagedControlledGroup, ManagedGenesisBasis,
     ManagedOperation, ManagedTargetEndpoint,
 };
+use std::sync::atomic::Ordering;
 use std::{future::Future, sync::Arc};
 use tokio::time::Instant;
 
@@ -142,10 +144,27 @@ impl<S: SlotStateMachine> SlotHandle<S> {
         {
             let mut tasks = shared.tasks.lock().unwrap();
             shared.check(deadline)?;
+            while let Some(result) = tasks.try_join_next() {
+                if result.is_err() {
+                    shared.accepting.store(false, Ordering::Release);
+                    shared.panicked.store(true, Ordering::Release);
+                    return Err(RuntimeError::TaskPanicked.into());
+                }
+            }
             let pinned = shared.clone();
             tasks.spawn(async move {
                 let _guard = guard;
-                let result = action(pinned).await;
+                let result = match std::panic::AssertUnwindSafe(action(pinned.clone()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        pinned.panicked.store(true, Ordering::Release);
+                        pinned.begin_cleanup();
+                        Err(RuntimeError::Unknown.into())
+                    }
+                };
                 let _ = sender.send(result);
             });
         }

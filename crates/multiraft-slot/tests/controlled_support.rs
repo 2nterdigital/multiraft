@@ -1,6 +1,8 @@
 //! Public Slot fixtures backed by real durable FSMs and independently persisted catalogs.
 #![allow(dead_code)]
+#[path = "controlled_support/catalog.rs"]
 pub mod catalog;
+#[path = "controlled_support/disk.rs"]
 pub mod disk;
 use authority::*;
 use catalog::FileAuthority;
@@ -96,6 +98,7 @@ pub struct Fixture {
     pub directory: TrustedSlotDirectory,
     pub authority: Arc<Catalogs>,
     pub owners: Vec<SlotNodeOwner<DiskImage>>,
+    pub factory_calls: Arc<AtomicU64>,
 }
 impl Fixture {
     pub async fn fresh() -> Self {
@@ -169,6 +172,7 @@ impl Fixture {
             directory,
             authority: Arc::new(Catalogs(catalogs)),
             owners: vec![],
+            factory_calls: Arc::new(AtomicU64::new(0)),
         };
         let starts = (1..=3)
             .map(|id| fixture.start(id, SlotStartupDisposition::Genesis, 1))
@@ -228,6 +232,7 @@ impl Fixture {
     ) -> Result<SlotNodeOwner<DiskImage>, RuntimeError> {
         let path = self.root.join(format!("node-{id}"));
         let fsm_path = path.clone();
+        let calls = self.factory_calls.clone();
         let mut config = SlotNodeConfig::new(self.layout.clone(), id, path);
         config.native.heartbeat_interval_ms = 50;
         config.native.election_timeout_min_ms = 150;
@@ -236,6 +241,7 @@ impl Fixture {
             config,
             self.startup(id, disposition, boot),
             move |ctx: multiraft_net::FsmFactoryContext| {
+                calls.fetch_add(1, Ordering::Relaxed);
                 DiskImage::open(&fsm_path, ctx.group_id()).map_err(Into::into)
             },
             deadline(),
