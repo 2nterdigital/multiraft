@@ -664,3 +664,26 @@ async fn purge_boundary_without_committed_record_or_disk_basis_still_rejects() {
     assert_eq!(log.read_committed().await.unwrap(), None);
     drop(owner);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn local_basis_probe_rejects_memory_without_fencing_the_running_group() {
+    let mut inputs = config(Path::new(""));
+    inputs.cluster.snapshot_mode = SnapshotMode::Disabled;
+    inputs.groups = vec![group(7)];
+    let owner = NodeOwner::start(inputs, |_| Ok(CounterFsm::default()), deadline())
+        .await
+        .unwrap();
+    let handle = owner.handle();
+    assert!(handle
+        .validate_local_recovery_basis(7, deadline())
+        .await
+        .is_err());
+    assert!(
+        handle
+            .local_group_status(7, deadline())
+            .await
+            .unwrap()
+            .running
+    );
+    owner.shutdown(deadline()).await.unwrap();
+}
