@@ -2,12 +2,47 @@
 use super::*;
 use multiraft_store::ControlledGroupStage;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupMode {
+    Retire,
+    Cleanup,
+    RetireAndCleanup,
+}
+
 impl<S: StateMachine> ControlledGroup<S> {
-    /// Retire and remove only the excluded local generation proven by this sealed terminal.
-    /// The retained job continues through all barriers if its caller leaves or times out.
+    /// Persist retirement, stop all local owners, and retain the replica's files.
+    /// Success proves actual local stop; exclusion alone does not establish this receipt.
+    pub async fn retire(
+        &self,
+        terminal: &ControlledTerminal,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ControlledError> {
+        self.finish_retirement(terminal, CleanupMode::Retire, deadline)
+            .await
+    }
+    /// Explicitly delete a retired generation after rechecking its durable proof and barriers.
+    pub async fn cleanup(
+        &self,
+        terminal: &ControlledTerminal,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ControlledError> {
+        self.finish_retirement(terminal, CleanupMode::Cleanup, deadline)
+            .await
+    }
+    /// Explicit convenience operation joining retirement and subsequent file cleanup.
+    /// A caller timeout leaves the admitted job owned through its real release barriers.
     pub async fn retire_and_cleanup(
         &self,
         terminal: &ControlledTerminal,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ControlledError> {
+        self.finish_retirement(terminal, CleanupMode::RetireAndCleanup, deadline)
+            .await
+    }
+    async fn finish_retirement(
+        &self,
+        terminal: &ControlledTerminal,
+        mode: CleanupMode,
         deadline: tokio::time::Instant,
     ) -> Result<(), ControlledError> {
         let this = self.clone();
@@ -37,6 +72,11 @@ impl<S: StateMachine> ControlledGroup<S> {
                     && receipt.terminal_proof.as_ref() == Some(&proof)
                 {
                     return Ok(());
+                }
+                if mode == CleanupMode::Cleanup && receipt.stage == ControlledGroupStage::Opened {
+                    return Err(ControlledError::Rejected(
+                        "explicit cleanup requires a retired generation",
+                    ));
                 }
                 if receipt.stage == ControlledGroupStage::Opened {
                     db.retire(this.group, this.generation, &proof)?;
@@ -88,6 +128,12 @@ impl<S: StateMachine> ControlledGroup<S> {
                         .await
                         .map_err(|error| ControlledError::Native(error.to_string()))?;
                 }
+                if let NetBackend::Grpc { router } = &node.net {
+                    router
+                        .join_group_sends(this.group)
+                        .await
+                        .map_err(|error| ControlledError::Native(error.to_string()))?;
+                }
                 node.leader_watch_groups
                     .lock()
                     .expect("leader watcher lock poisoned")
@@ -96,6 +142,9 @@ impl<S: StateMachine> ControlledGroup<S> {
                     .lock()
                     .expect("construction basis lock poisoned")
                     .remove(&this.group);
+                if mode == CleanupMode::Retire {
+                    return Ok(());
+                }
                 let root = node.config.data_dir.clone();
                 let group = this.group;
                 let generation = this.generation;

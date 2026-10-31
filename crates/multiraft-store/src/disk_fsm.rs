@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use multiraft_fsm::{AppliedState, GroupId};
+use multiraft_fsm::{AppliedState, DiskStoragePaths, GroupId};
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB,
 };
@@ -88,6 +88,17 @@ fn db_error(error: rocksdb::Error) -> io::Error {
 }
 
 impl DiskFsmDb {
+    /// Declare the actual opened store and its exclusively owned snapshot workspace.
+    ///
+    /// Consumers forwarding this capability must preserve exclusive Group ownership;
+    /// the runtime validates these paths before admitting controlled cleanup.
+    pub fn storage_paths(&self) -> io::Result<DiskStoragePaths> {
+        Ok(DiskStoragePaths {
+            live: self.path.clone(),
+            workspace: Self::workspace_path(&self.path)?,
+        })
+    }
+
     /// Canonical location of `group`'s FSM database under a node data directory.
     pub fn group_path(data_dir: impl AsRef<Path>, group: GroupId) -> PathBuf {
         data_dir

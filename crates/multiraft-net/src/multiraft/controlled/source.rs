@@ -1,8 +1,6 @@
 //! Membership steps and terminal proof run under one local per-group command owner.
 use super::*;
-use crate::controlled_startup::{
-    StartupAuthorityResult, StartupBinding, StartupTargetGeneration, StartupTerminalProof,
-};
+use crate::controlled_startup::{StartupAuthorityResult, StartupBinding, StartupTargetGeneration};
 use multiraft_core::{ControlReply, NativeControl, TargetOpenReceipt};
 use multiraft_store::ControlledGroupStage;
 use openraft::{storage::RaftStateMachine, vote::RaftLeaderId, MembershipChangeGuard};
@@ -390,69 +388,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                         .current
                         .ok_or(ControlledError::Rejected("native terminal record missing"))?;
                 }
-                let proof = record
-                    .terminal
-                    .clone()
-                    .ok_or(ControlledError::Rejected("native terminal proof missing"))?;
-                let old: BTreeSet<_> = record
-                    .specification
-                    .expected_start
-                    .membership()
-                    .voter_ids()
-                    .collect();
-                let source = *old
-                    .difference(&record.specification.target_voters)
-                    .next()
-                    .ok_or(ControlledError::Rejected("excluded source missing"))?;
-                let catalog = this.authority.read(this.group).await?;
-                let source_generation = catalog
-                    .active_operation
-                    .as_ref()
-                    .filter(|binding| binding.specification == record.specification)
-                    .map(|binding| binding.source_generation)
-                    .or_else(|| {
-                        catalog
-                            .completed
-                            .iter()
-                            .find(|completed| completed.native_record == record)
-                            .map(|completed| completed.source_generation)
-                    })
-                    .ok_or(ControlledError::Rejected("source generation proof missing"))?;
-                let handoff = StartupTerminalProof {
-                    source_generation,
-                    group_id: this.group,
-                    native_record: record.clone(),
-                    committed_membership: proof.configuration.clone(),
-                    applied_membership: proof.configuration.clone(),
-                    applied_log: proof.barrier,
-                    target_opened: StartupTargetGeneration {
-                        node_id: proof.target_open.target_node,
-                        generation: proof.target_open.generation,
-                        consumption_id: proof.target_open.receipt.clone(),
-                    },
-                };
-                match this.authority.terminal_handoff(handoff.clone()).await? {
-                    StartupAuthorityResult::Applied(actual) if actual == handoff => {}
-                    StartupAuthorityResult::Unknown
-                        if this
-                            .authority
-                            .read(this.group)
-                            .await?
-                            .completed
-                            .contains(&handoff) => {}
-                    _ => {
-                        return Err(ControlledError::Rejected(
-                            "terminal startup handoff is unconfirmed",
-                        ))
-                    }
-                }
-                Ok(ControlledTerminal {
-                    group: this.group,
-                    source,
-                    source_generation,
-                    proof,
-                    specification: record.specification,
-                })
+                super::terminal::handoff(&this, record).await
             })
             .await
     }

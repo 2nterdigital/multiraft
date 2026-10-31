@@ -252,6 +252,12 @@ impl GrpcRouter {
             .insert(group);
     }
 
+    pub(crate) async fn join_group_sends(&self, group: GroupId) -> anyhow::Result<()> {
+        self.snapshot_sender.join_group(group).await
+    }
+    pub(crate) fn reopen_group_sends(&self, group: GroupId) {
+        self.snapshot_sender.reopen_group(group);
+    }
     pub(crate) fn controlled_groups(&self) -> Arc<RwLock<BTreeSet<GroupId>>> {
         self.controlled_groups.clone()
     }
