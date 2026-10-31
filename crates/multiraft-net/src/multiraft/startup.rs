@@ -156,9 +156,18 @@ impl<S: StateMachine> MultiRaft<S> {
             committed.is_some() || snapshot_membership,
             "strict recovery requires committed native membership or checkpoint"
         );
+        let vote = log
+            .read_vote()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("strict recovery requires a persisted native vote"))?;
+        let latest = state.last_log_id.max(committed).max(
+            snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.meta.last_log_id),
+        );
         anyhow::ensure!(
-            log.read_vote().await?.is_some(),
-            "strict recovery requires a persisted native vote"
+            latest.is_none_or(|id| vote.leader_id.to_committed() >= *id.committed_leader_id()),
+            "strict recovery vote is older than persisted native history"
         );
         if snapshot_membership || state.last_purged_log_id.is_some() {
             // Generic disk FSM authority is available only after opening the
