@@ -5,6 +5,7 @@ use multiraft_fsm::AppliedState;
 use openraft::storage::{RaftLogReader, RaftLogStorage};
 use serde::{Deserialize, Serialize};
 
+mod control;
 mod install;
 mod snapshot;
 
@@ -16,14 +17,19 @@ pub(super) struct AppliedRecord {
     version: u32,
     pub(super) last_applied: LogIdOf<TypeConfig>,
     pub(super) membership: StoredMembershipOf<TypeConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) control: Option<multiraft_core::NativeLedger>,
 }
 
 impl AppliedRecord {
     pub(super) fn decode(bytes: &[u8]) -> io::Result<Self> {
         let record: Self =
             serde_json::from_slice(bytes).map_err(|error| invalid(&error.to_string()))?;
-        if record.version != RECORD_VERSION {
+        if record.version != RECORD_VERSION && record.version != 2 {
             return Err(invalid("unknown disk applied record version"));
+        }
+        if (record.version == 2) != record.control.is_some() {
+            return Err(invalid("disk applied control version mismatch"));
         }
         if record.membership.log_id().as_ref() > Some(&record.last_applied) {
             return Err(invalid(
@@ -88,9 +94,11 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
             let record = AppliedRecord::decode(&bytes)?;
             self.last_applied_log = Some(record.last_applied);
             self.last_membership = record.membership;
+            self.control = record.control;
         } else {
             self.last_applied_log = None;
             self.last_membership = StoredMembershipOf::<TypeConfig>::default();
+            self.control = None;
         }
         Ok(())
     }
@@ -113,8 +121,19 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
                 ),
             ));
         }
+        let mut control = self.control.clone();
+        let mut control_response = None;
         let (data, membership) = match &entry.payload {
             EntryPayload::Blank => (None, self.last_membership.clone()),
+            EntryPayload::Normal(req) if req.control.is_some() => {
+                let (next, reply) = self.control_transition(
+                    req.control.as_ref().expect("matched native control"),
+                    entry.log_id,
+                );
+                control = Some(next);
+                control_response = Some(reply);
+                (None, self.last_membership.clone())
+            }
             EntryPayload::Normal(req) if is_standby_snapshot_trigger(&req.data) => {
                 (None, self.last_membership.clone())
             }
@@ -125,9 +144,10 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
             ),
         };
         let record = AppliedRecord {
-            version: RECORD_VERSION,
+            version: if control.is_some() { 2 } else { RECORD_VERSION },
             last_applied: entry.log_id,
             membership,
+            control,
         };
         let applied = AppliedState::new(
             entry.log_id.index,
@@ -143,6 +163,12 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
         // Durable now: only then advance the in-memory view and answer.
         self.last_applied_log = Some(record.last_applied);
         self.last_membership = record.membership;
+        self.control = record.control;
+        if let Some(reply) = control_response {
+            return serde_json::to_vec(&reply)
+                .map(Response::new)
+                .map_err(io::Error::other);
+        }
         Ok(if data.is_some() {
             Response::new(out.effects)
         } else {

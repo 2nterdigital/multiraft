@@ -70,6 +70,7 @@ struct StateMachineStoreInner<S: StateMachine> {
     disk_loaded: bool,
     /// Disk mode: the FSM's snapshot workspace, opened with the store.
     disk_workspace: Option<crate::disk_snapshot::Workspace>,
+    control: Option<multiraft_core::NativeLedger>,
     // Fields drop in declaration order: signal only AFTER application FSM Drop.
     _release: release::ReleaseOnDrop,
 }
@@ -85,6 +86,7 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
             current_snapshot: None,
             disk_loaded: false,
             disk_workspace: None,
+            control: None,
             _release: release::ReleaseOnDrop(release),
         }
     }

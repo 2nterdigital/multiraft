@@ -12,7 +12,12 @@ mod startup;
 pub use startup::{
     InitializationLogId, InitializationVote, InitializeDisposition, StartupProvenance,
 };
+mod native_control;
 mod type_config;
+pub use native_control::{
+    ControlRejection, ControlReply, NativeControl, NativeLedger, OperationId, OperationRecord,
+    ReplacementSpec, TargetOpenReceipt, TerminalProof,
+};
 
 pub use config::ClusterConfig;
 pub use config::FileLogSyncLevel;

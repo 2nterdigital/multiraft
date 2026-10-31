@@ -15,14 +15,77 @@ pub use multiraft_fsm::NodeId;
 pub type SnapshotData = std::io::Cursor<Vec<u8>>;
 
 /// Application write request: opaque bytes applied by [`multiraft_fsm::StateMachine`].
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct Request {
     pub data: Vec<u8>,
+    pub control: Option<crate::NativeControl>,
 }
 
 impl Request {
     pub fn new(data: impl Into<Vec<u8>>) -> Self {
-        Self { data: data.into() }
+        Self {
+            data: data.into(),
+            control: None,
+        }
+    }
+
+    /// Construct a native entry. Owned runtime control is the admission boundary.
+    pub fn native_control(control: crate::NativeControl) -> Self {
+        Self {
+            data: Vec::new(),
+            control: Some(control),
+        }
+    }
+}
+
+impl Serialize for Request {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        if !serializer.is_human_readable() {
+            if self.control.is_some() {
+                return Err(serde::ser::Error::custom(
+                    "native control requires the RocksDB JSON log format",
+                ));
+            }
+            let mut record = serializer.serialize_struct("Request", 1)?;
+            record.serialize_field("data", &self.data)?;
+            return record.end();
+        }
+        let mut record =
+            serializer.serialize_struct("Request", if self.control.is_some() { 2 } else { 1 })?;
+        record.serialize_field("data", &self.data)?;
+        if let Some(control) = &self.control {
+            record.serialize_field("control", control)?;
+        }
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Legacy {
+            data: Vec<u8>,
+        }
+        #[derive(Deserialize)]
+        struct Typed {
+            data: Vec<u8>,
+            #[serde(default)]
+            control: Option<crate::NativeControl>,
+        }
+        if !deserializer.is_human_readable() {
+            return Legacy::deserialize(deserializer).map(|record| Self::new(record.data));
+        }
+        let record = Typed::deserialize(deserializer)?;
+        if record.control.is_some() && !record.data.is_empty() {
+            return Err(serde::de::Error::custom(
+                "native entry also contains application bytes",
+            ));
+        }
+        Ok(Self {
+            data: record.data,
+            control: record.control,
+        })
     }
 }
 
