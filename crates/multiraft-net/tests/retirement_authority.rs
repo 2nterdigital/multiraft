@@ -33,37 +33,40 @@ fn admitted<T: std::fmt::Debug>(outcome: StartupAuthorityResult<T>) -> T {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_source_resolves_fresh_retirement_without_core_quorum_or_catalog_writes() {
     let root = cluster::scratch("authority-only-retirement-");
-    let mut session = Session::fresh(root.as_path()).await;
-    let (leader, spec, executor) = session.prepare(false).await;
-    session
-        .group(leader)
-        .enter_joint(&executor, session.group(3), deadline())
-        .await
-        .unwrap();
-    session
-        .group(leader)
-        .finalize_uniform(&executor, deadline())
-        .await
-        .unwrap();
-    let terminal = session
-        .group(leader)
-        .complete(&executor, session.group(3), deadline())
-        .await
-        .unwrap();
-    let source_id = spec
-        .expected_start
-        .membership()
-        .voter_ids()
-        .find(|id| !spec.target_voters.contains(id))
-        .unwrap();
-    let source = (source_id - 1) as usize;
-    let receipt = session.group(source).receipt().unwrap();
-    let operation = spec.operation;
-    let catalog_digest = Sha256::digest(std::fs::read(root.join("catalog.json")).unwrap());
-    drop(terminal);
-    drop(executor);
-    drop(spec);
-    session.stop().await;
+    let (operation, source, source_id, receipt, catalog_digest) = {
+        let mut session = Session::fresh(root.as_path()).await;
+        let (leader, spec, executor) = session.prepare(false).await;
+        session
+            .group(leader)
+            .enter_joint(&executor, session.group(3), deadline())
+            .await
+            .unwrap();
+        session
+            .group(leader)
+            .finalize_uniform(&executor, deadline())
+            .await
+            .unwrap();
+        let terminal = session
+            .group(leader)
+            .complete(&executor, session.group(3), deadline())
+            .await
+            .unwrap();
+        let source_id = spec
+            .expected_start
+            .membership()
+            .voter_ids()
+            .find(|id| !spec.target_voters.contains(id))
+            .unwrap();
+        let source = (source_id - 1) as usize;
+        let receipt = session.group(source).receipt().unwrap();
+        let operation = spec.operation;
+        let catalog_digest = Sha256::digest(std::fs::read(root.join("catalog.json")).unwrap());
+        assert!(receipt.terminal_proof.is_none());
+        let metadata = (operation, source, source_id, receipt, catalog_digest);
+        drop(terminal);
+        session.stop().await;
+        metadata
+    };
     let backend = Arc::new(catalog::FileAuthority::open(&root.join("catalog.json")));
     // Every previous native runtime is gone. Only this source listener/log owner restarts;
     // no group is opened and there is no current quorum available to answer ReadIndex.
