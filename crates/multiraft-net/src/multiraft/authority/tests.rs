@@ -220,6 +220,92 @@ async fn exact_configuration_identity_metadata_and_terminal_ledger_are_retained(
         .unwrap(),
         terminal_snapshot
     );
+    drop(target_sm);
+    drop(raft);
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_configuration_and_begin_never_publish_old_membership_with_new_ledger() {
+    let root = scratch();
+    let nodes = cluster(root.path()).await;
+    let until = deadline();
+    let leader = loop {
+        if let Some(index) = nodes[..3].iter().position(|node| node.is_leader(7)) {
+            break index;
+        }
+        assert!(Instant::now() < until);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let node = &nodes[leader];
+    let initial = snapshot(node).await;
+    let raft = node.raft(7).unwrap();
+    let mutate = async {
+        let metadata: BTreeMap<_, _> = (1..=3)
+            .map(|id| {
+                (
+                    id,
+                    BasicNode {
+                        addr: format!("new-peer-{id}.authority.invalid:22101"),
+                    },
+                )
+            })
+            .collect();
+        raft.change_membership(ChangeMembers::SetNodes(metadata), false)
+            .await
+            .unwrap();
+        let changed = snapshot(node).await;
+        assert_ne!(changed.membership.log_id(), initial.membership.log_id());
+        let removed = (1..=3).find(|id| *id != node.node_id()).unwrap();
+        control(
+            &raft,
+            NativeControl::Begin {
+                specification: ReplacementSpec {
+                    operation: OperationId {
+                        sequence: 41,
+                        nonce: [19; 16],
+                    },
+                    expected_start: changed.membership,
+                    target_voters: (1..=4).filter(|id| *id != removed).collect(),
+                    target_generation: 40,
+                },
+                executor_epoch: 1,
+            },
+        )
+        .await
+    };
+    let observe = async {
+        for _ in 0..128 {
+            match node.local_authoritative_membership(7, until).await {
+                Ok(view) if view.ledger.high_water == 41 => {
+                    assert_eq!(
+                        view.membership,
+                        view.ledger
+                            .current
+                            .as_ref()
+                            .unwrap()
+                            .specification
+                            .expected_start,
+                        "a new Begin cannot be paired with the older membership"
+                    );
+                }
+                Ok(view) => assert_eq!(view.ledger, NativeLedger::default()),
+                Err(LocalAuthorityError::Unavailable) => {}
+                other => panic!("stable leader concurrent snapshot outcome: {other:?}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let (begun, ()) = tokio::join!(mutate, observe);
+    let final_view = snapshot(node).await;
+    assert_eq!(final_view.ledger, begun);
+    assert_eq!(
+        final_view.membership,
+        begun.current.unwrap().specification.expected_start
+    );
+    drop(raft);
     for node in nodes {
         node.shutdown().await.unwrap();
     }

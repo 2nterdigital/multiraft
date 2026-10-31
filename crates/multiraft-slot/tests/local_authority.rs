@@ -181,5 +181,12 @@ async fn slot_leader_returns_full_native_membership_and_control_facts() {
     );
     assert_eq!(handle.inflight().global.requests, 0);
     assert!(owner.shutdown(deadline()).await.complete);
+    assert_eq!(
+        handle
+            .local_authoritative_membership(SlotId(0), deadline())
+            .await,
+        Err(LocalAuthorityError::Closed)
+    );
+    assert_eq!(handle.inflight().global.requests, 0);
     std::fs::remove_dir_all(root).unwrap();
 }

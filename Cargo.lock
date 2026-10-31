@@ -1420,6 +1420,7 @@ dependencies = [
  "multiraft-core",
  "multiraft-fsm",
  "multiraft-net",
+ "multiraft-store",
  "serde",
  "serde_json",
  "sha2",

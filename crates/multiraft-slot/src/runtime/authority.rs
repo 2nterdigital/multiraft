@@ -2,6 +2,7 @@
 use super::{SlotHandle, SlotStateMachine};
 use crate::SlotId;
 use multiraft_net::{LocalAuthoritativeMembership, LocalAuthorityError};
+use std::sync::atomic::Ordering;
 use tokio::time::Instant;
 impl<S: SlotStateMachine> SlotHandle<S> {
     /// Capture this Slot's actual local native membership and control ledger after ReadIndex.
@@ -30,9 +31,13 @@ impl<S: SlotStateMachine> SlotHandle<S> {
             .budget
             .acquire(slot, 0)
             .map_err(|_| LocalAuthorityError::Busy)?;
-        shared
+        let result = shared
             .native
             .local_authoritative_membership(group, deadline)
-            .await
+            .await;
+        if !shared.accepting.load(Ordering::Acquire) {
+            return Err(LocalAuthorityError::Closed);
+        }
+        result
     }
 }
