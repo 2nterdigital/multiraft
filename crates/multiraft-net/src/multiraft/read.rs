@@ -17,7 +17,7 @@ fn native_failure(error: openraft::error::Fatal<TypeConfig>) -> ReadIndexFailure
     }
 }
 /// Returns the confirmed read point; OpenRaft has applied at least that far.
-async fn confirm<S: StateMachine>(
+pub(super) async fn confirm<S: StateMachine>(
     raft: &Raft<S>,
     deadline: Instant,
 ) -> Result<Option<openraft::alias::LogIdOf<TypeConfig>>, MultiRaftError> {
