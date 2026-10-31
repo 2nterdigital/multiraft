@@ -221,3 +221,90 @@ async fn partial_retired_namespace_deletion_can_resume_without_touching_sibling(
     );
     db.begin_rejoin(7, 1, 2, b"new-op").unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_stale_appends_cannot_cross_retirement_into_rejoined_generations() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let root = tempfile::tempdir().unwrap();
+    let db = RocksLogDb::<TypeConfig>::open(root.path()).unwrap();
+    let mut sibling = db.group(999).unwrap();
+    let log_id = |index| LogId::new(LeaderIdOf::<TypeConfig>::new_committed(5, 1), index);
+    let vote = VoteOf::<TypeConfig>::new(8, 1);
+    sibling.save_vote(&vote).await.unwrap();
+    sibling
+        .blocking_append(vec![Entry::new_blank(log_id(0))])
+        .await
+        .unwrap();
+    drop(sibling);
+
+    for group in 1..=32 {
+        db.enroll_controlled(group, 1, b"cutover").unwrap();
+        let mut stale = db.group_generation(group, 1).unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let retired = Arc::new(AtomicBool::new(false));
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_retired = Arc::clone(&retired);
+        let writer = tokio::spawn(async move {
+            writer_barrier.wait().await;
+            for index in 0..16 {
+                let began_after_retirement = writer_retired.load(Ordering::SeqCst);
+                let result = stale
+                    .blocking_append(vec![Entry::new_blank(log_id(index))])
+                    .await;
+                if began_after_retirement {
+                    assert!(
+                        result.is_err(),
+                        "stale append after retirement in group {group}"
+                    );
+                }
+                if result.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            stale
+        });
+        barrier.wait().await;
+        tokio::task::yield_now().await;
+        db.retire(group, 1, b"terminal").unwrap();
+        retired.store(true, Ordering::SeqCst);
+        db.cleanup_group(group, 1, b"terminal").unwrap();
+        db.finish_cleanup(group, 1, b"terminal").unwrap();
+        db.begin_rejoin(group, 1, 2, b"new-op").unwrap();
+        let receipt = db.lifecycle_receipt(group).unwrap().unwrap();
+        db.advance_controlled(
+            group,
+            2,
+            b"new-op",
+            receipt.stage,
+            serde_json::from_str("\"Opening\"").unwrap(),
+        )
+        .unwrap();
+        let mut current = db.group_generation(group, 2).unwrap();
+        current.save_vote(&vote).await.unwrap();
+        let mut stale = writer.await.unwrap();
+        assert!(stale
+            .blocking_append(vec![Entry::new_blank(log_id(0))])
+            .await
+            .is_err());
+        assert!(stale.blocking_append(Vec::new()).await.is_err());
+        assert!(stale.read_vote().await.is_err());
+        assert!(current.try_get_log_entries(..).await.unwrap().is_empty());
+        assert_eq!(current.read_vote().await.unwrap(), Some(vote));
+    }
+    drop(db);
+    let db = RocksLogDb::<TypeConfig>::open(root.path()).unwrap();
+    for group in 1..=32 {
+        let mut current = db.group_generation(group, 2).unwrap();
+        assert!(current.try_get_log_entries(..).await.unwrap().is_empty());
+        assert_eq!(current.read_vote().await.unwrap(), Some(vote));
+    }
+    let mut sibling = db.group(999).unwrap();
+    assert_eq!(sibling.read_vote().await.unwrap(), Some(vote));
+    assert_eq!(
+        sibling.try_get_log_entries(..).await.unwrap()[0].log_id,
+        log_id(0)
+    );
+}
