@@ -1,8 +1,11 @@
 //! Durable generation fencing through the public shared RocksDB engine.
+use multiraft_core::typ::{Entry, LogId};
 use multiraft_core::TypeConfig;
 use multiraft_store::RocksLogDb;
-use openraft::alias::VoteOf;
+use openraft::alias::{LeaderIdOf, VoteOf};
+use openraft::entry::RaftEntry;
 use openraft::storage::{RaftLogStorage, RaftLogStorageExt};
+use openraft::vote::RaftLeaderIdExt;
 use openraft::RaftLogReader;
 
 #[tokio::test]
@@ -13,6 +16,13 @@ async fn retirement_fences_existing_handles_and_survives_reopen() {
     let mut sibling = db.group(8).unwrap();
     let vote = VoteOf::<TypeConfig>::new(4, 1);
     sibling.save_vote(&vote).await.unwrap();
+    let log_id = |index| LogId::new(LeaderIdOf::<TypeConfig>::new_committed(4, 1), index);
+    sibling
+        .blocking_append((0..3).map(|index| Entry::new_blank(log_id(index))))
+        .await
+        .unwrap();
+    sibling.save_committed(Some(log_id(1))).await.unwrap();
+    sibling.purge(log_id(0)).await.unwrap();
     db.enroll_controlled(7, 1, b"cutover").unwrap();
     assert!(legacy.read_vote().await.is_err());
     assert!(db.group(7).is_err());
@@ -23,6 +33,11 @@ async fn retirement_fences_existing_handles_and_survives_reopen() {
     assert!(old.try_get_log_entries(..).await.is_err());
     assert!(old.blocking_append(Vec::new()).await.is_err());
     assert!(old.save_vote(&vote).await.is_err());
+    assert!(old.read_committed().await.is_err());
+    assert!(old.get_log_state().await.is_err());
+    assert!(old.save_committed(None).await.is_err());
+    assert!(old.truncate_after(None).await.is_err());
+    assert!(old.purge(log_id(0)).await.is_err());
     assert!(db.cleanup_group(7, 1, b"wrong-config").is_err());
     db.cleanup_group(7, 1, b"terminal-config").unwrap();
     db.cleanup_group(7, 1, b"terminal-config").unwrap();
@@ -30,7 +45,23 @@ async fn retirement_fences_existing_handles_and_survives_reopen() {
     let db = RocksLogDb::<TypeConfig>::open(root.path()).unwrap();
     assert!(db.group(7).is_err());
     assert!(db.group_generation(7, 1).is_err());
-    assert_eq!(db.group(8).unwrap().read_vote().await.unwrap(), Some(vote));
+    let mut sibling = db.group(8).unwrap();
+    assert_eq!(sibling.read_vote().await.unwrap(), Some(vote));
+    assert_eq!(sibling.read_committed().await.unwrap(), Some(log_id(1)));
+    assert_eq!(
+        sibling.get_log_state().await.unwrap().last_purged_log_id,
+        Some(log_id(0))
+    );
+    assert_eq!(
+        sibling
+            .try_get_log_entries(..)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.log_id)
+            .collect::<Vec<_>>(),
+        vec![log_id(1), log_id(2)]
+    );
 }
 
 #[tokio::test]
@@ -132,7 +163,7 @@ fn group_key(tag: u8, group: u64) -> Vec<u8> {
 
 #[test]
 fn missing_registry_or_metadata_never_recreates_a_controlled_generation() {
-    for missing in [b'x', b'c', b'm'] {
+    for missing in *b"xcm" {
         let root = tempfile::tempdir().unwrap();
         let db = RocksLogDb::<TypeConfig>::open(root.path()).unwrap();
         db.enroll_controlled(7, 1, b"cutover").unwrap();
