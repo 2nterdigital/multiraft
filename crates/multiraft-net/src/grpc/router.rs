@@ -235,15 +235,37 @@ impl GrpcRouter {
             config.node_id,
             StandbyThrottle::from_config(config),
         );
-        if let Some(transport) = &config.transport {
-            router.transport.channels =
-                GrpcPeerChannelPool::with_dial_addresses(transport.peers.clone());
-        }
+        router.transport.channels = GrpcPeerChannelPool::with_carrier_config(
+            config.peers.clone(),
+            config
+                .transport
+                .as_ref()
+                .map(|transport| transport.peers.clone()),
+            config.raft_transport_fingerprint,
+            crate::CarrierService::Raft,
+        );
         router.transport.snapshot_cap = config.max_snapshot_bytes;
         router.transport.fingerprint = config.raft_transport_fingerprint;
         router
     }
     /// Permanently select the versioned control-capable protocol for this group.
+    pub(crate) fn install_carrier_catalog(
+        &self,
+        catalog: &crate::CarrierCatalog,
+    ) -> Result<crate::CarrierInstall, crate::CarrierError> {
+        self.transport.channels.install_carrier_catalog(catalog)
+    }
+    pub(crate) fn carrier_catalog(
+        &self,
+    ) -> Result<Option<crate::CarrierCatalog>, crate::CarrierError> {
+        self.transport.channels.carrier_catalog()
+    }
+    pub(crate) fn peer_carrier_address(&self, peer: NodeId) -> Option<SocketAddr> {
+        self.transport.channels.peer_address(peer)
+    }
+    pub(crate) fn fence_carrier_installs(&self) {
+        self.transport.channels.fence_carrier_installs();
+    }
     /// Unsupported peers are rejected; no binary fallback is attempted.
     pub fn enable_controlled_group(&self, group: GroupId) {
         self.controlled_groups

@@ -77,11 +77,8 @@ impl<S: StateMachine> MultiRaft<S> {
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
         let addr = self
-            .config
-            .peers
-            .iter()
-            .find(|(n, _)| *n == standby_id)
-            .map(|(_, a)| a.to_string())
+            .peer_carrier_address(standby_id)
+            .map(|address| address.to_string())
             .unwrap_or_default();
         let node = BasicNode { addr };
         match raft.add_learner(standby_id, node, true).await {

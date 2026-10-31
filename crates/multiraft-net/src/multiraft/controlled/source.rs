@@ -243,11 +243,8 @@ impl<S: StateMachine> ControlledGroup<S> {
                     return Ok(());
                 }
                 let addr = node
-                    .config
-                    .peers
-                    .iter()
-                    .find(|(id, _)| *id == target.identity().node)
-                    .map(|(_, address)| address.to_string())
+                    .peer_carrier_address(target.identity().node)
+                    .map(|address| address.to_string())
                     .ok_or(ControlledError::Rejected("target peer address is unknown"))?;
                 raft.change_membership_guarded(
                     ChangeMembers::AddNodes(BTreeMap::from([(
