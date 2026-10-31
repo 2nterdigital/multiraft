@@ -303,8 +303,22 @@ async fn verify_actual<S: StateMachine>(
     let native_membership = membership.clone();
     let native = raft
         .with_raft_state(move |state| {
-            state.membership_state.committed().as_ref() == &native_membership
-                && state.membership_state.effective().as_ref() == &native_membership
+            let committed = state.membership_state.committed().as_ref();
+            let effective = state.membership_state.effective().as_ref();
+            let effective_covers = match (*effective.log_id(), *native_membership.log_id()) {
+                (Some(effective_log), Some(applied_log)) => {
+                    covers(effective_log, applied_log)
+                        && (effective_log != applied_log || effective == &native_membership)
+                }
+                (None, None) => effective == &native_membership,
+                _ => false,
+            };
+            committed == &native_membership
+                && if exact {
+                    effective == &native_membership
+                } else {
+                    effective_covers
+                }
         })
         .await
         .map_err(native)?;

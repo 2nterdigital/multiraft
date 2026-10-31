@@ -175,6 +175,14 @@ impl<S: StateMachine> MultiRaft<S> {
             .map_err(|error| ControlledError::Native(error.to_string()))
     }
     pub(super) fn publish_controlled_group(&self, group: GroupId) -> Result<(), ControlledError> {
+        if self
+            .snapshot_rt
+            .stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+            || *self.group_owner(group).stopping().borrow()
+        {
+            return Err(ControlledError::Closed);
+        }
         let app = self
             .quarantined_groups
             .lock()
