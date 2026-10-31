@@ -101,8 +101,11 @@ impl<S: StateMachine> ControlledGroup<S> {
                 let generation = this.generation;
                 tokio::task::spawn_blocking(move || {
                     db.cleanup_group(group, generation, &proof)?;
+                    let fsm = multiraft_store::DiskFsmDb::group_path(&root, group);
+                    let workspace = multiraft_store::DiskFsmDb::workspace_path(&fsm)?;
                     for path in [
-                        multiraft_store::DiskFsmDb::group_path(&root, group),
+                        fsm,
+                        workspace,
                         root.join("snapshots").join(group.to_string()),
                         root.join(format!("group-{group}")),
                     ] {

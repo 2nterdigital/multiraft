@@ -139,7 +139,7 @@ impl<S: StateMachine> MultiRaft<S> {
             node_id: self.node_id,
             group_id: group,
         };
-        let fsm = self.fsm_factory.create(context).map_err(|source| {
+        let mut fsm = self.fsm_factory.create(context).map_err(|source| {
             tracing::error!(
                 target: "multiraft::recovery",
                 operation = "group_start",
@@ -158,6 +158,10 @@ impl<S: StateMachine> MultiRaft<S> {
                 context.group_id(),
             )))
         })?;
+        if controlled {
+            self.controlled_validate_fsm(group, &mut fsm)
+                .map_err(|error| MultiRaftError::Other(anyhow::Error::new(error)))?;
+        }
         // StandbyOffload: never hot-dump FSM in openraft build_snapshot (voters or standby).
         let allow_hot_build = self.config.snapshot_mode != SnapshotMode::StandbyOffload;
 

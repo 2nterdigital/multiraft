@@ -402,6 +402,36 @@ impl<S: StateMachine> MultiRaft<S> {
         )))
     }
 
+    pub(in crate::multiraft) fn controlled_validate_fsm(
+        &self,
+        group: GroupId,
+        fsm: &mut S,
+    ) -> Result<(), ControlledError> {
+        let live = multiraft_store::DiskFsmDb::group_path(&self.config.data_dir, group);
+        let workspace = multiraft_store::DiskFsmDb::workspace_path(&live)?;
+        let disk = fsm.disk_state().ok_or(ControlledError::Rejected(
+            "controlled group requires a disk-backed FSM",
+        ))?;
+        if disk.snapshot_workspace()? != workspace || !live.join("CURRENT").is_file() {
+            return Err(ControlledError::Rejected(
+                "controlled FSM must own the canonical DiskFsmDb namespace",
+            ));
+        }
+        for path in [self.config.data_dir.join("fsm-rocksdb"), live, workspace] {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(ControlledError::Rejected(
+                        "controlled FSM namespace may not be a symlink",
+                    ))
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     fn controlled_require_storage(&self) -> Result<(), ControlledError> {
         if self.config.data_dir.as_os_str().is_empty()
             || self.config.log_storage_backend != LogStorageBackend::RocksDb
