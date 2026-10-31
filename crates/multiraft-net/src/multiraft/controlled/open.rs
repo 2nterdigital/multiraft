@@ -134,6 +134,11 @@ impl<S: StateMachine> MultiRaft<S> {
         admission: StartupAdmission,
         deadline: tokio::time::Instant,
     ) -> Result<ControlledGroup<S>, ControlledError> {
+        if request.generation == 0 || request.identity.is_empty() {
+            return Err(ControlledError::Rejected(
+                "controlled generation and identity must be nonempty",
+            ));
+        }
         self.controlled_require_storage()?;
         self.ensure_node_log().await?;
         let replay = tokio::time::timeout_at(
@@ -395,6 +400,36 @@ impl<S: StateMachine> MultiRaft<S> {
             request,
             authority.clone(),
         )))
+    }
+
+    pub(in crate::multiraft) fn controlled_validate_fsm(
+        &self,
+        group: GroupId,
+        fsm: &mut S,
+    ) -> Result<(), ControlledError> {
+        let live = multiraft_store::DiskFsmDb::group_path(&self.config.data_dir, group);
+        let workspace = multiraft_store::DiskFsmDb::workspace_path(&live)?;
+        let disk = fsm.disk_state().ok_or(ControlledError::Rejected(
+            "controlled group requires a disk-backed FSM",
+        ))?;
+        if disk.snapshot_workspace()? != workspace || !live.join("CURRENT").is_file() {
+            return Err(ControlledError::Rejected(
+                "controlled FSM must own the canonical DiskFsmDb namespace",
+            ));
+        }
+        for path in [self.config.data_dir.join("fsm-rocksdb"), live, workspace] {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(ControlledError::Rejected(
+                        "controlled FSM namespace may not be a symlink",
+                    ))
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     fn controlled_require_storage(&self) -> Result<(), ControlledError> {
