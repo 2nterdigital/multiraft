@@ -92,6 +92,9 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
                 .layout()
                 .clone()
         };
+        let transport_digest = strict
+            .as_ref()
+            .map_or_else(|| layout.digest(), |s| s.transport_digest(layout.digest()));
         let candidate = strict
             .as_ref()
             .is_some_and(|s| s.disposition == SlotStartupDisposition::Candidate);
@@ -139,8 +142,9 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         let mut cluster = config.native;
         cluster.peers = nodes.iter().map(|n| (n.node_id, n.raft)).collect();
         cluster.transport = config.transport.as_ref().map(|t| t.native());
-        // Source the native compatibility domain from the disk-verified layout.
-        cluster.raft_transport_fingerprint = Some(layout.digest().0);
+        // Strict native RPC and Slot RPC share one domain, bound to verified space/compatibility.
+        // The frozen manifest layout digest remains the unchanged origin identity.
+        cluster.raft_transport_fingerprint = Some(transport_digest.0);
         // Groups are declared by the batch below, never by the owner itself.
         let mut runtime = RuntimeConfig::new(cluster, Vec::new());
         // The Slot budget is the public limit, native admission remains independently bounded.
@@ -211,6 +215,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             native: native_owner.handle(),
             budget: Budget::new(config.limits, layout.slot_count()),
             layout: layout.clone(),
+            transport_digest,
             node_id: config.node_id,
             rpc: Mutex::new(None),
             owners: Mutex::new(None),

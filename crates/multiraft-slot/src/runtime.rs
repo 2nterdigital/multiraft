@@ -80,6 +80,7 @@ struct Owners<S: SlotStateMachine> {
 }
 pub(crate) struct Shared<S: SlotStateMachine> {
     pub layout: ClusterLayout,
+    pub transport_digest: crate::ManifestDigest,
     pub node_id: NodeId,
     pub native: RuntimeHandle<S>,
     rpc: Mutex<Option<ApplicationRpcHandle>>,

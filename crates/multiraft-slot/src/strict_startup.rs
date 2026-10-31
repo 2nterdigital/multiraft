@@ -1,6 +1,7 @@
 //! Explicit startup authority for isolated new-format data spaces.
 use crate::{ClusterLayout, ManifestDigest, NodeAddress, RuntimeError, MAX_NODES};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// Strict Slot startup/manifest compatibility; independent from native controlled protocol versions.
@@ -56,6 +57,17 @@ pub struct StrictSlotStartup {
     pub directory: TrustedSlotDirectory,
 }
 impl StrictSlotStartup {
+    /// Common strict wire identity; local UUIDs and mutable directory facts never enter it.
+    pub(crate) fn transport_digest(&self, genesis: ManifestDigest) -> ManifestDigest {
+        let mut hash = Sha256::new();
+        hash.update(b"multiraft-slot/strict-transport/v1\0");
+        hash.update(genesis.0);
+        hash.update(self.identity.data_space_id.to_be_bytes());
+        hash.update(self.identity.protocol_version.to_be_bytes());
+        hash.update(self.identity.compatibility_digest);
+        ManifestDigest(hash.finalize().into())
+    }
+
     pub(crate) fn validate(&self, layout: &ClusterLayout, local: u64) -> Result<(), RuntimeError> {
         let directory = &self.directory;
         if self.identity.data_space_id == 0
