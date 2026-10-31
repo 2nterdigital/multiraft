@@ -2,6 +2,8 @@
 use crate::limits::{Budget, MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES};
 use crate::runtime_error::native;
 mod authority;
+mod carriers;
+pub use carriers::SlotCarrierError;
 mod control;
 mod controlled_start;
 mod leadership_control;

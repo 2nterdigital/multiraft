@@ -137,7 +137,8 @@ impl<S: SlotStateMachine> Shared<S> {
                 voters.extend(binding.specification.target_voters);
             }
         }
-        voters.retain(|id| controlled.directory.contains(id));
+        let directory = controlled.directory.lock().unwrap();
+        voters.retain(|id| directory.contains(id));
         Ok(voters.into_iter().collect())
     }
     pub(crate) async fn locally_routable(

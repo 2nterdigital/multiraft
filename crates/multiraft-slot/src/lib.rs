@@ -60,3 +60,6 @@ pub use runtime::{
     LocalSlotRole, SlotControlError, SlotControlledGroup, SlotManagedOperation,
     SlotRoleObservation, SlotTargetEndpoint,
 };
+
+pub use multiraft_net::{CarrierCatalog, CarrierError, CarrierInstall, CarrierPeer};
+pub use runtime::SlotCarrierError;

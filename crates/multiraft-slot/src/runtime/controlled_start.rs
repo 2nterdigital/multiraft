@@ -18,7 +18,8 @@ pub(super) struct ControlledState<S: SlotStateMachine> {
     pub authority: Arc<dyn StartupAuthority>,
     pub groups: Mutex<BTreeMap<SlotId, ManagedControlledGroup<S>>>,
     pub endpoints: Mutex<BTreeMap<Vec<u8>, ManagedTargetEndpoint<S>>>,
-    pub directory: BTreeSet<u64>,
+    pub directory: Mutex<super::carriers::CarrierDirectory>,
+    pub carrier_install: tokio::sync::Mutex<()>,
 }
 pub(super) async fn open<S: SlotStateMachine>(
     native: &RuntimeHandle<S>,
@@ -154,12 +155,15 @@ pub(super) async fn open<S: SlotStateMachine>(
         authority: input.authority,
         groups: Mutex::new(groups),
         endpoints: Mutex::new(BTreeMap::new()),
-        directory: input
-            .startup
-            .directory
-            .nodes
-            .iter()
-            .map(|node| node.node_id)
-            .collect(),
+        carrier_install: tokio::sync::Mutex::new(()),
+        directory: Mutex::new(super::carriers::CarrierDirectory::new(
+            input
+                .startup
+                .directory
+                .nodes
+                .iter()
+                .map(|node| node.node_id)
+                .collect(),
+        )),
     })
 }

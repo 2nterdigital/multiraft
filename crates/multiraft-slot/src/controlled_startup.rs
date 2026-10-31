@@ -32,14 +32,30 @@ impl std::fmt::Debug for ControlledSlotStartup {
     }
 }
 impl ControlledSlotStartup {
+    /// Validate and derive the actual controlled common transport domain before owner startup.
+    /// This establishes no catalog admission, peer authentication or quorum authority.
+    pub fn transport_domain(
+        &self,
+        layout: &crate::ClusterLayout,
+        local: crate::NodeId,
+    ) -> Result<[u8; 32], RuntimeError> {
+        let sparse = self.startup.disposition == crate::SlotStartupDisposition::Candidate
+            && self.replicas.is_empty();
+        self.startup.validate_profile_coverage(
+            layout,
+            local,
+            CONTROLLED_SLOT_PROTOCOL_VERSION,
+            !sparse,
+        )?;
+        Ok(self.startup.transport_digest(layout.digest()).0)
+    }
     pub(crate) async fn catalogs(
         &self,
         layout: &crate::ClusterLayout,
         local: u64,
         deadline: Instant,
     ) -> Result<Vec<(SlotId, StartupCatalog)>, RuntimeError> {
-        self.startup
-            .validate_profile(layout, local, CONTROLLED_SLOT_PROTOCOL_VERSION)?;
+        self.transport_domain(layout, local)?;
         let mut slots = BTreeSet::new();
         for replica in &self.replicas {
             layout
@@ -64,6 +80,15 @@ impl ControlledSlotStartup {
                 .map_err(|_| RuntimeError::Unavailable)?;
             if catalog.group_id != group {
                 return Err(RuntimeError::InvalidConfig);
+            }
+            if catalog.authorized.contains_key(&local)
+                || catalog
+                    .active_operation
+                    .as_ref()
+                    .is_some_and(|binding| binding.target.node_id == local)
+            {
+                self.startup
+                    .validate_profile(layout, local, CONTROLLED_SLOT_PROTOCOL_VERSION)?;
             }
             catalogs.push((assignment.slot, catalog));
         }
