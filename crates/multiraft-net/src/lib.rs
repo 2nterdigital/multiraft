@@ -98,7 +98,9 @@ pub use multiraft::{
 };
 pub use multiraft::{LocalAuthoritativeMembership, LocalAuthorityError};
 pub use multiraft_core::ObservationClosed;
-pub use multiraft_store::{ControlledGroupReceipt, ControlledGroupStage};
+pub use multiraft_store::{
+    ControlledCheckpointState, ControlledGroupReceipt, ControlledGroupStage,
+};
 pub use network::GrpcNetworkFactory;
 pub use network::NetworkFactory;
 pub use node::create_node;
