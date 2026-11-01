@@ -3,6 +3,33 @@ use super::*;
 use crate::{LocalGroupStatus, TryReadError};
 
 impl<S: StateMachine> RuntimeHandle<S> {
+    /// Sample this published local replica's durable applied id, full membership and native ledger.
+    /// This is a LOCAL observation: it requires no leadership and grants no ReadIndex,
+    /// quorum, freshness or business authority. No Group, log or FSM state is created or written.
+    ///
+    /// # Errors
+    /// Missing/closed Groups, deadline expiry and malformed or unavailable disk state fail closed.
+    pub async fn inspect_controlled_applied(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+    ) -> Result<crate::ControlledCheckpointState, RuntimeError> {
+        let admitted = self.admit(deadline).await?;
+        admitted.ensure_group(group)?;
+        let sample = admitted
+            .run(
+                deadline,
+                RuntimePhase::LocalRead,
+                false,
+                admitted.shared.node.inspect_local_controlled_applied(group),
+            )
+            .await?;
+        if !admitted.shared.accepting.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        Ok(sample)
+    }
+
     /// Query this replica's applied FSM under its application lock, without
     /// confirming authority. It may be stale and must not authorize business work.
     /// Applications own query meaning; callbacks must be bounded and nonblocking.

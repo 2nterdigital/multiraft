@@ -130,6 +130,17 @@ async fn original_native_core_recovers_real_memberships_and_all_business_bytes_w
     .unwrap();
     let handle = owner.handle();
     std::fs::create_dir_all("/data/native-test-catalogs").unwrap();
+    assert!(
+        matches!(
+            handle
+                .inspect_controlled_applied(u64::MAX, deadline())
+                .await,
+            Err(multiraft_net::RuntimeError::Source(
+                multiraft_core::MultiRaftError::UnknownGroup(u64::MAX)
+            ))
+        ),
+        "missing local group must not be constructed by inspection"
+    );
     for original in evidence.replicas() {
         assert_eq!(
             original.committed,
@@ -176,43 +187,46 @@ async fn original_native_core_recovers_real_memberships_and_all_business_bytes_w
             .await
             .unwrap();
         assert_eq!(group.receipt(deadline()).await.unwrap().generation, 1);
-        let view = handle
-            .try_read_applied_with_watermark(original.group, deadline(), |_| {
-                Ok::<_, std::io::Error>(())
-            })
+        let local = handle
+            .inspect_controlled_applied(original.group, deadline())
             .await
             .unwrap();
-        let applied = view.applied.unwrap();
         assert_eq!(
-            (applied.term, applied.node_id, applied.index),
-            (
-                original.applied.leader_id.term,
-                original.applied.leader_id.node_id,
-                original.applied.index
-            )
-        );
-        let (observed, _) = handle
-            .observe_group(original.group, deadline())
-            .await
-            .unwrap();
-        let membership = *original.membership.log_id();
-        assert_eq!(
-            observed
-                .committed_membership
-                .log_id
-                .map(|id| (id.term, id.node_id, id.index)),
-            membership.map(|id| (id.leader_id.term, id.leader_id.node_id, id.index))
+            local.applied, original.applied,
+            "actual durable local applied floor"
         );
         assert_eq!(
-            &observed.committed_membership.voter_configs,
-            original.membership.membership().get_joint_config()
+            local.membership, original.membership,
+            "full original membership includes configuration log identity and every node"
         );
+        assert_eq!(local.ledger, multiraft_core::NativeLedger::default());
         assert!(
             group.genesis_basis(deadline()).await.is_err(),
             "adopted replicas must never masquerade as fresh Genesis"
         );
     }
+    assert!(
+        matches!(
+            handle
+                .inspect_controlled_applied(first.group, tokio::time::Instant::now())
+                .await,
+            Err(multiraft_net::RuntimeError::Deadline {
+                outcome_unknown: false,
+                ..
+            })
+        ),
+        "local sample must obey the original deadline"
+    );
     owner.shutdown(deadline()).await.unwrap();
+    assert!(
+        matches!(
+            handle
+                .inspect_controlled_applied(first.group, deadline())
+                .await,
+            Err(multiraft_net::RuntimeError::Closed)
+        ),
+        "retained handle cannot inspect a closed owner"
+    );
     assert_eq!(
         read_completed_receipt(root, &authorization).unwrap(),
         Some(receipt.clone()),

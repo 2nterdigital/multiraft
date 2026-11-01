@@ -18,6 +18,24 @@ pub struct LocalGroupStatus {
     pub last_applied: Option<ObservedLogId>,
 }
 impl<S: StateMachine> MultiRaft<S> {
+    pub(crate) async fn inspect_local_controlled_applied(
+        &self,
+        group: GroupId,
+    ) -> Result<multiraft_store::ControlledCheckpointState, MultiRaftError> {
+        // Only published local Groups are visible; quarantined construction is not inspected.
+        let store = self
+            .groups
+            .lock()
+            .expect("native group lock poisoned")
+            .get(&group)
+            .map(|app| app.state_machine.clone())
+            .ok_or(MultiRaftError::UnknownGroup(group))?;
+        store
+            .inspect_controlled_applied()
+            .await
+            .map_err(|error| MultiRaftError::Other(error.into()))
+    }
+
     pub(crate) fn local_group_status(
         &self,
         group: GroupId,
