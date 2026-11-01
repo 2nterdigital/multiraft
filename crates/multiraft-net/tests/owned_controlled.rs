@@ -216,6 +216,14 @@ async fn managed_replacement_streams_seed_and_retires_without_escaping_native_ca
         .await
         .unwrap();
     let receipt = target.receipt(deadline()).await.unwrap();
+    assert!(
+        target.storage_usage(deadline()).await.is_err(),
+        "unconstructed target usage is unavailable"
+    );
+    assert!(
+        !multiraft_store::DiskFsmDb::group_path(&fixture.configs[3].data_dir, GROUP).exists(),
+        "usage must not initialize target storage"
+    );
     fixture
         .authority
         .consume_target(StartupTargetGeneration {
@@ -308,6 +316,172 @@ async fn managed_replacement_streams_seed_and_retires_without_escaping_native_ca
             .is_err(),
         "actual retirement removes readiness"
     );
+    let retired = &fixture.groups[source_index];
+    let before = retired.storage_usage(deadline()).await.unwrap();
+    assert_eq!(
+        before.receipt.stage,
+        multiraft_net::ControlledGroupStage::Retired
+    );
+    assert!(before.fsm_file_bytes.unwrap() > 0);
+    let cleaned = retired
+        .retire_and_cleanup_from_authority(specification.operation, deadline())
+        .await
+        .unwrap();
+    assert_eq!(cleaned.generation, retired.generation());
+    assert_eq!(cleaned.stage, multiraft_net::ControlledGroupStage::Cleaned);
+    let after = retired.storage_usage(deadline()).await.unwrap();
+    assert_eq!(after.retained_log_value_bytes, 0);
+    assert_eq!(after.fsm_file_bytes, Some(0));
+    assert_eq!(after.workspace_file_bytes, Some(0));
+    assert_eq!(
+        retired
+            .retire_and_cleanup_from_authority(specification.operation, deadline())
+            .await
+            .unwrap(),
+        cleaned
+    );
+    let old_endpoint_spec = ReplacementSpec {
+        operation: OperationId {
+            sequence: 2,
+            nonce: [10; 16],
+        },
+        expected_start: proof.configuration.clone(),
+        target_voters: [1, 2, 3].into(),
+        target_generation: retired.generation(),
+    };
+    let old_endpoint = retired
+        .target_endpoint(old_endpoint_spec.clone(), deadline())
+        .await
+        .unwrap();
+    let old_request = multiraft_net::portable::NativeTargetRequest {
+        scope: multiraft_net::portable::NativeTargetScope {
+            version: multiraft_net::portable::NATIVE_TARGET_VERSION,
+            target: old_endpoint.identity().clone(),
+            specification: old_endpoint_spec,
+            correlation: [55; 16],
+        },
+        command: multiraft_net::portable::NativeTargetCommand::Observe {
+            configuration: None,
+            barrier: None,
+        },
+    };
+    let next = ReplacementSpec {
+        operation: OperationId {
+            sequence: 2,
+            nonce: [10; 16],
+        },
+        expected_start: proof.configuration.clone(),
+        target_voters: [1, 2, 3].into(),
+        target_generation: retired.generation() + 1,
+    };
+    let rejoined = fixture.owners[source_index]
+        .handle()
+        .reserve_controlled_target(
+            GROUP,
+            next.clone(),
+            vec![99],
+            fixture.authority.clone(),
+            deadline(),
+        )
+        .await
+        .expect("same runtime replaces cleaned generation");
+    assert_eq!(rejoined.generation(), cleaned.generation + 1);
+    assert!(retired.receipt(deadline()).await.is_err());
+    assert!(retired.storage_usage(deadline()).await.is_err());
+    assert!(retired
+        .retire_and_cleanup_from_authority(specification.operation, deadline())
+        .await
+        .is_err());
+    assert_eq!(
+        rejoined.receipt(deadline()).await.unwrap().stage,
+        multiraft_net::ControlledGroupStage::Reserved
+    );
+    fixture
+        .authority
+        .consume_target(StartupTargetGeneration {
+            node_id: source,
+            generation: rejoined.generation(),
+            consumption_id: rejoined.receipt(deadline()).await.unwrap().identity,
+        })
+        .unwrap();
+    let endpoint = rejoined
+        .target_endpoint(next.clone(), deadline())
+        .await
+        .unwrap();
+    let port = SourceTargetPort::new(
+        endpoint.identity().clone(),
+        next.clone(),
+        Arc::new(LocalTransport { endpoint }),
+    )
+    .unwrap();
+    let operation = fixture.groups[leader]
+        .begin(next, 1, port.clone(), deadline())
+        .await
+        .unwrap();
+    let admission = match fixture
+        .authority
+        .admit(StartupRequest {
+            group_id: GROUP,
+            node_id: source,
+            generation: rejoined.generation(),
+            request_id: [55; 16],
+        })
+        .await
+        .unwrap()
+    {
+        StartupAuthorityResult::Applied(a) => a,
+        other => panic!("{other:?}"),
+    };
+    operation
+        .seed_target(port.clone(), admission, deadline())
+        .await
+        .unwrap();
+    operation
+        .add_learner(port.clone(), deadline())
+        .await
+        .unwrap();
+    operation
+        .enter_joint(port.clone(), deadline())
+        .await
+        .unwrap();
+    operation.finalize_uniform(deadline()).await.unwrap();
+    operation.complete(port, deadline()).await.unwrap();
+    fixture.owners[leader]
+        .handle()
+        .propose(GROUP, b"new-generation-payload".to_vec(), deadline())
+        .await
+        .unwrap();
+    let response: multiraft_net::portable::NativeTargetReply = serde_json::from_slice(
+        &old_endpoint
+            .dispatch(serde_json::to_vec(&old_request).unwrap(), deadline())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        response.outcome,
+        multiraft_net::portable::NativeTargetOutcome::Rejected
+    );
+    assert!(retired
+        .retire_and_cleanup_from_authority(specification.operation, deadline())
+        .await
+        .is_err());
+    let usage = rejoined.storage_usage(deadline()).await.unwrap();
+    assert_eq!(
+        usage.receipt.stage,
+        multiraft_net::ControlledGroupStage::Opened
+    );
+    assert!(
+        usage.fsm_file_bytes.unwrap() > 0,
+        "old cleanup leaves new FSM intact"
+    );
+    let payloads = fixture.owners[leader]
+        .handle()
+        .read_linearizable(GROUP, deadline(), |fsm| fsm.payloads())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(payloads, vec![b"new-generation-payload".to_vec()]);
     fixture.stop().await;
     assert!(
         retained_endpoint
@@ -517,4 +691,22 @@ async fn purged_payload_deletion_with_retained_receipts_anchor_and_vote_cannot_r
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_repeated_timeouts_wait_for_real_blocked_seed_install_and_release_fsm() {
     cancellation::blocked_install_repeated_shutdown_timeouts().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "self-spawned managed cleanup trajectory"]
+async fn managed_cleanup_child() {
+    cleanup::child().await;
+}
+#[test]
+fn managed_cleanup_survives_sigkill_after_each_cleanup_boundary() {
+    for phase in ["logs", "fsm", "workspace", "snapshots", "legacy"] {
+        cleanup::trajectory(phase, "");
+    }
+}
+#[test]
+fn admitted_managed_cleanup_survives_caller_timeout_and_cancellation() {
+    for mode in ["timeout", "cancel"] {
+        cleanup::trajectory("logs", mode);
+    }
 }

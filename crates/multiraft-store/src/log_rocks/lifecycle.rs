@@ -288,6 +288,35 @@ where
         Ok(store.required_metadata()?.bytes)
     }
 
+    /// Observe logical log-value bytes for an exact generation, including retired replicas.
+    /// This does not open a log handle or grant permission to read or mutate retired logs.
+    pub fn observe_retained_log_bytes_generation(
+        &self,
+        group: u64,
+        generation: u64,
+    ) -> io::Result<u64> {
+        let gate = self.engine.gate(group)?;
+        let _guard = lock(&gate)?;
+        let receipt = self.exact_receipt(group, generation)?;
+        if matches!(
+            receipt.stage,
+            ControlledGroupStage::LogsCleaned | ControlledGroupStage::Cleaned
+        ) {
+            return Ok(0);
+        }
+        let store = RocksLogStore {
+            owner: self.clone(),
+            group,
+            gate: gate.clone(),
+            generation: Some(generation),
+        };
+        let meta = store.required_metadata()?;
+        if meta.controlled_generation != Some(generation) {
+            return Err(invalid("log observation generation mismatch"));
+        }
+        Ok(meta.bytes)
+    }
+
     /// Persist retirement before any deletion; native validates terminal proof authority.
     pub fn retire(&self, group: u64, generation: u64, terminal_proof: &[u8]) -> io::Result<()> {
         if terminal_proof.is_empty() {

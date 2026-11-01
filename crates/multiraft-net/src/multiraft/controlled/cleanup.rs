@@ -165,11 +165,12 @@ impl<S: StateMachine> ControlledGroup<S> {
                 let generation = this.generation;
                 tokio::task::spawn_blocking(move || {
                     db.cleanup_group(group, generation, &proof)?;
-                    for path in [
-                        storage_owner.live,
-                        storage_owner.workspace,
-                        root.join("snapshots").join(group.to_string()),
-                        root.join(format!("group-{group}")),
+                    observe_cleanup_phase(&root, "logs")?;
+                    for (path, phase) in [
+                        (storage_owner.live, "fsm"),
+                        (storage_owner.workspace, "workspace"),
+                        (root.join("snapshots").join(group.to_string()), "snapshots"),
+                        (root.join(format!("group-{group}")), "legacy"),
                     ] {
                         match std::fs::remove_dir_all(&path) {
                             Ok(()) => {
@@ -180,6 +181,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                             Err(error) => return Err(error),
                         }
+                        observe_cleanup_phase(&root, phase)?;
                     }
                     db.finish_cleanup(group, generation, &proof)
                 })
@@ -189,4 +191,31 @@ impl<S: StateMachine> ControlledGroup<S> {
             })
             .await
     }
+}
+
+// Explicitly scoped, default-off observation for process-kill integration tests. It
+// changes neither cleanup eligibility nor ordering and never runs on a sibling root.
+fn observe_cleanup_phase(root: &std::path::Path, phase: &str) -> std::io::Result<()> {
+    if std::env::var_os("MULTIRAFT_CLEANUP_OBSERVE_ROOT").as_deref() != Some(root.as_os_str())
+        || std::env::var("MULTIRAFT_CLEANUP_OBSERVE_PHASE")
+            .ok()
+            .as_deref()
+            != Some(phase)
+    {
+        return Ok(());
+    }
+    use std::io::Write;
+    std::fs::write(root.join("cleanup-observed-phase"), phase)?;
+    println!("MANAGED_CLEANUP_PHASE {phase}");
+    std::io::stdout().flush()?;
+    let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !root.join("cleanup-observed-release").exists() {
+        if std::time::Instant::now() >= limit {
+            return Err(std::io::Error::other(
+                "cleanup phase observation was not released",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
 }

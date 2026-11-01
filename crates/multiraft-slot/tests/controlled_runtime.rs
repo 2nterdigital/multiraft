@@ -388,6 +388,43 @@ async fn candidate_internal_routes_and_actual_learner_joint_uniform_roles_preser
             b"through-removed-source".to_vec()
         ]
     );
+    let retired = removed.controlled(slot).unwrap();
+    let generation = source * 10;
+    let usage = retired.storage_usage(generation, deadline()).await.unwrap();
+    assert_eq!(
+        usage.receipt.stage,
+        multiraft_net::ControlledGroupStage::Retired
+    );
+    assert!(usage.fsm_file_bytes.unwrap() > 0);
+    assert!(retired
+        .retire_and_cleanup_from_authority(generation + 1, spec.operation, deadline())
+        .await
+        .is_err());
+    let sibling = SlotId(1);
+    let sibling_key = key(&f, sibling);
+    removed
+        .propose(&sibling_key, b"sibling-before-cleanup".to_vec(), deadline())
+        .await
+        .unwrap();
+    let cleaned = retired
+        .retire_and_cleanup_from_authority(generation, spec.operation, deadline())
+        .await
+        .unwrap();
+    assert_eq!(cleaned.stage, multiraft_net::ControlledGroupStage::Cleaned);
+    assert_eq!(
+        retired
+            .retire_and_cleanup_from_authority(generation, spec.operation, deadline())
+            .await
+            .unwrap(),
+        cleaned
+    );
+    removed
+        .propose(&sibling_key, b"sibling-after-cleanup".to_vec(), deadline())
+        .await
+        .unwrap();
+    let usage = retired.storage_usage(generation, deadline()).await.unwrap();
+    assert_eq!(usage.retained_log_value_bytes, 0);
+    assert_eq!(usage.fsm_file_bytes, Some(0));
     let stopped = f.owners.remove((source - 1) as usize);
     assert!(stopped.shutdown(deadline()).await.complete);
     let reopened = f
@@ -417,6 +454,50 @@ async fn candidate_internal_routes_and_actual_learner_joint_uniform_roles_preser
         .await
         .unwrap();
     f.owners.insert((source - 1) as usize, reopened);
+    let payload = f
+        .handle(source)
+        .read_linearizable(&sibling_key, b"", deadline())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Vec<Vec<u8>>>(&payload).unwrap(),
+        vec![
+            b"sibling-before-cleanup".to_vec(),
+            b"sibling-after-cleanup".to_vec()
+        ]
+    );
+    let fresh_facade = f.handle(source).controlled(slot).unwrap();
+    let next = ReplacementSpec {
+        operation: OperationId {
+            sequence: 2,
+            nonce: [10; 16],
+        },
+        expected_start: target.membership(deadline()).await.unwrap(),
+        target_voters: [1, 2, 3].into(),
+        target_generation: generation + 1,
+    };
+    let rejoined = f
+        .handle(source)
+        .reserve_controlled_target(slot, next, vec![99], deadline())
+        .await
+        .unwrap();
+    assert!(fresh_facade
+        .retire_and_cleanup_from_authority(generation, spec.operation, deadline())
+        .await
+        .is_err());
+    assert!(fresh_facade
+        .storage_usage(generation, deadline())
+        .await
+        .is_err());
+    assert_eq!(
+        rejoined.receipt(deadline()).await.unwrap().generation,
+        generation + 1
+    );
+    assert_eq!(
+        rejoined.receipt(deadline()).await.unwrap().stage,
+        multiraft_net::ControlledGroupStage::Reserved
+    );
+
     let receipt = target.receipt(deadline()).await.unwrap();
     let stopped_target = f.owners.remove(3);
     assert!(stopped_target.shutdown(deadline()).await.complete);
