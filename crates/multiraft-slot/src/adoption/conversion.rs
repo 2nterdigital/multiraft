@@ -137,7 +137,6 @@ fn prepare(evidence: &AdoptionEvidence, auth: &UpgradeAuthorization) -> io::Resu
                 "adoption evidence paths escape the exact authorized group scope",
             ));
         }
-        multiraft_store::adoption::verify_adoption_fsm(original)?;
     }
     let fingerprint = evidence.transport_fingerprint(&auth.startup)?;
     let authorization = authorization_value(auth);
@@ -241,6 +240,52 @@ fn verify_payload(intent: &Intent) -> io::Result<()> {
     }
     Ok(())
 }
+/// A completed conversion is an immutable past fact. Ordinary native operation
+/// may change physical engine files, so receipt replay checks the sealed anchors
+/// instead of treating an obsolete physical inventory as current state.
+fn completed(intent: &Intent) -> io::Result<bool> {
+    let path = adoption_directory(&intent.root).join("complete.json");
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let complete: AdoptionComplete = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let authorization_digest: [u8; 32] =
+        Sha256::digest(serde_json::to_vec(&intent.authorization).map_err(io::Error::other)?).into();
+    if complete.version != 1
+        || complete.root != intent.root
+        || complete.node != intent.node
+        || complete.authorization_digest != intent.receipt.authorization_digest
+        || authorization_digest != intent.receipt.authorization_digest
+        || complete.anchors.keys().copied().collect::<BTreeSet<_>>()
+            != intent.receipt.identities.keys().copied().collect()
+    {
+        return Err(invalid("completed adoption intent identity mismatch"));
+    }
+    for original in &intent.replicas {
+        let identity = intent
+            .receipt
+            .identities
+            .get(&original.group)
+            .ok_or_else(|| invalid("completed original group identity missing"))?;
+        let anchor = multiraft_store::adoption::load_adoption_anchor(
+            &intent.root,
+            intent.node,
+            original.group,
+            1,
+            identity,
+            Some(intent.receipt.fingerprint),
+        )?
+        .ok_or_else(|| invalid("completed original adoption anchor missing"))?;
+        if anchor.original != *original {
+            return Err(invalid(
+                "completed adoption anchor differs from sealed original facts",
+            ));
+        }
+    }
+    Ok(true)
+}
 pub(super) fn inspect_resume(root: &Path) -> io::Result<AdoptionEvidence> {
     let intent: Intent =
         serde_json::from_slice(&fs::read(adoption_directory(root).join("intent.json"))?)
@@ -252,7 +297,12 @@ pub(super) fn inspect_resume(root: &Path) -> io::Result<AdoptionEvidence> {
     {
         return Err(invalid("conversion intent identity mismatch"));
     }
-    verify_payload(&intent)?;
+    if !completed(&intent)? {
+        verify_payload(&intent)?;
+        for original in &intent.replicas {
+            multiraft_store::adoption::verify_adoption_fsm(original)?;
+        }
+    }
     Ok(AdoptionEvidence {
         root: intent.root,
         layout: ClusterLayout::new(intent.layout).map_err(io::Error::other)?,
@@ -271,7 +321,7 @@ pub(super) fn inspect_resume(root: &Path) -> io::Result<AdoptionEvidence> {
 /// Same-authorization crash resume is allowed; conflicting authorization never repairs data.
 ///
 /// # Errors
-/// Rejects changed inventory, missing/conflicting evidence and every authorization mismatch.
+/// Rejects changed incomplete-conversion inventory, missing/conflicting evidence and authorization mismatches.
 pub fn adopt_existing(
     evidence: &AdoptionEvidence,
     auth: &UpgradeAuthorization,
@@ -290,8 +340,14 @@ pub fn adopt_existing(
                 "adoption already belongs to another authorization or evidence",
             ));
         }
+        if completed(&expected)? {
+            return Ok(expected.receipt);
+        }
         verify_payload(&expected)?;
     } else {
+        if directory.join("complete.json").try_exists()? {
+            return Err(invalid("completion without its original conversion intent"));
+        }
         let fresh = inspect_existing(&evidence.root)?;
         if fresh.inventory != evidence.inventory
             || fresh.manifest != evidence.manifest
@@ -301,6 +357,9 @@ pub fn adopt_existing(
             return Err(invalid("legacy evidence changed after inspection"));
         }
         publish(&path, &bytes)?;
+    }
+    for original in &evidence.replicas {
+        multiraft_store::adoption::verify_adoption_fsm(original)?;
     }
     let log_path = evidence.root.join("raft-rocksdb");
     if !log_path.join("CURRENT").is_file() {

@@ -116,11 +116,13 @@ pub(crate) fn digest(files: &BTreeMap<PathBuf, [u8; 32]>) -> [u8; 32] {
 }
 
 /// Inspect a cold node's existing Slot root and adjacent OLD data-space passport.
+/// Completed conversions return their sealed original evidence for receipt replay;
+/// this historical proof is not an observation of subsequent native operation.
 /// The caller must quiesce the complete stack and supply an unmodified backup copy.
 /// No missing database, namespace, snapshot or manifest is created.
 ///
 /// # Errors
-/// Rejects missing, linked, changed, foreign or already-converted data.
+/// Rejects missing, linked, changed or conflicting original data.
 pub fn inspect_existing(root: &Path) -> io::Result<AdoptionEvidence> {
     if fs::symlink_metadata(root)?.file_type().is_symlink() || root.canonicalize()? != root {
         return Err(invalid("legacy root must be its exact canonical directory"));

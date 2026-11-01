@@ -213,5 +213,14 @@ async fn original_native_core_recovers_real_memberships_and_all_business_bytes_w
         );
     }
     owner.shutdown(deadline()).await.unwrap();
+    let completed = inspect_existing(root)
+        .expect("completed adoption remains inspectable after legitimate Native open");
+    assert_eq!(
+        adopt_existing(&completed, &authorization).expect(
+            "completed same-authorization replay must not require OLD physical engine files"
+        ),
+        receipt
+    );
+
     assert_eq!(support::business_payloads(root),before,"all original pending, full first-result, Presence and sibling checkpoint rows remain exact");
 }
