@@ -166,3 +166,12 @@ pub(crate) fn complete(
     }
     Ok(())
 }
+
+/// Only explicit cold adoption may construct a controlled manifest for existing data.
+pub(crate) fn adoption_manifest(
+    layout: &ClusterLayout,
+    node: NodeId,
+    startup: &StrictSlotStartup,
+) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec(&Manifest::expected(layout, node, startup)).map_err(std::io::Error::other)
+}

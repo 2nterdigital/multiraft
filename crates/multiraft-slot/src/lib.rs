@@ -9,6 +9,7 @@
 #[cfg(test)]
 extern crate self as multiraft_slot;
 
+pub mod adoption;
 pub mod config;
 pub mod error;
 pub mod manifest;

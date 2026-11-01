@@ -50,7 +50,7 @@ fn registry_key(group: u64, tag: u8) -> Vec<u8> {
 }
 
 impl Engine {
-    fn receipt(&self, group: u64) -> io::Result<Option<ControlledGroupReceipt>> {
+    pub(super) fn receipt(&self, group: u64) -> io::Result<Option<ControlledGroupReceipt>> {
         let fence = self.db.get(registry_key(group, b'c')).map_err(db_error)?;
         let raw = self.db.get(registry_key(group, b'x')).map_err(db_error)?;
         match (fence, raw) {
