@@ -3,6 +3,7 @@
 //! Memory log + SM bridge adapted from openraft `examples/{log-mem,sm-mem,multi-raft-kv}`
 //! at tag `v0.10.0-alpha.30`.
 
+pub mod adoption;
 mod disk_fsm;
 pub mod disk_snapshot;
 mod durability;

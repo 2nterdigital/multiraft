@@ -15,6 +15,7 @@ use openraft::RaftTypeConfig;
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+mod adoption;
 mod lifecycle;
 mod storage;
 pub use lifecycle::{ControlledGroupReceipt, ControlledGroupStage};

@@ -4,6 +4,7 @@ use crate::controlled_startup::{StartupAdmission, StartupAuthority, StartupAutho
 use multiraft_core::{NativeLedger, OperationId, ReplacementSpec, TerminalProof};
 use std::sync::Weak;
 
+mod adoption;
 mod bootstrap;
 pub use bootstrap::ManagedGenesisBasis;
 pub(super) type Publication = Arc<dyn Fn(GroupId, u64, bool) + Send + Sync>;

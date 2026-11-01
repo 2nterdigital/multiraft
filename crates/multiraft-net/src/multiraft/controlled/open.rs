@@ -180,6 +180,10 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         self.controlled_require_storage()?;
         self.ensure_node_log().await?;
+        if matches!(request.mode, ControlledOpenMode::Recover) {
+            // A half conversion is rejected before any Core construction or replay.
+            adoption::anchor(self, &request)?;
+        }
         let replaying =
             self.controlled_open_replay(&request, &authority, &admission, seed.is_none());
         let replay = match deadline {
@@ -336,6 +340,11 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                 }
             }
+            let adoption_anchor = if matches!(request.mode, ControlledOpenMode::Recover) {
+                adoption::anchor(&node, &request)?
+            } else {
+                None
+            };
             let bootstrap_generation = bootstrap::owns_generation(&node, &request)?;
             let quarantine = !matches!(&request.mode, ControlledOpenMode::BootstrapNew { .. })
                 || bootstrap::has_anchor(&node, request.group_id)?;
@@ -372,6 +381,9 @@ impl<S: StateMachine> MultiRaft<S> {
             if quarantine {
                 let ready = if let Some(seed) = seed {
                     super::seed::install(&node, &request, &authority, seed).await?;
+                    true
+                } else if let Some(anchor) = adoption_anchor {
+                    adoption::recover(&node, &request, anchor).await?;
                     true
                 } else if bootstrap_generation {
                     bootstrap::recover_anchor(&node, &request).await?;
