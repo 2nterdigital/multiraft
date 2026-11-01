@@ -95,6 +95,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         {
             return Err(RuntimeError::InvalidConfig);
         }
+        startup.startup.directory.version = carriers.version;
         startup.startup.directory.nodes = carriers
             .peers
             .iter()

@@ -481,6 +481,15 @@ async fn post_start_fourth_node_replaces_source_and_new_address_serves_removed_c
         new_rpc
     );
     assert_eq!(
+        reopened
+            .handle()
+            .local_transport_addresses()
+            .unwrap()
+            .directory_version,
+        5,
+        "cold startup reports the version of the address set actually used"
+    );
+    assert_eq!(
         reopened.handle().carrier_catalog(deadline()).await.unwrap(),
         Some(v5.validated_install().unwrap())
     );
