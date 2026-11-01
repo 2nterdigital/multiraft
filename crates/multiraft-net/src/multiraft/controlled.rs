@@ -17,6 +17,7 @@ mod seed_stream;
 mod source;
 mod storage_owner;
 mod terminal;
+mod usage;
 pub(super) use owner::GroupOwner;
 
 /// A controlled open always distinguishes a new bootstrap from durable recovery.

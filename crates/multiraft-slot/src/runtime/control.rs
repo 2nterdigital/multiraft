@@ -317,6 +317,39 @@ impl<S: SlotStateMachine> SlotControlledGroup<S> {
         })
         .await
     }
+    /// Observe only the expected local generation, without constructing a missing Core.
+    pub async fn storage_usage(
+        &self,
+        expected_generation: u64,
+        d: Instant,
+    ) -> Result<multiraft_net::ReplicaStorageUsage, SlotControlError> {
+        self.call(d, move |g| async move {
+            if g.generation() != expected_generation {
+                return Err(
+                    multiraft_net::ControlledError::Rejected("stale cleanup generation").into(),
+                );
+            }
+            g.storage_usage(d).await
+        })
+        .await
+    }
+    /// Explicitly clean the expected generation after resolving the current Slot group.
+    pub async fn retire_and_cleanup_from_authority(
+        &self,
+        expected_generation: u64,
+        operation: OperationId,
+        d: Instant,
+    ) -> Result<ControlledGroupReceipt, SlotControlError> {
+        self.call(d, move |g| async move {
+            if g.generation() != expected_generation {
+                return Err(
+                    multiraft_net::ControlledError::Rejected("stale cleanup generation").into(),
+                );
+            }
+            g.retire_and_cleanup_from_authority(operation, d).await
+        })
+        .await
+    }
     /// Verify retained native authority, stop this source, and retain all files.
     pub async fn retire_from_authority(
         &self,

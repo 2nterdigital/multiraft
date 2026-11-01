@@ -39,6 +39,21 @@ impl<S: StateMachine> std::fmt::Debug for ManagedControlledGroup<S> {
     }
 }
 
+/// Exact-generation observations, without promises about physically reclaimed shared RocksDB space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaStorageUsage {
+    /// Durable lifecycle sampled for this exact generation.
+    pub receipt: ControlledGroupReceipt,
+    /// Retained encoded log-value bytes, excluding RocksDB keys, WAL, and shared overhead.
+    pub retained_log_value_bytes: u64,
+    /// Observed live FSM file lengths; unavailable observations are not zero.
+    pub fsm_file_bytes: Option<u64>,
+    /// Observed FSM snapshot workspace file lengths.
+    pub workspace_file_bytes: Option<u64>,
+    /// Observed native snapshot file lengths.
+    pub snapshot_file_bytes: Option<u64>,
+}
+
 /// One executor incarnation; all sealed native evidence remains private to this facade.
 pub struct ManagedOperation<S: StateMachine> {
     group: ManagedControlledGroup<S>,
@@ -84,17 +99,27 @@ impl<S: StateMachine> std::fmt::Debug for ManagedTargetEndpoint<S> {
 }
 
 impl<S: StateMachine> RuntimeShared<S> {
-    fn register_controlled(&self, group: GroupId, generation: u64) -> Result<(), ControlledError> {
+    fn register_controlled(&self, handle: &ControlledGroup<S>) -> Result<(), ControlledError> {
         let mut generations = self
             .controlled_generations
             .lock()
             .expect("controlled generations lock poisoned");
+        // Native begin_rejoin is the only transition to a new durable generation and
+        // requires prior Cleaned. Validate the exact handle before updating this cache.
+        handle.receipt()?;
+        let group = handle.group_id();
+        let generation = handle.generation();
         match generations.get(&group) {
-            Some(actual) if *actual != generation => Err(ControlledError::Rejected(
+            Some(actual) if *actual > generation => Err(ControlledError::Rejected(
                 "runtime generation differs from controlled request",
             )),
+            Some(actual) if *actual == generation => Ok(()),
             _ => {
                 generations.insert(group, generation);
+                self.ready
+                    .lock()
+                    .expect("runtime readiness lock poisoned")
+                    .remove(&group);
                 Ok(())
             }
         }
@@ -170,13 +195,13 @@ impl<S: StateMachine> RuntimeHandle<S> {
                 .node
                 .open_controlled_group_completion(request, authority, admission, None, None)
                 .await?;
+            shared.register_controlled(&group)?;
             // Replay may bypass construction; only an active actual core is publishable.
             if group.receipt()?.stage == multiraft_store::ControlledGroupStage::Opened
                 && shared.node.local_group_status(group.group_id()).is_ok()
             {
                 shared.publish_controlled(group.group_id(), group.generation(), true);
             }
-            shared.register_controlled(group.group_id(), group.generation())?;
             Ok(ManagedControlledGroup { runtime, group })
         })
         .await
@@ -196,7 +221,7 @@ impl<S: StateMachine> RuntimeHandle<S> {
                 .node
                 .reserve_controlled_target(group, specification, identity, authority, deadline)
                 .await?;
-            shared.register_controlled(group.group_id(), group.generation())?;
+            shared.register_controlled(&group)?;
             Ok(ManagedControlledGroup { runtime, group })
         })
         .await
@@ -216,7 +241,7 @@ impl<S: StateMachine> RuntimeHandle<S> {
                 .node
                 .inspect_controlled_group(group, generation, identity, authority)
                 .await?;
-            shared.register_controlled(group.group_id(), group.generation())?;
+            shared.register_controlled(&group)?;
             Ok(ManagedControlledGroup { runtime, group })
         })
         .await
@@ -335,6 +360,30 @@ impl<S: StateMachine> ManagedControlledGroup<S> {
                 .await?
                 .proof()
                 .clone())
+        })
+        .await
+    }
+    /// Observe owned replica storage without opening a Core or initializing missing storage.
+    pub async fn storage_usage(
+        &self,
+        deadline: Instant,
+    ) -> Result<ReplicaStorageUsage, ManagedControlError> {
+        self.request(deadline, move |group| async move {
+            group.storage_usage(deadline).await
+        })
+        .await
+    }
+    /// Explicitly clean this generation using freshly resolved retained exclusion authority.
+    /// A timeout leaves admitted cleanup owned through its actual task and FSM barriers.
+    pub async fn retire_and_cleanup_from_authority(
+        &self,
+        operation: OperationId,
+        deadline: Instant,
+    ) -> Result<ControlledGroupReceipt, ManagedControlError> {
+        self.request(deadline, move |group| async move {
+            let terminal = group.retirement_from_authority(operation, deadline).await?;
+            group.retire_and_cleanup(&terminal, deadline).await?;
+            group.receipt()
         })
         .await
     }

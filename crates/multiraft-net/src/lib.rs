@@ -127,8 +127,8 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
 
 pub use runtime::{
     GroupConfig, ManagedControlError, ManagedControlledGroup, ManagedOperation,
-    ManagedTargetEndpoint, NodeOwner, ProposalReceipt, RuntimeConfig, RuntimeError, RuntimeHandle,
-    RuntimePhase, RuntimeTransport,
+    ManagedTargetEndpoint, NodeOwner, ProposalReceipt, ReplicaStorageUsage, RuntimeConfig,
+    RuntimeError, RuntimeHandle, RuntimePhase, RuntimeTransport,
 };
 
 pub use leader_hint::{HintSource, LeaderHint, LeaderHintReceiver};

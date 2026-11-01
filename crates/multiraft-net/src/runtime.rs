@@ -10,6 +10,7 @@ mod control;
 mod controlled;
 pub use controlled::{
     ManagedControlError, ManagedControlledGroup, ManagedOperation, ManagedTargetEndpoint,
+    ReplicaStorageUsage,
 };
 mod election_source;
 mod local;
