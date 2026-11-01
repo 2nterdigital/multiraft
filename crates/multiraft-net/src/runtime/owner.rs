@@ -209,6 +209,7 @@ impl<S: StateMachine> RuntimeShared<S> {
 
     pub(super) fn begin_cleanup(self: &Arc<Self>) {
         self.accepting.store(false, Ordering::Release);
+        self.node.fence_carrier_installs();
         self.ready
             .lock()
             .expect("runtime readiness lock poisoned")

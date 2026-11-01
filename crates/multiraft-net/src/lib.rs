@@ -9,6 +9,8 @@
 
 mod api;
 pub mod application_rpc;
+mod carrier;
+pub use carrier::{CarrierCatalog, CarrierError, CarrierInstall, CarrierPeer, CarrierService};
 mod conn_metrics;
 #[cfg(test)]
 extern crate self as multiraft_net;
