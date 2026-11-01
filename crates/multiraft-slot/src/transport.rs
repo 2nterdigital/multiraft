@@ -71,6 +71,8 @@ pub struct SlotTransportAddresses {
     pub raft_bind: SocketAddr,
     /// Nonzero application RPC listener socket, independent from its advertised address.
     pub application_rpc_bind: SocketAddr,
-    /// Source directory revision used when this owner started.
+    /// Routing directory revision used when this owner started. With controlled carrier startup,
+    /// this is the installed catalog version; local bind and advertised addresses remain
+    /// independently configured by the caller.
     pub directory_version: u64,
 }
