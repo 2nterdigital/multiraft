@@ -24,6 +24,9 @@ impl Fixture {
         Self::startup(false).await
     }
     pub async fn unopened() -> Self {
+        Self::unopened_known(true).await
+    }
+    async fn unopened_known(candidate_known: bool) -> Self {
         let parent =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/owned-controlled");
         std::fs::create_dir_all(&parent).unwrap();
@@ -64,6 +67,12 @@ impl Fixture {
         for id in 1..=4 {
             let mut config = ClusterConfig::for_test(id, &[1, 2, 3]);
             config.peers = peers.clone();
+            if !candidate_known {
+                config.raft_transport_fingerprint = Some([7; 32]);
+                if id != 4 {
+                    config.peers.retain(|(peer, _)| *peer != 4);
+                }
+            }
             config.data_dir = root.path().join(format!("node-{id}"));
             config.log_storage_backend = LogStorageBackend::RocksDb;
             config.snapshot_mode = SnapshotMode::NativeDurable;
@@ -90,14 +99,20 @@ impl Fixture {
             groups: vec![],
         }
     }
+    pub async fn without_candidate() -> Self {
+        Self::startup_catalog(false, false).await
+    }
     pub async fn startup(cancel_first_waiter: bool) -> Self {
+        Self::startup_catalog(cancel_first_waiter, true).await
+    }
+    async fn startup_catalog(cancel_first_waiter: bool, candidate_known: bool) -> Self {
         let Self {
             root,
             authority,
             owners,
             configs,
             ..
-        } = Self::unopened().await;
+        } = Self::unopened_known(candidate_known).await;
         let mut opens = Vec::new();
         for (i, owner) in owners.iter().take(3).enumerate() {
             let handle = owner.handle();
