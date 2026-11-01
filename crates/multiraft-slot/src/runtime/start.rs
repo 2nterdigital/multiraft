@@ -87,9 +87,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         factory: impl StateMachineFactory<S>,
         deadline: Instant,
     ) -> Result<Self, RuntimeError> {
-        let scope = startup.transport_domain(&config.layout, config.node_id)?;
-        if carriers.scope != Some(scope)
-            || carriers.validated_install().is_err()
+        if carriers.validated_install().is_err()
             || !carriers
                 .peers
                 .iter()
@@ -106,6 +104,10 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
                 application_rpc: peer.application_rpc,
             })
             .collect();
+        let scope = startup.transport_domain(&config.layout, config.node_id)?;
+        if carriers.scope != Some(scope) {
+            return Err(RuntimeError::InvalidConfig);
+        }
         Self::start_controlled_inner(config, startup, factory, deadline, Some(carriers)).await
     }
     async fn start_controlled_inner(
@@ -331,6 +333,13 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
                 return Err(error);
             }
         }
+        if initial_carriers.is_some() {
+            controlled_state
+                .as_ref()
+                .expect("controlled initial carrier startup has controlled state")
+                .starting_carriers
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let shared = Arc::new(Shared {
             native: native_owner.handle(),
             budget: Budget::new(config.limits, layout.slot_count()),
@@ -396,11 +405,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         });
         let owner = Self { shared, startup };
         if let Some(carriers) = initial_carriers {
-            if let Err(error) = owner
-                .handle()
-                .install_carrier_catalog(carriers, deadline)
-                .await
-            {
+            if let Err(error) = owner.shared.install_carriers(carriers, deadline).await {
                 tracing::warn!(%error,"initial composite carrier installation refused");
                 let _ = owner.shutdown(Instant::now() + CLEANUP).await;
                 return Err(RuntimeError::Unavailable);

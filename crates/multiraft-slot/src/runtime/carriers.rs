@@ -16,12 +16,17 @@ pub enum SlotCarrierError {
     Native(#[from] CarrierError),
     #[error("carrier installation {version} is unresolved; retry the same full catalog")]
     Pending { version: u64 },
-    #[error("carrier components differ: native={native:?}, application_rpc={application_rpc:?}, discovery={discovery:?}")]
+    #[error("carrier components differ: {components:?}")]
     Incomplete {
-        native: Option<CarrierInstall>,
-        application_rpc: Option<CarrierInstall>,
-        discovery: Option<CarrierInstall>,
+        components: Box<SlotCarrierComponents>,
     },
+}
+/// Actual local component acknowledgements sampled while Slot installation is serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotCarrierComponents {
+    pub native: Option<CarrierInstall>,
+    pub application_rpc: Option<CarrierInstall>,
+    pub discovery: Option<CarrierInstall>,
 }
 pub(super) struct CarrierDirectory {
     initial: BTreeSet<u64>,
@@ -57,17 +62,26 @@ fn installation(catalog: Option<CarrierCatalog>) -> Result<Option<CarrierInstall
         .transpose()
 }
 impl<S: SlotStateMachine> Shared<S> {
+    fn check_carrier_owner(&self, deadline: Instant) -> Result<(), RuntimeError> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::Deadline);
+        }
+        Ok(())
+    }
     pub(super) async fn install_carriers(
         &self,
         mut catalog: CarrierCatalog,
         deadline: Instant,
     ) -> Result<CarrierInstall, SlotCarrierError> {
-        self.check(deadline)?;
+        self.check_carrier_owner(deadline)?;
         let controlled = self.controlled.as_ref().ok_or(RuntimeError::Unavailable)?;
         let _serial = tokio::time::timeout_at(deadline, controlled.carrier_install.lock())
             .await
             .map_err(|_| RuntimeError::Deadline)?;
-        self.check(deadline)?;
+        self.check_carrier_owner(deadline)?;
         if catalog.scope != Some(self.transport_digest.0) {
             return Err(CarrierError::ScopeMismatch.into());
         }
@@ -123,25 +137,28 @@ impl<S: SlotStateMachine> Shared<S> {
             .await?;
         if native != expected || application_rpc != expected {
             return Err(SlotCarrierError::Incomplete {
-                native: Some(native),
-                application_rpc: Some(application_rpc),
-                discovery: None,
+                components: Box::new(SlotCarrierComponents {
+                    native: Some(native),
+                    application_rpc: Some(application_rpc),
+                    discovery: None,
+                }),
             });
         }
         // This is the same fence lock used by owner cleanup; no discovery publication
         // can race past shutdown, even after both transport components installed.
         let _fence = self.tasks.lock().unwrap();
-        self.check(deadline)?;
+        self.check_carrier_owner(deadline)?;
         let mut directory = controlled.directory.lock().unwrap();
         directory.installed = Some(catalog);
         directory.pending = None;
+        controlled.starting_carriers.store(false, Ordering::Release);
         Ok(expected)
     }
     pub(super) async fn installed_carriers(
         &self,
         deadline: Instant,
     ) -> Result<Option<CarrierInstall>, SlotCarrierError> {
-        self.check(deadline)?;
+        self.check_carrier_owner(deadline)?;
         let controlled = self.controlled.as_ref().ok_or(RuntimeError::Unavailable)?;
         let _serial = tokio::time::timeout_at(deadline, controlled.carrier_install.lock())
             .await
@@ -149,14 +166,16 @@ impl<S: SlotStateMachine> Shared<S> {
         let native = installation(self.native.carrier_catalog(deadline).await?)?;
         let application_rpc = installation(self.rpc()?.carrier_catalog(deadline).await?)?;
         let discovery = installation(controlled.directory.lock().unwrap().installed.clone())?;
-        self.check(deadline)?;
+        self.check_carrier_owner(deadline)?;
         if native == application_rpc && native == discovery {
             Ok(native)
         } else {
             Err(SlotCarrierError::Incomplete {
-                native,
-                application_rpc,
-                discovery,
+                components: Box::new(SlotCarrierComponents {
+                    native,
+                    application_rpc,
+                    discovery,
+                }),
             })
         }
     }
@@ -192,6 +211,7 @@ impl<S: SlotStateMachine> SlotHandle<S> {
     ///
     /// This does not authenticate the DTO or peer, grant membership/admission/intake,
     /// construct Groups, or rewrite frozen Genesis/native membership metadata.
+    /// The ACK proves local installation, not remote reachability or a fresh peer attestation.
     /// Cancellation abandons waiting; owned installation continues. An uncertain partial
     /// install must be reconciled using identical version and content.
     pub async fn install_carrier_catalog(
@@ -222,3 +242,6 @@ impl<S: SlotStateMachine> SlotHandle<S> {
         result
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -20,6 +20,7 @@ pub(super) struct ControlledState<S: SlotStateMachine> {
     pub endpoints: Mutex<BTreeMap<Vec<u8>, ManagedTargetEndpoint<S>>>,
     pub directory: Mutex<super::carriers::CarrierDirectory>,
     pub carrier_install: tokio::sync::Mutex<()>,
+    pub starting_carriers: std::sync::atomic::AtomicBool,
 }
 pub(super) async fn open<S: SlotStateMachine>(
     native: &RuntimeHandle<S>,
@@ -156,6 +157,7 @@ pub(super) async fn open<S: SlotStateMachine>(
         groups: Mutex::new(groups),
         endpoints: Mutex::new(BTreeMap::new()),
         carrier_install: tokio::sync::Mutex::new(()),
+        starting_carriers: std::sync::atomic::AtomicBool::new(false),
         directory: Mutex::new(super::carriers::CarrierDirectory::new(
             input
                 .startup
