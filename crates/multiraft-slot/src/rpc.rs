@@ -241,14 +241,31 @@ pub(crate) async fn route_hint<S: SlotStateMachine>(
     slot: SlotId,
     deadline: Instant,
 ) -> Result<Option<NodeId>, RuntimeError> {
+    routing_hint(shared, slot, None, deadline).await
+}
+// A locally present Core can retain an old joint membership after exclusion.
+// Wait for its hint only within a slice; absence may discover actual remote
+// authority, while local errors and every application dispatch remain unchanged.
+async fn routing_hint<S: SlotStateMachine>(
+    shared: &Arc<Shared<S>>,
+    slot: SlotId,
+    key: Option<&[u8]>,
+    deadline: Instant,
+) -> Result<Option<NodeId>, RuntimeError> {
     shared.check(deadline)?;
     let voters = shared.routing_voters(slot, deadline).await?;
     let hint = if shared.locally_routable(slot, deadline).await? {
-        local_hint(shared, slot, deadline).await?
+        let now = Instant::now();
+        let allowance =
+            (deadline.saturating_duration_since(now) / 2).min(std::time::Duration::from_secs(1));
+        match local_hint(shared, slot, now + allowance).await? {
+            Some(candidate) => Some(candidate),
+            None => probe_voters(shared, slot, key, deadline).await?,
+        }
     } else {
-        probe_voters(shared, slot, None, deadline).await?
+        probe_voters(shared, slot, key, deadline).await?
     };
-    if hint.is_some_and(|h| !voters.contains(&h)) {
+    if hint.is_some_and(|hint| !voters.contains(&hint)) {
         return Err(RuntimeError::Unavailable);
     }
     Ok(hint)
@@ -294,14 +311,8 @@ async fn destination<S: SlotStateMachine>(
     key: &[u8],
     deadline: Instant,
 ) -> Result<NodeId, RuntimeError> {
-    shared.check(deadline)?;
-    let voters = shared.routing_voters(slot, deadline).await?;
-    let hint = if shared.locally_routable(slot, deadline).await? {
-        local_hint(shared, slot, deadline).await?
-    } else {
-        probe_voters(shared, slot, Some(key), deadline).await?
-    };
-    hint.filter(|h| voters.contains(h))
+    routing_hint(shared, slot, Some(key), deadline)
+        .await?
         .ok_or(RuntimeError::Unavailable)
 }
 pub(crate) async fn route_write<S: SlotStateMachine>(
