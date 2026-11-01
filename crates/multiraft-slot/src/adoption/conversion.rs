@@ -25,20 +25,10 @@ pub struct UpgradeAuthorization {
     pub node_id: u64,
     pub data_space_id: u64,
     pub groups: BTreeSet<u64>,
-    pub old_manifest_digest: [u8; 32],
+    pub old_layout_digest: [u8; 32],
     pub inventory_digest: [u8; 32],
-    pub new_identity_digest: [u8; 32],
+    pub per_directory_identity_digest: [u8; 32],
     pub startup: StrictSlotStartup,
-}
-/// Durable Native conversion result; this grants no shared Store or ingress permission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AdoptionReceipt {
-    pub authorization_digest: [u8; 32],
-    pub node_id: u64,
-    pub generation: u64,
-    pub identities: BTreeMap<u64, Vec<u8>>,
-    pub fingerprint: [u8; 32],
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,7 +52,10 @@ impl AdoptionEvidence {
         1
     }
     /// The target identity digest binds UUID, protocol, logical space and compatibility tuple.
-    pub fn new_identity_digest(&self, identity: &SlotLocalIdentity) -> io::Result<[u8; 32]> {
+    pub fn per_directory_identity_digest(
+        &self,
+        identity: &SlotLocalIdentity,
+    ) -> io::Result<[u8; 32]> {
         Ok(Sha256::digest(serde_json::to_vec(identity).map_err(io::Error::other)?).into())
     }
     /// Derive the exact per-group identity from original evidence and the authorized target identity.
@@ -79,7 +72,7 @@ impl AdoptionEvidence {
         hash.update(self.inventory);
         hash.update(self.node.to_be_bytes());
         hash.update(group.to_be_bytes());
-        hash.update(self.new_identity_digest(identity)?);
+        hash.update(self.per_directory_identity_digest(identity)?);
         Ok(hash.finalize().to_vec())
     }
     /// The shared controlled transport fingerprint excludes this node's local UUID.
@@ -90,12 +83,16 @@ impl AdoptionEvidence {
         Ok(startup.transport_digest(self.layout.digest()).0)
     }
 }
-fn authorization_value(auth: &UpgradeAuthorization) -> serde_json::Value {
+fn authorization_value(
+    auth: &UpgradeAuthorization,
+    evidence: &AdoptionEvidence,
+) -> serde_json::Value {
     serde_json::json!({"session":auth.session_id,"authorization":auth.authorization_id,
         "cold_manifest_sha256":auth.cold_manifest_sha256,"physical_domain":auth.physical_domain,
         "root":auth.root,"node":auth.node_id,"space":auth.data_space_id,"groups":auth.groups,
-        "old_manifest_digest":auth.old_manifest_digest,"inventory_digest":auth.inventory_digest,
-        "new_identity_digest":auth.new_identity_digest,"identity":auth.startup.identity,
+        "old_layout_digest":auth.old_layout_digest,"inventory_digest":auth.inventory_digest,
+        "old_slot_manifest_sha256":evidence.old_slot_manifest_sha256(),"old_passport_sha256":evidence.legacy_passport_sha256(),
+        "per_directory_identity_digest":auth.per_directory_identity_digest,"identity":auth.startup.identity,
         "directory_version":auth.startup.directory.version,"directory_nodes":auth.startup.directory.nodes})
 }
 fn prepare(evidence: &AdoptionEvidence, auth: &UpgradeAuthorization) -> io::Result<Intent> {
@@ -107,11 +104,12 @@ fn prepare(evidence: &AdoptionEvidence, auth: &UpgradeAuthorization) -> io::Resu
         || auth.node_id != evidence.node
         || auth.data_space_id != evidence.space
         || auth.inventory_digest != evidence.inventory
-        || auth.old_manifest_digest != evidence.layout.digest().0
+        || auth.old_layout_digest != evidence.layout.digest().0
         || auth.groups != evidence.replicas.iter().map(|r| r.group).collect()
         || auth.startup.disposition != SlotStartupDisposition::RecoverExisting
         || auth.startup.identity.data_space_id != evidence.space
-        || auth.new_identity_digest != evidence.new_identity_digest(&auth.startup.identity)?
+        || auth.per_directory_identity_digest
+            != evidence.per_directory_identity_digest(&auth.startup.identity)?
     {
         return Err(invalid(
             "maintenance authorization does not bind exact original evidence",
@@ -139,7 +137,7 @@ fn prepare(evidence: &AdoptionEvidence, auth: &UpgradeAuthorization) -> io::Resu
         }
     }
     let fingerprint = evidence.transport_fingerprint(&auth.startup)?;
-    let authorization = authorization_value(auth);
+    let authorization = authorization_value(auth, evidence);
     let authorization_digest =
         Sha256::digest(serde_json::to_vec(&authorization).map_err(io::Error::other)?).into();
     let identities = evidence
@@ -159,10 +157,27 @@ fn prepare(evidence: &AdoptionEvidence, auth: &UpgradeAuthorization) -> io::Resu
         authorization,
         receipt: AdoptionReceipt {
             authorization_digest,
-            node_id: evidence.node,
+            binding: AdoptionBinding {
+                session_id: auth.session_id,
+                authorization_id: auth.authorization_id,
+                cold_manifest_sha256: auth.cold_manifest_sha256,
+                authorized_physical_domain: auth.physical_domain,
+                root: evidence.root.clone(),
+                node_id: evidence.node,
+                data_space_id: evidence.space,
+                groups: auth.groups.clone(),
+                old_layout_digest: evidence.layout.digest().0,
+                old_slot_manifest_sha256: evidence.old_slot_manifest_sha256(),
+                old_passport_sha256: evidence.legacy_passport_sha256(),
+                inventory_digest: evidence.inventory,
+                target_identity: auth.startup.identity.clone(),
+                per_directory_identity_digest: auth.per_directory_identity_digest,
+            },
+            legacy_space_identity: evidence.legacy_space_identity.clone(),
+            original_replicas: evidence.replicas.clone(),
             generation: 1,
             identities,
-            fingerprint,
+            transport_fingerprint: fingerprint,
         },
         root: evidence.root.clone(),
         layout: evidence.layout.config().clone(),
@@ -275,7 +290,7 @@ fn completed(intent: &Intent) -> io::Result<bool> {
             original.group,
             1,
             identity,
-            Some(intent.receipt.fingerprint),
+            Some(intent.receipt.transport_fingerprint),
         )?
         .ok_or_else(|| invalid("completed original adoption anchor missing"))?;
         if anchor.original != *original {
@@ -292,7 +307,7 @@ pub(super) fn inspect_resume(root: &Path) -> io::Result<AdoptionEvidence> {
             .map_err(io::Error::other)?;
     if intent.version != 1
         || intent.root != root
-        || intent.node != intent.receipt.node_id
+        || intent.node != intent.receipt.binding.node_id
         || intent.receipt.generation != 1
     {
         return Err(invalid("conversion intent identity mismatch"));
@@ -303,17 +318,72 @@ pub(super) fn inspect_resume(root: &Path) -> io::Result<AdoptionEvidence> {
             multiraft_store::adoption::verify_adoption_fsm(original)?;
         }
     }
+    evidence_from_intent(&intent)
+}
+fn evidence_from_intent(intent: &Intent) -> io::Result<AdoptionEvidence> {
+    if intent.version != 1
+        || intent.node != intent.receipt.binding.node_id
+        || intent.receipt.generation != 1
+    {
+        return Err(invalid("conversion intent identity mismatch"));
+    }
+    let layout = ClusterLayout::new(intent.layout.clone()).map_err(io::Error::other)?;
+    let legacy_space_identity = super::passport::inspect(&intent.passport, &layout)?;
     Ok(AdoptionEvidence {
-        root: intent.root,
-        layout: ClusterLayout::new(intent.layout).map_err(io::Error::other)?,
+        root: intent.root.clone(),
+        layout,
         node: intent.node,
         space: intent.space,
         inventory: digest(&intent.files),
-        files: intent.files,
-        replicas: intent.replicas,
-        manifest: intent.manifest,
-        passport: intent.passport,
+        files: intent.files.clone(),
+        replicas: intent.replicas.clone(),
+        manifest: intent.manifest.clone(),
+        passport: intent.passport.clone(),
+        legacy_space_identity,
     })
+}
+
+/// Read a completed historical receipt without adopting, opening databases or writing files.
+/// Absence and half conversion return None. Immutable authorization and all original anchors
+/// are rechecked, including after legitimate native progress changed mutable engine files.
+///
+/// # Errors
+/// Conflicting authorization, root aliases, corrupt completion and orphan records fail closed.
+pub fn read_completed_receipt(
+    root: &Path,
+    auth: &UpgradeAuthorization,
+) -> io::Result<Option<AdoptionReceipt>> {
+    if auth.root != root || root.canonicalize()? != root {
+        return Err(invalid(
+            "completed receipt lookup root does not match authorization",
+        ));
+    }
+    let directory = adoption_directory(root);
+    let bytes = match fs::read(directory.join("intent.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if directory.join("complete.json").try_exists()? {
+                return Err(invalid("completion without original conversion intent"));
+            }
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let intent: Intent = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if intent.root != root {
+        return Err(invalid("completed receipt intent owner mismatch"));
+    }
+    let evidence = evidence_from_intent(&intent)?;
+    let expected = prepare(&evidence, auth)?;
+    if serde_json::to_vec(&expected).map_err(io::Error::other)? != bytes {
+        return Err(invalid(
+            "completed receipt authorization or original evidence mismatch",
+        ));
+    }
+    if !completed(&intent)? {
+        return Ok(None);
+    }
+    Ok(Some(intent.receipt))
 }
 
 /// Convert exactly the inspected cold original groups under one trusted authorization.
@@ -383,7 +453,7 @@ pub fn adopt_existing(
             node: evidence.node,
             generation: 1,
             identity: identity.clone(),
-            fingerprint: expected.receipt.fingerprint,
+            fingerprint: expected.receipt.transport_fingerprint,
             original: original.clone(),
         };
         let bytes = serde_json::to_vec(&anchor).map_err(io::Error::other)?;

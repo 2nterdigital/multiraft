@@ -10,7 +10,7 @@ use multiraft_core::{ClusterConfig, LogStorageBackend, SnapshotMode};
 use multiraft_net::{
     ControlledOpen, ControlledOpenMode, FsmFactoryContext, NodeOwner, RuntimeConfig,
 };
-use multiraft_slot::adoption::{adopt_existing, inspect_existing};
+use multiraft_slot::adoption::{adopt_existing, inspect_existing, read_completed_receipt};
 use std::{path::Path, sync::Arc, time::Duration};
 fn deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + Duration::from_secs(30)
@@ -213,6 +213,11 @@ async fn original_native_core_recovers_real_memberships_and_all_business_bytes_w
         );
     }
     owner.shutdown(deadline()).await.unwrap();
+    assert_eq!(
+        read_completed_receipt(root, &authorization).unwrap(),
+        Some(receipt.clone()),
+        "read-only historical receipt lookup survives actual Native progress"
+    );
     let completed = inspect_existing(root)
         .expect("completed adoption remains inspectable after legitimate Native open");
     assert_eq!(

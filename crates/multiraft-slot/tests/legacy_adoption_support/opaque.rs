@@ -107,9 +107,9 @@ pub fn authorization(e: &AdoptionEvidence) -> UpgradeAuthorization {
         node_id: e.node_id(),
         data_space_id: e.data_space_id(),
         groups: e.replicas().iter().map(|r| r.group).collect(),
-        old_manifest_digest: e.layout().digest().0,
+        old_layout_digest: e.layout().digest().0,
         inventory_digest: e.inventory_digest(),
-        new_identity_digest: e.new_identity_digest(&identity).unwrap(),
+        per_directory_identity_digest: e.per_directory_identity_digest(&identity).unwrap(),
         startup,
     }
 }

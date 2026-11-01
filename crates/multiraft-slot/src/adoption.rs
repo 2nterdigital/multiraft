@@ -1,8 +1,12 @@
 //! Explicit cold legacy inspection; no ordinary startup adopts existing data.
 mod conversion;
+mod passport;
+mod receipt;
 use crate::{ClusterLayout, LayoutConfig, ManifestDigest, RouteDigest, SlotId};
-pub use conversion::{adopt_existing, AdoptionReceipt, UpgradeAuthorization};
+pub use conversion::{adopt_existing, read_completed_receipt, UpgradeAuthorization};
 use multiraft_store::adoption::{inspect_legacy_replica, LegacyReplica};
+pub use passport::LegacyPassportIdentity;
+pub use receipt::{AdoptionBinding, AdoptionReceipt};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,6 +28,7 @@ pub struct AdoptionEvidence {
     pub(crate) replicas: Vec<LegacyReplica>,
     pub(crate) manifest: Vec<u8>,
     pub(crate) passport: Vec<u8>,
+    pub(crate) legacy_space_identity: LegacyPassportIdentity,
 }
 impl AdoptionEvidence {
     pub fn root(&self) -> &Path {
@@ -41,6 +46,16 @@ impl AdoptionEvidence {
     pub fn inventory_digest(&self) -> [u8; 32] {
         self.inventory
     }
+    /// Original checked local passport values, including skew and creation identity.
+    pub fn legacy_space_identity(&self) -> &LegacyPassportIdentity {
+        &self.legacy_space_identity
+    }
+    pub fn legacy_passport_sha256(&self) -> [u8; 32] {
+        self.legacy_space_identity.raw_sha256()
+    }
+    pub fn old_slot_manifest_sha256(&self) -> [u8; 32] {
+        Sha256::digest(&self.manifest).into()
+    }
     /// Full native membership log identity, applied and committed facts, and observed paths.
     pub fn replicas(&self) -> &[LegacyReplica] {
         &self.replicas
@@ -53,21 +68,6 @@ struct Manifest {
     layout_digest: ManifestDigest,
     route_digest: RouteDigest,
     local_node_id: u64,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Passport {
-    format_version: u32,
-    space_id: u64,
-    cluster_id: String,
-    layout_digest: String,
-    route_version: u32,
-    bucket_count: u32,
-    route_digest: String,
-    slot_count: u32,
-    group_id_base: u64,
-    max_skew_ms: u64,
-    created_at_ms: u64,
 }
 pub(crate) fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -143,24 +143,8 @@ pub fn inspect_existing(root: &Path) -> io::Result<AdoptionEvidence> {
             .ok_or_else(|| invalid("legacy parent missing"))?
             .join("data-space.json"),
     )?;
-    let passport: Passport = serde_json::from_slice(&passport_bytes).map_err(io::Error::other)?;
+    let legacy_space_identity = passport::inspect(&passport_bytes, &layout)?;
     let config = layout.config();
-    if passport.format_version != 5
-        || passport.space_id == 0
-        || passport.cluster_id != config.cluster_id
-        || passport.layout_digest != layout.digest().to_hex()
-        || passport.route_digest != layout.route_digest().to_hex()
-        || passport.route_version != config.route_version.wire_id()
-        || passport.bucket_count != config.bucket_count
-        || passport.slot_count != config.slot_count
-        || passport.group_id_base != config.group_id_base
-        || passport.max_skew_ms == 0
-        || passport.created_at_ms == 0
-    {
-        return Err(invalid(
-            "legacy passport does not match actual Slot manifest",
-        ));
-    }
     let mut replicas = Vec::new();
     for assignment in &config.slots {
         if !assignment.voters.contains(&disk.local_node_id) {
@@ -192,11 +176,12 @@ pub fn inspect_existing(root: &Path) -> io::Result<AdoptionEvidence> {
         root: root.to_owned(),
         layout,
         node: disk.local_node_id,
-        space: passport.space_id,
+        space: legacy_space_identity.data_space_id(),
         inventory: digest(&files),
         files,
         replicas,
         manifest,
         passport: passport_bytes,
+        legacy_space_identity,
     })
 }
