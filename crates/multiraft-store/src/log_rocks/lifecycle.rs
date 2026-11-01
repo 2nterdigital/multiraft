@@ -317,6 +317,40 @@ where
         Ok(meta.bytes)
     }
 
+    /// Count actual log-namespace keys for an existing exact generation, including retired replicas.
+    ///
+    /// Registry keys live outside this namespace. Every retained namespace key, including
+    /// metadata, is counted even when the receipt reports Cleaned. This observation neither
+    /// creates a namespace nor permits reading or mutating its log entries.
+    ///
+    /// # Errors
+    /// Rejects absent or stale generation receipts and propagates database read failures.
+    pub fn group_namespace_key_count_generation(
+        &self,
+        group: u64,
+        generation: u64,
+    ) -> io::Result<u64> {
+        let gate = self.engine.gate(group)?;
+        let _guard = lock(&gate)?;
+        self.exact_receipt(group, generation)?;
+        let start = prefix(group);
+        let mut count = 0_u64;
+        for row in self
+            .engine
+            .db
+            .iterator(IteratorMode::From(&start, Direction::Forward))
+        {
+            let (key, _) = row.map_err(db_error)?;
+            if !key.starts_with(&start) {
+                break;
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| invalid("namespace key count overflow"))?;
+        }
+        Ok(count)
+    }
+
     /// Persist retirement before any deletion; native validates terminal proof authority.
     pub fn retire(&self, group: u64, generation: u64, terminal_proof: &[u8]) -> io::Result<()> {
         if terminal_proof.is_empty() {
@@ -464,5 +498,44 @@ where
             None,
         )
         .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod namespace_observation_tests {
+    use super::*;
+    use multiraft_core::TypeConfig;
+
+    #[test]
+    fn exact_namespace_observation_detects_residue_and_rejects_stale_generations() {
+        let parent =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/namespace-reader");
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = tempfile::tempdir_in(parent).unwrap();
+        let db = RocksLogDb::<TypeConfig>::open(root.path().join("logs")).unwrap();
+        assert!(
+            db.group_namespace_key_count_generation(7, 1).is_err(),
+            "missing receipt never proves an empty namespace"
+        );
+        db.enroll_controlled(7, 1, b"original").unwrap();
+        assert!(db.group_namespace_key_count_generation(7, 1).unwrap() > 0);
+        db.retire(7, 1, b"proof").unwrap();
+        assert!(db.group_namespace_key_count_generation(7, 1).unwrap() > 0);
+        db.cleanup_group(7, 1, b"proof").unwrap();
+        assert_eq!(db.group_namespace_key_count_generation(7, 1).unwrap(), 0);
+        db.finish_cleanup(7, 1, b"proof").unwrap();
+        assert_eq!(db.group_namespace_key_count_generation(7, 1).unwrap(), 0);
+        // Deliberate internal corruption checks that Cleaned never masks actual keys.
+        let mut batch = WriteBatch::default();
+        batch.put(key(7, b'm'), b"deliberate residual canonical metadata");
+        db.engine.write(batch).unwrap();
+        assert_eq!(db.group_namespace_key_count_generation(7, 1).unwrap(), 1);
+        assert!(db.begin_rejoin(7, 1, 2, b"next").is_err());
+        let mut batch = WriteBatch::default();
+        batch.delete(key(7, b'm'));
+        db.engine.write(batch).unwrap();
+        db.begin_rejoin(7, 1, 2, b"next").unwrap();
+        assert!(db.group_namespace_key_count_generation(7, 1).is_err());
+        assert!(db.group_namespace_key_count_generation(7, 2).unwrap() > 0);
     }
 }
