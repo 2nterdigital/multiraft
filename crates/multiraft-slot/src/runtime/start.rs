@@ -41,7 +41,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         factory: impl StateMachineFactory<S>,
         deadline: Instant,
     ) -> Result<Self, RuntimeError> {
-        Self::start_inner(config, None, None, factory, deadline).await
+        Self::start_inner(config, None, None, factory, deadline, None).await
     }
 
     /// Start with explicit creation/recovery authority and a separately versioned peer directory.
@@ -62,7 +62,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         factory: impl StateMachineFactory<S>,
         deadline: Instant,
     ) -> Result<Self, RuntimeError> {
-        Self::start_inner(config, Some(startup), None, factory, deadline).await
+        Self::start_inner(config, Some(startup), None, factory, deadline, None).await
     }
 
     /// Start only catalog-authorized controlled replicas, with no ordinary startup fallback.
@@ -75,6 +75,49 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         factory: impl StateMachineFactory<S>,
         deadline: Instant,
     ) -> Result<Self, RuntimeError> {
+        Self::start_controlled_inner(config, startup, factory, deadline, None).await
+    }
+    /// Cold start with an App-verified current carrier catalog installed before controlled Core opens.
+    /// Installation is local and requires no remote acknowledgements or Raft quorum.
+    /// The caller authenticates full persistent passports, native addresses and profile.
+    pub async fn start_controlled_with_carriers(
+        config: SlotNodeConfig,
+        mut startup: crate::ControlledSlotStartup,
+        carriers: multiraft_net::CarrierCatalog,
+        factory: impl StateMachineFactory<S>,
+        deadline: Instant,
+    ) -> Result<Self, RuntimeError> {
+        if carriers.validated_install().is_err()
+            || !carriers
+                .peers
+                .iter()
+                .any(|peer| peer.node_id == config.node_id)
+        {
+            return Err(RuntimeError::InvalidConfig);
+        }
+        startup.startup.directory.version = carriers.version;
+        startup.startup.directory.nodes = carriers
+            .peers
+            .iter()
+            .map(|peer| crate::NodeAddress {
+                node_id: peer.node_id,
+                raft: peer.raft,
+                application_rpc: peer.application_rpc,
+            })
+            .collect();
+        let scope = startup.transport_domain(&config.layout, config.node_id)?;
+        if carriers.scope != Some(scope) {
+            return Err(RuntimeError::InvalidConfig);
+        }
+        Self::start_controlled_inner(config, startup, factory, deadline, Some(carriers)).await
+    }
+    async fn start_controlled_inner(
+        config: SlotNodeConfig,
+        startup: crate::ControlledSlotStartup,
+        factory: impl StateMachineFactory<S>,
+        deadline: Instant,
+        carriers: Option<multiraft_net::CarrierCatalog>,
+    ) -> Result<Self, RuntimeError> {
         let catalogs = startup
             .catalogs(&config.layout, config.node_id, deadline)
             .await?;
@@ -85,6 +128,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             Some((startup, catalogs)),
             factory,
             deadline,
+            carriers,
         )
         .await
     }
@@ -101,6 +145,7 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         )>,
         factory: impl StateMachineFactory<S>,
         deadline: Instant,
+        initial_carriers: Option<multiraft_net::CarrierCatalog>,
     ) -> Result<Self, RuntimeError> {
         if let Some(startup) = &strict {
             if controlled.is_none() {
@@ -186,6 +231,17 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         let native_owner = NodeOwner::start(runtime, factory, deadline)
             .await
             .map_err(|e| native(e, false))?;
+        if let Some(carriers) = &initial_carriers {
+            if let Err(error) = native_owner
+                .handle()
+                .install_carrier_catalog(carriers.clone(), deadline)
+                .await
+            {
+                tracing::warn!(%error,"initial native carrier installation refused");
+                let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(RuntimeError::Unavailable);
+            }
+        }
         let controlled_state = if let Some((input, catalogs)) = controlled {
             match super::controlled_start::open(
                 &native_owner.handle(),
@@ -278,6 +334,13 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
                 return Err(error);
             }
         }
+        if initial_carriers.is_some() {
+            controlled_state
+                .as_ref()
+                .expect("controlled initial carrier startup has controlled state")
+                .starting_carriers
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let shared = Arc::new(Shared {
             native: native_owner.handle(),
             budget: Budget::new(config.limits, layout.slot_count()),
@@ -319,12 +382,14 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
                     .collect(),
             );
         }
-        let result = ApplicationRpcOwner::start(
+        let rpc_scope = shared.controlled.as_ref().map(|_| transport_digest.0);
+        let result = ApplicationRpcOwner::start_with_carrier_scope(
             rpc_config,
             Arc::new(crate::rpc::Handler {
                 shared: Arc::downgrade(&shared),
             }),
             deadline,
+            rpc_scope,
         )
         .await;
         let (rpc_owner, rpc_handle) = match result {
@@ -340,6 +405,13 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
             rpc: rpc_owner,
         });
         let owner = Self { shared, startup };
+        if let Some(carriers) = initial_carriers {
+            if let Err(error) = owner.shared.install_carriers(carriers, deadline).await {
+                tracing::warn!(%error,"initial composite carrier installation refused");
+                let _ = owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(RuntimeError::Unavailable);
+            }
+        }
         if let Some(strict) = &strict {
             if let Err(error) =
                 crate::strict_manifest::complete(&config.data_dir, &layout, config.node_id, strict)

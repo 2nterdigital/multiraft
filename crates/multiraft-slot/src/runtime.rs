@@ -2,6 +2,8 @@
 use crate::limits::{Budget, MAX_COMMAND_BYTES, MAX_EFFECTS_BYTES, MAX_QUERY_BYTES};
 use crate::runtime_error::native;
 mod authority;
+mod carriers;
+pub use carriers::{SlotCarrierComponents, SlotCarrierError};
 mod control;
 mod controlled_start;
 mod leadership_control;
@@ -157,6 +159,13 @@ impl<S: SlotStateMachine> Shared<S> {
     pub(crate) fn check(&self, deadline: Instant) -> Result<(), RuntimeError> {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
+        }
+        if self
+            .controlled
+            .as_ref()
+            .is_some_and(|controlled| controlled.starting_carriers.load(Ordering::Acquire))
+        {
+            return Err(RuntimeError::Unavailable);
         }
         if !self.business_enabled && self.controlled.is_none() {
             return Err(RuntimeError::Unavailable);

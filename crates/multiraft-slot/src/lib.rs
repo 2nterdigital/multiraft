@@ -6,6 +6,9 @@
 //! Slot groups carry Raft replication order; applications define their own business sequence.
 //! Layout changes require new data. There is no online resharding in this format.
 
+#[cfg(test)]
+extern crate self as multiraft_slot;
+
 pub mod config;
 pub mod error;
 pub mod manifest;
@@ -60,3 +63,6 @@ pub use runtime::{
     LocalSlotRole, SlotControlError, SlotControlledGroup, SlotManagedOperation,
     SlotRoleObservation, SlotTargetEndpoint,
 };
+
+pub use multiraft_net::{CarrierCatalog, CarrierError, CarrierInstall, CarrierPeer};
+pub use runtime::{SlotCarrierComponents, SlotCarrierError};

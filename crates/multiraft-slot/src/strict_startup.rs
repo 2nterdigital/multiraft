@@ -79,6 +79,15 @@ impl StrictSlotStartup {
         local: u64,
         protocol: u32,
     ) -> Result<(), RuntimeError> {
+        self.validate_profile_coverage(layout, local, protocol, true)
+    }
+    pub(crate) fn validate_profile_coverage(
+        &self,
+        layout: &ClusterLayout,
+        local: u64,
+        protocol: u32,
+        require_genesis: bool,
+    ) -> Result<(), RuntimeError> {
         let directory = &self.directory;
         if self.identity.data_space_id == 0
             || self.identity.data_dir_uuid == [0; 16]
@@ -108,7 +117,9 @@ impl StrictSlotStartup {
                 }
             }
         }
-        if !ids.contains(&local) || layout.nodes().iter().any(|n| !ids.contains(&n.node_id)) {
+        if !ids.contains(&local)
+            || (require_genesis && layout.nodes().iter().any(|n| !ids.contains(&n.node_id)))
+        {
             return Err(RuntimeError::InvalidConfig);
         }
         match self.disposition {

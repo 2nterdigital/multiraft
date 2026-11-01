@@ -102,6 +102,12 @@ pub struct Fixture {
 }
 impl Fixture {
     pub async fn fresh() -> Self {
+        Self::fresh_with_candidates(true).await
+    }
+    pub async fn fresh_sources() -> Self {
+        Self::fresh_with_candidates(false).await
+    }
+    async fn fresh_with_candidates(include_candidate: bool) -> Self {
         let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/controlled-slot");
         std::fs::create_dir_all(&parent).unwrap();
         let root = parent.join(format!(
@@ -125,11 +131,13 @@ impl Fixture {
         })
         .unwrap();
         let mut nodes = layout.nodes().to_vec();
-        nodes.push(NodeAddress {
-            node_id: 4,
-            raft: address(),
-            application_rpc: address(),
-        });
+        if include_candidate {
+            nodes.push(NodeAddress {
+                node_id: 4,
+                raft: address(),
+                application_rpc: address(),
+            });
+        }
         let directory = TrustedSlotDirectory {
             version: 1,
             data_space_id: 77,

@@ -18,6 +18,7 @@ const SERVICE: u32 = 0x534c4f54;
 const METHOD: u32 = 1;
 // 2: 256-bucket route table and compatibility digest (strict startup binds the data space).
 const VERSION: u32 = 2;
+const CONTROLLED_VERSION: u32 = 3;
 // Reserve ample room for protobuf tags, IDs and transport framing.
 const MAX_ENVELOPE: usize = APPLICATION_RPC_OUTER_BYTES - 1024;
 #[derive(Serialize, Deserialize)]
@@ -28,6 +29,30 @@ struct Envelope {
     slot: SlotId,
     key: Vec<u8>,
     operation: Operation,
+}
+// These are identity/address data fences against the App-verified catalog. They
+// do not cryptographically authenticate callers; trusted-network assumptions remain.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct CarrierIdentity {
+    pub node_id: NodeId,
+    pub identity: Option<Vec<u8>>,
+}
+#[derive(Serialize, Deserialize)]
+struct ControlledEnvelope {
+    request: Envelope,
+    peer: CarrierIdentity,
+}
+#[derive(Serialize, Deserialize)]
+struct ControlledReply {
+    reply: Reply,
+    peer: CarrierIdentity,
+}
+fn version<S: SlotStateMachine>(shared: &Shared<S>) -> u32 {
+    if shared.controlled_profile() {
+        CONTROLLED_VERSION
+    } else {
+        VERSION
+    }
 }
 #[derive(Serialize, Deserialize)]
 enum Operation {
@@ -111,8 +136,14 @@ impl<S: SlotStateMachine> ApplicationRpcHandler for Handler<S> {
                 if call.service_id != SERVICE || call.method_id != METHOD {
                     return Err(RuntimeError::InvalidRequest);
                 }
-                let request: Envelope = decode(&call.payload)?;
-                if request.version != VERSION
+                let request: Envelope = if shared.controlled_profile() {
+                    let wire: ControlledEnvelope = decode(&call.payload)?;
+                    shared.check_carrier_identity(&wire.peer)?;
+                    wire.request
+                } else {
+                    decode(&call.payload)?
+                };
+                if request.version != version(&shared)
                     || request.cluster != shared.layout.cluster_id()
                     || request.digest != shared.transport_digest
                 {
@@ -170,10 +201,17 @@ impl<S: SlotStateMachine> ApplicationRpcHandler for Handler<S> {
                 }
             }
             .await;
-            let bytes = encode(&Reply {
-                version: VERSION,
+            let reply = Reply {
+                version: version(&shared),
                 digest: shared.transport_digest,
                 result,
+            };
+            let bytes = (if shared.controlled_profile() {
+                shared
+                    .carrier_identity()
+                    .and_then(|peer| encode(&ControlledReply { reply, peer }))
+            } else {
+                encode(&reply)
             })
             .map_err(|_| {
                 RpcHandlerError::new(RpcErrorKind::Internal, "slot reply encoding failed")
@@ -355,14 +393,22 @@ async fn remote<S: SlotStateMachine>(
     write: bool,
 ) -> Result<Value, RuntimeError> {
     shared.check(deadline)?;
-    let payload = encode(&Envelope {
-        version: VERSION,
+    let request = Envelope {
+        version: version(shared),
         cluster: shared.layout.cluster_id().to_owned(),
         digest: shared.transport_digest,
         slot,
         key,
         operation,
-    })?;
+    };
+    let payload = if shared.controlled_profile() {
+        encode(&ControlledEnvelope {
+            request,
+            peer: shared.carrier_identity()?,
+        })?
+    } else {
+        encode(&request)?
+    };
     let response = shared
         .rpc()?
         .call(
@@ -378,14 +424,25 @@ async fn remote<S: SlotStateMachine>(
                 RuntimeError::Unavailable
             }
         })?;
-    let reply: Reply = decode(&response.payload).map_err(|_| {
+    let decoded = if shared.controlled_profile() {
+        decode::<ControlledReply>(&response.payload).and_then(|wire| {
+            if wire.peer.node_id != target {
+                return Err(RuntimeError::LayoutMismatch);
+            }
+            shared.check_carrier_identity(&wire.peer)?;
+            Ok(wire.reply)
+        })
+    } else {
+        decode::<Reply>(&response.payload)
+    };
+    let reply = decoded.map_err(|_| {
         if write {
             RuntimeError::Unknown
         } else {
             RuntimeError::Unavailable
         }
     })?;
-    if reply.version != VERSION || reply.digest != shared.transport_digest {
+    if reply.version != version(shared) || reply.digest != shared.transport_digest {
         return Err(if write {
             RuntimeError::Unknown
         } else {
