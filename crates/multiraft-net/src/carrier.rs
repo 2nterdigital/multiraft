@@ -90,6 +90,11 @@ impl CarrierCatalog {
                 ));
             }
             for address in [peer.raft, peer.application_rpc] {
+                if matches!(address,SocketAddr::V6(address) if address.flowinfo()!=0) {
+                    return Err(CarrierError::InvalidCatalog(
+                        "IPv6 flow information is not serializable",
+                    ));
+                }
                 if address.ip().is_unspecified()
                     || address.port() == 0
                     || !addresses.insert(address)

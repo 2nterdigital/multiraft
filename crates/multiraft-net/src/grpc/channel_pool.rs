@@ -110,6 +110,8 @@ pub struct GrpcPeerChannelPool {
     service: CarrierService,
     stopping: watch::Sender<bool>,
     metrics: ConnMetrics,
+    #[cfg(test)]
+    connect_gate: Option<Arc<carrier_tests::ConnectGate>>,
 }
 impl PeerLink {
     fn new(address: String, canonical: Option<SocketAddr>) -> Self {
@@ -179,6 +181,8 @@ impl GrpcPeerChannelPool {
             service,
             stopping: watch::channel(false).0,
             metrics: ConnMetrics::new(),
+            #[cfg(test)]
+            connect_gate: None,
         }
     }
     /// Configured actual transport scope, independent from membership and peer assertions.
@@ -320,6 +324,15 @@ impl GrpcPeerChannelPool {
                 .connect()
                 .await
                 .map_err(|source| GrpcPeerChannelError::Connect { peer, source })?;
+            #[cfg(test)]
+            if let Some(gate) = self
+                .connect_gate
+                .as_ref()
+                .filter(|gate| gate.version == version)
+            {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             let mut state = self.state.lock().expect("carrier state lock poisoned");
             if state.closed {
                 return Err(GrpcPeerChannelError::Closed { peer });
@@ -404,3 +417,6 @@ impl GrpcPeerChannelPool {
         self.metrics.unique_peer_links()
     }
 }
+
+#[cfg(test)]
+mod carrier_tests;
