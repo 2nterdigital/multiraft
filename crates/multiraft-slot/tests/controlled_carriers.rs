@@ -1,4 +1,6 @@
 //! Post-start carrier installation through the controlled Slot boundary.
+#[path = "controlled_carriers/cold_binding.rs"]
+mod cold_binding;
 mod controlled_support;
 use controlled_support::disk::DiskImage;
 use controlled_support::*;
@@ -451,7 +453,13 @@ async fn post_start_fourth_node_replaces_source_and_new_address_serves_removed_c
     row.raft = address();
     row.application_rpc = address();
     let new_rpc = row.application_rpc;
+    let desired_local = NodeAddress {
+        node_id: row.node_id,
+        raft: row.raft,
+        application_rpc: row.application_rpc,
+    };
     let mut startup = f.startup(4, SlotStartupDisposition::Candidate, 4);
+    startup.startup.directory.nodes.push(desired_local);
     startup.replicas = vec![ControlledSlotReplica {
         slot,
         generation: 40,

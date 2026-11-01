@@ -80,6 +80,10 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
     /// Cold start with an App-verified current carrier catalog installed before controlled Core opens.
     /// Installation is local and requires no remote acknowledgements or Raft quorum.
     /// The caller authenticates full persistent passports, native addresses and profile.
+    /// The validated local startup row controls advertised addresses and default listener binds;
+    /// explicit transport binds remain independent. Only remote rows come from the carrier catalog.
+    /// The reported directory version identifies that routing catalog, installed without rewriting
+    /// its local row, version or digest even when its local addresses are stale.
     pub async fn start_controlled_with_carriers(
         config: SlotNodeConfig,
         mut startup: crate::ControlledSlotStartup,
@@ -95,14 +99,34 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         {
             return Err(RuntimeError::InvalidConfig);
         }
+        startup.startup.validate_profile_coverage(
+            &config.layout,
+            config.node_id,
+            crate::CONTROLLED_SLOT_PROTOCOL_VERSION,
+            false,
+        )?;
+        let local = startup
+            .startup
+            .directory
+            .nodes
+            .iter()
+            .find(|node| node.node_id == config.node_id)
+            .expect("validated startup directory contains the local node")
+            .clone();
         startup.startup.directory.version = carriers.version;
         startup.startup.directory.nodes = carriers
             .peers
             .iter()
-            .map(|peer| crate::NodeAddress {
-                node_id: peer.node_id,
-                raft: peer.raft,
-                application_rpc: peer.application_rpc,
+            .map(|peer| {
+                if peer.node_id == config.node_id {
+                    local.clone()
+                } else {
+                    crate::NodeAddress {
+                        node_id: peer.node_id,
+                        raft: peer.raft,
+                        application_rpc: peer.application_rpc,
+                    }
+                }
             })
             .collect();
         let scope = startup.transport_domain(&config.layout, config.node_id)?;
