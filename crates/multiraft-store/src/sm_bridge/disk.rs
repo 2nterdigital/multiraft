@@ -47,7 +47,7 @@ impl AppliedRecord {
 #[derive(Default)]
 pub(super) struct DiskRuntime {
     /// Serializes checkpoint publication with installs.
-    pub(super) transition: tokio::sync::Mutex<()>,
+    pub(super) transition: Arc<tokio::sync::Mutex<()>>,
     /// The transfer currently being received, at most one per Group.
     pub(super) incoming: std::sync::Mutex<Option<Incoming>>,
     /// Serializes chunk writes and verification, so a retried chunk waits for

@@ -22,6 +22,9 @@ use openraft::vote::RaftLeaderIdExt;
 use openraft::{EntryPayload, Membership, RaftSnapshotBuilder};
 use tokio::sync::Semaphore;
 
+#[path = "disk_snapshot/capture.rs"]
+mod capture;
+
 const GROUP: GroupId = 7;
 /// Install faults are process-global; tests that install take this lock.
 static INSTALLS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -41,8 +44,11 @@ fn options(format: &[u8]) -> DiskFsmOptions {
 /// Sum plus one incompressible blob row per entry, all in RocksDB.
 struct DiskBlobs {
     db: DiskFsmDb,
+    // Deliberately Send but !Sync: capture must preserve the StateMachine contract.
+    _send_only: std::cell::Cell<()>,
     workspace_ready: Option<Arc<tokio::sync::Notify>>,
     inspection: Option<Arc<InspectionGate>>,
+    checkpoint_gate: Option<Arc<capture::CheckpointGate>>,
 }
 
 #[derive(Default)]
@@ -59,8 +65,10 @@ impl DiskBlobs {
     fn open_as(path: &Path, format: &[u8]) -> Self {
         Self {
             db: DiskFsmDb::open(path, GROUP, options(format)).unwrap(),
+            _send_only: std::cell::Cell::new(()),
             workspace_ready: None,
             inspection: None,
+            checkpoint_gate: None,
         }
     }
     fn sum(&self) -> u64 {
@@ -128,6 +136,9 @@ impl DiskState for DiskBlobs {
         self.db.snapshot_workspace()
     }
     fn checkpoint(&self, dir: &Path) -> io::Result<()> {
+        if let Some(gate) = &self.checkpoint_gate {
+            return gate.checkpoint(&self.db, dir);
+        }
         self.db.checkpoint(dir)
     }
     fn inspect_checkpoint(&self, dir: &Path) -> io::Result<Option<Vec<u8>>> {

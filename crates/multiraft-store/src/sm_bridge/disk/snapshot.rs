@@ -55,23 +55,42 @@ impl<S: StateMachine> StateMachineStore<S> {
         native: &NativeRuntime,
     ) -> Result<Capture, NativeCaptureError> {
         let permits = native.admit().map_err(NativeCaptureError::Refused)?;
-        let _transition = self.disk_rt.transition.lock().await;
-        let mut inner = self.inner.lock().await;
-        self.validation.readable().map_err(NativeCaptureError::Io)?;
-        if self.native_is_closing() {
-            return Err(NativeCaptureError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "native snapshot owner closed",
-            )));
-        }
-        let (_, capture, meta) = inner.take_disk_checkpoint().map_err(|error| {
-            if error.kind() == io::ErrorKind::Unsupported {
-                NativeCaptureError::Refused(CaptureRefusal::Unsupported)
-            } else {
-                NativeCaptureError::Io(error)
-            }
-        })?;
-        Ok(Capture::disk(meta, capture, permits))
+        let transition = self.disk_rt.transition.clone().lock_owned().await;
+        let mut inner = self.inner.clone().lock_owned().await;
+        let validation = self.validation.clone();
+        let owner = self.clone();
+        // Acquire in the existing transition -> FSM order before dispatch. The
+        // job owns both guards and permits even if its async waiter is dropped.
+        let (capture, meta, permits, inner, transition, owner) =
+            tokio::task::spawn_blocking(move || {
+                validation.readable().map_err(NativeCaptureError::Io)?;
+                if owner.native_is_closing() {
+                    return Err(NativeCaptureError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "native snapshot owner closed",
+                    )));
+                }
+                let (_, capture, meta) = inner.take_disk_checkpoint().map_err(|error| {
+                    if error.kind() == io::ErrorKind::Unsupported {
+                        NativeCaptureError::Refused(CaptureRefusal::Unsupported)
+                    } else {
+                        NativeCaptureError::Io(error)
+                    }
+                })?;
+                // Tuple fields drop in order if the detached job's output is
+                // discarded: delete the temporary checkpoint before returning
+                // admission or unlocking either fence, and keep its owner last.
+                Ok((capture, meta, permits, inner, transition, owner))
+            })
+            .await
+            .map_err(|error| NativeCaptureError::Io(io::Error::other(error)))??;
+        // No await between receiving the bundle and handing off checkpoint and
+        // permits. Capture's own field drop order is irrelevant to job cleanup.
+        let captured = Capture::disk(meta, capture, permits);
+        drop(inner);
+        drop(transition);
+        drop(owner);
+        Ok(captured)
     }
 
     /// Publish a captured checkpoint; a newer published snapshot wins.
@@ -80,7 +99,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         mut captured: Capture,
         capture: TempCheckpoint,
     ) -> io::Result<DiskSnapshot> {
-        let _transition = self.disk_rt.transition.lock().await;
+        let transition = self.disk_rt.transition.clone().lock_owned().await;
         self.validation.readable()?;
         if self.native_is_closing() {
             return Err(io::Error::new(
@@ -91,9 +110,10 @@ impl<S: StateMachine> StateMachineStore<S> {
         let workspace = self.disk_workspace().await?;
         let group = self.group_id;
         let meta = captured.meta.clone();
-        // Permits and the completion move into the blocking work and survive
-        // cancellation of this waiter.
+        // The transition, permits and completion survive waiter cancellation;
+        // quiescence cannot pass until publication's filesystem IO has finished.
         let published = tokio::task::spawn_blocking(move || {
+            let _transition = transition;
             let started = std::time::Instant::now();
             let published = workspace.publish(group, capture, meta)?;
             tracing::info!(target: "multiraft::recovery", operation = "native_snapshot_build",
@@ -161,11 +181,15 @@ impl<S: StateMachine> StateMachineStore<S> {
 
     /// Publish a checkpoint at the applied position unless one exists already.
     pub(super) async fn ensure_disk_snapshot_at_applied(&self) -> io::Result<()> {
-        let _transition = self.disk_rt.transition.lock().await;
-        let (workspace, capture, meta) = {
-            let mut inner = self.inner.lock().await;
+        let transition = self.disk_rt.transition.clone().lock_owned().await;
+        let mut inner = self.inner.clone().lock_owned().await;
+        let group = self.group_id;
+        // Recovery keeps the transition through publication, including when
+        // its waiter is cancelled. The FSM fence only spans checkpoint capture.
+        tokio::task::spawn_blocking(move || {
+            let _transition = transition;
             let current = match &inner.disk_workspace {
-                Some(workspace) => workspace.latest(self.group_id)?,
+                Some(workspace) => workspace.latest(group)?,
                 None => None,
             };
             if current
@@ -173,12 +197,12 @@ impl<S: StateMachine> StateMachineStore<S> {
             {
                 return Ok(());
             }
-            inner.take_disk_checkpoint()?
-        };
-        let group = self.group_id;
-        tokio::task::spawn_blocking(move || workspace.publish(group, capture, meta))
-            .await
-            .map_err(io::Error::other)??;
-        Ok(())
+            let (workspace, capture, meta) = inner.take_disk_checkpoint()?;
+            drop(inner);
+            workspace.publish(group, capture, meta)?;
+            Ok::<_, io::Error>(())
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 }
