@@ -13,6 +13,7 @@ mod log_rocks;
 mod native_log;
 mod sm_bridge;
 mod snapshot_catalog;
+mod storage_memory;
 pub mod stub_network;
 
 /// The pinned RocksDB crate used by [`DiskFsmDb`].

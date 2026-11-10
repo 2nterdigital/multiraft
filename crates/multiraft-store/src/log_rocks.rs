@@ -12,7 +12,10 @@ use multiraft_core::StartupProvenance;
 use openraft::alias::{LogIdOf, VoteOf};
 use openraft::entry::RaftEntry;
 use openraft::RaftTypeConfig;
-use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    BlockBasedOptions, Cache, Direction, IteratorMode, Options, WriteBatch, WriteBufferManager,
+    WriteOptions, DB,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 mod adoption;
@@ -23,10 +26,17 @@ pub use lifecycle::{ControlledGroupReceipt, ControlledGroupStage};
 const SCHEMA_KEY: &[u8] = b"schema";
 const SCHEMA: &[u8] = b"multiraft-rocks-log-v1";
 const CONTROLLED_SCHEMA: &[u8] = b"multiraft-rocks-log-v2-controlled";
+/// Node-shared Raft log block cache; a soft budget, not a process cap.
+const RAFT_LOG_CACHE_BYTES: usize = 32 * 1024 * 1024;
+/// Node-shared Raft log memtable budget (`allow_stall = false`).
+const RAFT_LOG_WRITE_BUFFER_MANAGER_BYTES: usize = 64 * 1024 * 1024;
 
 struct Engine {
     db: DB,
     gates: Mutex<HashMap<u64, Arc<Mutex<()>>>>,
+    cache: Cache,
+    write_buffer_manager: WriteBufferManager,
+    db_id: String,
 }
 
 /// One node's shared log engine. Clones and group handles keep the DB alive.
@@ -132,10 +142,22 @@ where
 
     /// Select fsync (`true`) instead of fdatasync for synchronous WAL writes.
     pub fn open_with_sync_all(path: impl AsRef<Path>, sync_all: bool) -> io::Result<Self> {
+        let cache = Cache::new_lru_cache(RAFT_LOG_CACHE_BYTES);
+        let write_buffer_manager = WriteBufferManager::new_write_buffer_manager(
+            RAFT_LOG_WRITE_BUFFER_MANAGER_BYTES,
+            false,
+        );
+        let mut table = BlockBasedOptions::default();
+        table.set_block_cache(&cache);
         let mut options = Options::default();
+        options.set_block_based_table_factory(&table);
+        options.set_write_buffer_manager(&write_buffer_manager);
+        options.set_write_buffer_size(16 * 1024 * 1024);
+        options.set_max_write_buffer_number(2);
+        options.set_max_open_files(64);
         options.create_if_missing(true);
         options.set_use_fsync(sync_all);
-        let db = DB::open(&options, path).map_err(db_error)?;
+        let db = DB::open(&options, path.as_ref()).map_err(db_error)?;
         match db.get(SCHEMA_KEY).map_err(db_error)? {
             Some(value) if value == SCHEMA || value == CONTROLLED_SCHEMA => {}
             Some(_) => return Err(invalid("unknown rocks log schema")),
@@ -155,9 +177,45 @@ where
             engine: Arc::new(Engine {
                 db,
                 gates: Mutex::new(HashMap::new()),
+                cache,
+                write_buffer_manager,
+                db_id: std::fs::canonicalize(path.as_ref())?.display().to_string(),
             }),
             config: PhantomData,
         })
+    }
+
+    /// Sample this shared engine once per database identity, across all group clones.
+    pub fn storage_memory_stats(&self) -> io::Result<multiraft_fsm::StorageMemoryStats> {
+        let engine = &self.engine;
+        let mut stats = crate::storage_memory::collect(
+            &engine.db,
+            engine.db_id.clone(),
+            &["default".to_owned()],
+        );
+        // Read back RocksDB's effective capacity rather than restating the constructor.
+        let cache_capacity_bytes = match engine
+            .db
+            .property_int_value("rocksdb.block-cache-capacity")
+        {
+            Ok(Some(capacity)) => capacity,
+            other => {
+                stats.errors.push(format!(
+                    "rocksdb.block-cache-capacity unavailable ({other:?}); reporting configured value"
+                ));
+                RAFT_LOG_CACHE_BYTES as u64
+            }
+        };
+        stats.shared = Some(multiraft_fsm::SharedStorageMemoryStats {
+            cache_id: format!("{}:cache", engine.db_id),
+            cache_capacity_bytes,
+            cache_usage_bytes: engine.cache.get_usage() as u64,
+            cache_pinned_bytes: engine.cache.get_pinned_usage() as u64,
+            write_buffer_manager_id: format!("{}:wbm", engine.db_id),
+            write_buffer_manager_limit_bytes: engine.write_buffer_manager.get_buffer_size() as u64,
+            write_buffer_manager_usage_bytes: engine.write_buffer_manager.get_usage() as u64,
+        });
+        Ok(stats)
     }
 
     /// Open a stable group namespace, validating its persisted recovery basis.
@@ -402,3 +460,6 @@ where
         .map_err(io::Error::other)?
     }
 }
+
+#[cfg(test)]
+mod memory_tests;

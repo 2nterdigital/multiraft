@@ -174,6 +174,23 @@ impl DiskFsmDb {
         Ok(db)
     }
 
+    /// Fallible read access, including after an unrecoverable snapshot install.
+    pub fn try_db(&self) -> io::Result<&DB> {
+        self.live()
+    }
+
+    /// Observe the live database without retaining handles across an install.
+    pub fn storage_memory_stats(&self) -> io::Result<multiraft_fsm::StorageMemoryStats> {
+        let names = column_families(&self.options)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        Ok(crate::storage_memory::collect(
+            self.live()?,
+            self.path.display().to_string(),
+            &names,
+        ))
+    }
+
     fn live(&self) -> io::Result<&DB> {
         self.db
             .as_ref()
@@ -284,5 +301,22 @@ fn check_markers(
             write.set_sync(true);
             db.write_opt(batch, &write).map_err(db_error)
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn closed_store_memory_access_fails_without_panicking() {
+        let root = tempfile::tempdir().unwrap();
+        let mut db =
+            DiskFsmDb::open(root.path().join("db"), 7, DiskFsmOptions::new(b"test")).unwrap();
+        assert_eq!(db.storage_memory_stats().unwrap().column_families.len(), 2);
+        // This is the state left by install_checkpoint when rollback cannot reopen.
+        drop(db.db.take());
+        assert!(db.try_db().is_err());
+        assert!(db.storage_memory_stats().is_err());
     }
 }

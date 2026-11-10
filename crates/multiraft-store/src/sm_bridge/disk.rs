@@ -182,6 +182,34 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
 }
 
 impl<S: StateMachine> StateMachineStore<S> {
+    /// Run admitted work on one blocking worker with an opportunistic FSM memory sample.
+    /// Never waits for the FSM lock: when apply or capture holds it, `operation`
+    /// receives `ErrorKind::WouldBlock`. The worker owns the guard (if taken) and
+    /// all closure captures until it finishes, even if the caller is cancelled.
+    pub async fn try_with_storage_memory_stats<R, F>(&self, operation: F) -> io::Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(io::Result<Option<multiraft_fsm::StorageMemoryStats>>) -> R + Send + 'static,
+    {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            // Taken on the worker, so a queued sample never holds the FSM lock.
+            let stats = match inner.try_lock_owned() {
+                Some(mut inner) => match inner.fsm.disk_state() {
+                    Some(disk) => disk.storage_memory_stats(),
+                    None => Ok(None),
+                },
+                None => Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "state machine busy; memory sample skipped",
+                )),
+            };
+            operation(stats)
+        })
+        .await
+        .map_err(io::Error::other)
+    }
+
     /// Read the FSM's explicit live-store ownership capability before Core startup.
     ///
     /// Snapshot support never substitutes for this declaration. The caller must

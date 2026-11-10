@@ -57,6 +57,10 @@ pub struct LocalStorageStatus {
     pub retained_log_bytes_kind: &'static str,
     pub progress: CompactionProgress,
     pub no_purge_needed: bool,
+    /// Fixed, read-only per-FSM database memory observations.
+    pub fsm_memory: Option<multiraft_fsm::StorageMemoryStats>,
+    /// Shared Raft engine observations, deduplicated by database identity by consumers.
+    pub raft_engine_memory: Option<multiraft_fsm::StorageMemoryStats>,
 }
 
 impl std::fmt::Display for CompactionRejection {
@@ -185,8 +189,8 @@ impl<S: StateMachine> MultiRaft<S> {
         let mode = self.config.snapshot_mode;
         let (sender, receiver) = tokio::sync::oneshot::channel();
         if !self.group_owner(group).maintenance.spawn(async move {
-            let _permit = permit;
-            let result = status::collect(node_id, group, mode, raft, sm, inspection, state).await;
+            let result =
+                status::collect(node_id, group, mode, raft, sm, inspection, state, permit).await;
             let _ = sender.send(result);
         }) {
             return Err(CompactionRejection::ShuttingDown);

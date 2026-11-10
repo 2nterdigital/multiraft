@@ -121,6 +121,10 @@ impl StateMachine for DiskCounter {
 }
 
 impl DiskState for DiskCounter {
+    fn storage_memory_stats(&self) -> io::Result<Option<multiraft_fsm::StorageMemoryStats>> {
+        self.db.storage_memory_stats().map(Some)
+    }
+
     fn durable_applied(&self) -> io::Result<Option<Vec<u8>>> {
         self.db.applied_record()
     }
@@ -463,4 +467,40 @@ async fn disk_state_without_a_log_basis_fails_closed() {
         .err()
         .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+}
+
+#[tokio::test]
+async fn memory_sample_uses_live_cf_handles_and_reports_db_scoped_snapshots() {
+    let root = scratch();
+    let path = db_path(root.path());
+    let store = StateMachineStore::new(GROUP, DiskCounter::open(&path));
+    let sample = store
+        .try_with_storage_memory_stats(|sample| sample.unwrap().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sample
+            .column_families
+            .iter()
+            .map(|cf| cf.name.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["default", "calls", DISK_FSM_META_CF])
+    );
+    assert!(sample.captured_at_unix_ms > 0);
+    assert!(sample.errors.is_empty(), "{:?}", sample.errors);
+    assert_eq!(sample.num_snapshots, Some(0));
+    assert!(sample
+        .column_families
+        .iter()
+        .all(|cf| cf.active_memtable_bytes.is_some() && cf.table_readers_bytes.is_some()));
+    assert!(
+        sample.shared.is_none(),
+        "helper cannot invent application resource owners"
+    );
+    let plain = StateMachineStore::new(GROUP, multiraft_fsm::CounterFsm::default());
+    assert!(plain
+        .try_with_storage_memory_stats(|sample| sample.unwrap())
+        .await
+        .unwrap()
+        .is_none());
 }

@@ -1,5 +1,8 @@
 //! Disk-backed state machine mode (`docs/specs/2026-10-18-disk-backed-fsm-mode.md`)
 //! and its streaming snapshot hooks (`docs/specs/2026-10-19-disk-fsm-streaming-snapshot.md`).
+mod memory;
+pub use memory::{ColumnFamilyMemoryStats, SharedStorageMemoryStats, StorageMemoryStats};
+
 use crate::{ApplyOut, GroupId};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -71,6 +74,12 @@ pub struct DiskStoragePaths {
 /// directory hooks below. Their defaults refuse, which keeps compaction refused
 /// and the log unpurged. `multiraft_store::DiskFsmDb` implements all of them.
 pub trait DiskState {
+    /// Fixed read-only memory facts, sampled under the FSM lock on a blocking worker.
+    /// Unsupported backends keep the default absent observation.
+    fn storage_memory_stats(&self) -> io::Result<Option<StorageMemoryStats>> {
+        Ok(None)
+    }
+
     /// The last record committed by [`Self::apply_durable`], or `None` for a
     /// new store. Called before the first entry is applied.
     fn durable_applied(&self) -> io::Result<Option<Vec<u8>>>;
