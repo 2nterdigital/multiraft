@@ -65,11 +65,48 @@ impl GrpcServer {
         accepting: std::sync::Arc<std::sync::atomic::AtomicBool>,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
+        Self::serve_owned_bound(listener, groups, cap, tasks, accepting, None, shutdown).await
+    }
+
+    pub(crate) async fn serve_owned_bound<S: StateMachine + 'static>(
+        listener: tokio::net::TcpListener,
+        groups: GroupMap<S>,
+        cap: usize,
+        tasks: std::sync::Arc<crate::multiraft::tasks::OwnedTasks>,
+        accepting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fingerprint: Option<[u8; 32]>,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        Self::serve_owned_protocol(
+            listener,
+            groups,
+            cap,
+            tasks,
+            accepting,
+            IngressProtocol {
+                fingerprint,
+                ..Default::default()
+            },
+            shutdown,
+        )
+        .await
+    }
+
+    pub(crate) async fn serve_owned_protocol<S: StateMachine + 'static>(
+        listener: tokio::net::TcpListener,
+        groups: GroupMap<S>,
+        cap: usize,
+        tasks: std::sync::Arc<crate::multiraft::tasks::OwnedTasks>,
+        accepting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        protocol: IngressProtocol,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(cap > 0 && cap <= 64 * 1024 * 1024, "invalid snapshot cap");
         let incoming = TcpListenerStream::new(listener);
         let wire_limit = (cap + 1024 * 1024).max(4 * 1024 * 1024);
         let svc = RaftServiceServer::new(RaftServiceImpl {
             groups,
+            protocol,
             tasks,
             accepting,
             snapshot_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -85,8 +122,16 @@ impl GrpcServer {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct IngressProtocol {
+    pub(crate) fingerprint: Option<[u8; 32]>,
+    pub(crate) controlled_groups:
+        std::sync::Arc<std::sync::RwLock<std::collections::BTreeSet<multiraft_core::GroupId>>>,
+}
+
 pub(crate) struct RaftServiceImpl<S: StateMachine> {
     pub(crate) groups: GroupMap<S>,
+    protocol: IngressProtocol,
     snapshot_slots: std::sync::Arc<tokio::sync::Semaphore>,
     tasks: std::sync::Arc<crate::multiraft::tasks::OwnedTasks>,
     accepting: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -95,10 +140,23 @@ pub(crate) struct RaftServiceImpl<S: StateMachine> {
 #[tonic::async_trait]
 impl<S: StateMachine + 'static> RaftService for RaftServiceImpl<S> {
     async fn call(&self, request: Request<RaftRequest>) -> Result<Response<RaftResponse>, Status> {
+        super::fingerprint::validate(request.metadata(), self.protocol.fingerprint)?;
         if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Status::unavailable("native ingress is closed"));
         }
         let request = request.into_inner();
+        if request.path == "/raft/append"
+            && self
+                .protocol
+                .controlled_groups
+                .read()
+                .expect("controlled ingress lock poisoned")
+                .contains(&request.group_id)
+        {
+            return Err(Status::failed_precondition(
+                "controlled group requires append JSON v1",
+            ));
+        }
         if request.path == "/raft/snapshot" {
             let permit = self
                 .snapshot_slots
@@ -115,11 +173,15 @@ impl<S: StateMachine + 'static> RaftService for RaftServiceImpl<S> {
             if !registered {
                 return Err(Status::unavailable("native ingress is closed"));
             }
-            return result
+            let mut response = result
                 .await
-                .map_err(|_| Status::internal("native snapshot task stopped"))?;
+                .map_err(|_| Status::internal("native snapshot task stopped"))??;
+            super::fingerprint::insert(response.metadata_mut(), self.protocol.fingerprint);
+            return Ok(response);
         }
-        demux_raft_call(&self.groups, request).await
+        let mut response = demux_raft_call(&self.groups, request).await?;
+        super::fingerprint::insert(response.metadata_mut(), self.protocol.fingerprint);
+        Ok(response)
     }
 }
 
@@ -134,6 +196,9 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
         match groups.get(&req.group_id) {
             Some(g) => (g.raft.clone(), g.state_machine.clone()),
             None => {
+                if req.path == super::controlled_append::PATH {
+                    return Err(Status::unavailable("controlled group is not open"));
+                }
                 let payload = encode::<Result<(), typ::RaftError>>(Err(typ::RaftError::Fatal(
                     openraft::error::Fatal::Stopped,
                 )));
@@ -144,13 +209,26 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
 
     let res = match req.path.as_str() {
         "/raft/append" => api::append(&raft, &req.payload).await,
+        super::controlled_append::PATH => {
+            super::controlled_append::receive(&raft, &req.payload).await?
+        }
         "/raft/snapshot" => {
-            let result =
-                api::snapshot(&raft, &req.payload, state_machine.snapshot_byte_limit()).await;
+            // Native storage errors are fatal, including WouldBlock. Refuse peer
+            // input here, before Core/SM dispatch, while startup proof is pending.
+            state_machine.application_ready().map_err(|_| {
+                Status::unavailable("application validation pending; peer snapshot not dispatched")
+            })?;
+            let result = api::snapshot(&raft, &state_machine, &req.payload).await;
             // Fatal/Stopped can close the native API waiter before the application
             // worker returns. The owned receive slot follows the actual transition.
             state_machine.wait_native_quiescent().await;
             result?
+        }
+        "/raft/snapshot_chunk" => {
+            state_machine.application_ready().map_err(|_| {
+                Status::unavailable("application validation pending; disk snapshot chunk refused")
+            })?;
+            api::snapshot_chunk(&state_machine, &req.payload).await?
         }
         "/raft/vote" => api::vote(&raft, &req.payload).await,
         "/raft/transfer_leader" => api::transfer_leader(&raft, &req.payload).await,
@@ -168,3 +246,7 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
 #[cfg(test)]
 #[path = "../../tests/native_service_cancellation/mod.rs"]
 mod cancellation_tests;
+
+#[cfg(test)]
+#[path = "../../tests/raft_fingerprint/mod.rs"]
+mod fingerprint_tests;

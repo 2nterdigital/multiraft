@@ -19,6 +19,7 @@ downstream app): RMQ Leader propose + a pluggable matching FSM.
 - Multi-group Raft in one process; peer links **O(nodes)**, not O(groups)
 - `MultiRaft` facade: `propose`, `propose_batch`, `read_linearizable`, normalized group observation, leader callbacks
 - File-backed log / state / snapshot per group (restart recovery); sync levels **0/1/2** (Aeron-aligned)
+- [Owned asynchronous application validation](docs/specs/async-recovery-validation.md) for startup and native peer snapshots, with bounded admission, cancellation and candidate fencing
 - Aeron-inspired hot path: typed in-process RPC, pipelined propose, coalesced / streamed file append
 - Standby learner and membership operations, plus lab-only snapshot catalog/checksum/ad generation; live standby restore is disabled
 - Multi-process gRPC demo (`multiraft-demo`) + admin HTTP for ops / Jepsen

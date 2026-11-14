@@ -8,6 +8,7 @@ impl<S: StateMachine> MultiRaft<S> {
     /// for this group). Non-leader → [`MultiRaftError::NotLeader`].
     /// Timeout / disconnect ⇒ outcome **unknown**; retry with the same idempotency key.
     pub async fn propose(&self, group: u64, data: Vec<u8>) -> Result<ProposeOk, MultiRaftError> {
+        self.ensure_application_ready(group)?;
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
@@ -25,6 +26,7 @@ impl<S: StateMachine> MultiRaft<S> {
         group: u64,
         data: Vec<u8>,
     ) -> Result<ProposeApplied, MultiRaftError> {
+        self.ensure_application_ready(group)?;
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
@@ -48,6 +50,7 @@ impl<S: StateMachine> MultiRaft<S> {
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_application_ready(group)?;
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
@@ -68,6 +71,7 @@ impl<S: StateMachine> MultiRaft<S> {
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_application_ready(group)?;
         let raft = self
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
@@ -94,6 +98,18 @@ impl<S: StateMachine> MultiRaft<S> {
             }
         }
         Ok(out)
+    }
+
+    fn ensure_application_ready(&self, group: GroupId) -> Result<(), MultiRaftError> {
+        let sm = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(&group)
+            .map(|group| group.state_machine.clone())
+            .ok_or(MultiRaftError::UnknownGroup(group))?;
+        sm.application_ready()
+            .map_err(|error| MultiRaftError::Other(error.into()))
     }
 
     pub(super) async fn client_write_one(
@@ -236,7 +252,34 @@ impl<S: StateMachine> MultiRaft<S> {
             .unwrap()
             .get(&group)
             .map(|g| g.state_machine.clone())?;
-        Some(sm.with_fsm(f).await)
+        sm.try_with_fsm(f).await.ok()
+    }
+
+    /// Query one validated local FSM and its applied watermark atomically.
+    /// No quorum confirmation or network operation is performed. Callbacks must
+    /// be bounded and nonblocking; this local view may be stale.
+    pub async fn read_applied_with_watermark<R>(
+        &self,
+        group: GroupId,
+        query: impl FnOnce(&S) -> R,
+    ) -> Result<crate::AppliedView<R>, MultiRaftError> {
+        let sm = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(&group)
+            .map(|g| g.state_machine.clone())
+            .ok_or(MultiRaftError::UnknownGroup(group))?;
+        let (value, applied) = sm
+            .try_with_fsm_and_applied(query)
+            .await
+            .map_err(|error| MultiRaftError::Other(error.into()))?;
+        Ok(crate::AppliedView {
+            value,
+            applied: applied
+                .as_ref()
+                .map(crate::group_observation::normalize_log_id),
+        })
     }
 
     /// Local FSM read for Standby (or other) service offload.
@@ -252,17 +295,10 @@ impl<S: StateMachine> MultiRaft<S> {
         if !self.config.enable_stale_queries {
             return Err(MultiRaftError::StaleQueriesDisabled);
         }
-        let sm = self
-            .groups
-            .lock()
-            .unwrap()
-            .get(&group)
-            .map(|g| g.state_machine.clone())
-            .ok_or(MultiRaftError::UnknownGroup(group))?;
-        let (applied_index, applied_term) = self.local_applied(group).await.unwrap_or((0, 0));
-        let value = sm.with_fsm(f).await;
+        let view = self.read_applied_with_watermark(group, f).await?;
+        let (applied_index, applied_term) = view.applied.map_or((0, 0), |id| (id.index, id.term));
         Ok(StaleRead {
-            value,
+            value: view.value,
             applied_index,
             applied_term,
         })

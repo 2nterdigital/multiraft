@@ -3,20 +3,35 @@
 //! Memory log + SM bridge adapted from openraft `examples/{log-mem,sm-mem,multi-raft-kv}`
 //! at tag `v0.10.0-alpha.30`.
 
+pub mod adoption;
+mod disk_fsm;
+pub mod disk_snapshot;
 mod durability;
 mod log_file;
 mod log_mem;
+mod log_rocks;
+mod native_log;
 mod sm_bridge;
 mod snapshot_catalog;
+mod storage_memory;
 pub mod stub_network;
 
+/// The pinned RocksDB crate used by [`DiskFsmDb`].
+pub use rocksdb;
+
+pub use disk_fsm::{DiskFsmDb, DiskFsmOptions, DISK_FSM_META_CF};
+pub use disk_snapshot::{is_disk_snapshot, DiskChunk};
 pub use log_file::FileLogStore;
 pub use log_file::FileLogStreamOptions;
 pub use log_mem::LogStore;
+pub use log_rocks::{ControlledGroupReceipt, ControlledGroupStage, RocksLogDb, RocksLogStore};
+pub use native_log::NativeRaftLogStore;
 pub use sm_bridge::build_standby_snapshot_async;
+pub use sm_bridge::ControlledCheckpointState;
 pub use sm_bridge::SmOptions;
 pub use sm_bridge::StateMachineStore;
 pub use sm_bridge::TriggerCb;
+pub use sm_bridge::ValidationOptions;
 pub use sm_bridge::{NativeBuildReservation, NativeCaptureError, NativeSmOptions};
 pub use sm_bridge::{StateMachineRelease, WeakStateMachineStore};
 pub use snapshot_catalog::CatalogEntry;

@@ -52,10 +52,13 @@ pub struct WeakStateMachineStore<S: multiraft_fsm::StateMachine> {
     group_id: multiraft_core::GroupId,
     inner: std::sync::Weak<futures::lock::Mutex<super::StateMachineStoreInner<S>>>,
     native: Option<std::sync::Weak<super::native::NativeRuntime>>,
+    disk: bool,
+    disk_rt: std::sync::Weak<super::disk::DiskRuntime>,
     allow_hot_build: bool,
     catalog: Option<Arc<crate::SnapshotCatalog>>,
     trigger: Option<WeakTrigger>,
     release: StateMachineRelease,
+    validation: std::sync::Weak<super::validation::ValidationRuntime>,
 }
 impl<S: multiraft_fsm::StateMachine> super::StateMachineStore<S> {
     /// Create a resource-neutral weak reference for owned background callbacks.
@@ -64,10 +67,13 @@ impl<S: multiraft_fsm::StateMachine> super::StateMachineStore<S> {
             group_id: self.group_id,
             inner: Arc::downgrade(&self.inner),
             native: self.native.as_ref().map(Arc::downgrade),
+            disk: self.disk,
+            disk_rt: Arc::downgrade(&self.disk_rt),
             allow_hot_build: self.allow_hot_build,
             catalog: self.catalog.clone(),
             trigger: self.on_standby_trigger.as_ref().map(Arc::downgrade),
             release: self.release.clone(),
+            validation: Arc::downgrade(&self.validation),
         }
     }
 }
@@ -80,10 +86,13 @@ impl<S: multiraft_fsm::StateMachine> WeakStateMachineStore<S> {
                 Some(native) => Some(native.upgrade()?),
                 None => None,
             },
+            disk: self.disk,
+            disk_rt: self.disk_rt.upgrade()?,
             allow_hot_build: self.allow_hot_build,
             catalog: self.catalog.clone(),
             on_standby_trigger: self.trigger.as_ref().and_then(std::sync::Weak::upgrade),
             release: self.release.clone(),
+            validation: self.validation.upgrade()?,
         })
     }
 }

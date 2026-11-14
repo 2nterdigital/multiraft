@@ -9,18 +9,22 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tracing::field::{Field, Visit};
+use tracing::instrument::WithSubscriber as _;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::Layer;
 
 // Observe the real operational transition, never a scheduling/yield count.
-struct ShutdownStarted(Arc<Notify>);
+struct ShutdownStarted {
+    entered: Arc<Notify>,
+    node: u64,
+}
 #[derive(Default)]
 struct ReleaseBoundary {
     shutdown: bool,
     stopping: bool,
-    local_node: bool,
+    node: Option<u64>,
 }
 impl Visit for ReleaseBoundary {
     fn record_str(&mut self, field: &Field, value: &str) {
@@ -32,7 +36,7 @@ impl Visit for ReleaseBoundary {
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
         if field.name() == "node_id" {
-            self.local_node = value == 11;
+            self.node = Some(value);
         }
     }
     fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
@@ -44,8 +48,8 @@ impl<S: Subscriber> Layer<S> for ShutdownStarted {
         }
         let mut boundary = ReleaseBoundary::default();
         event.record(&mut boundary);
-        if boundary.shutdown && boundary.stopping && boundary.local_node {
-            self.0.notify_one();
+        if boundary.shutdown && boundary.stopping && boundary.node == Some(self.node) {
+            self.entered.notify_one();
         }
     }
 }
@@ -154,9 +158,9 @@ async fn cancelled_shutdown_retry_waits_for_actual_fsm_destructor_and_lease_rele
         .unwrap(),
     );
     node.create_group(9, &[1]).await.unwrap();
-    // A previously admitted public local read keeps the FSM alive after its
-    // Group is cleared, so its eventual Drop runs in the read task, not the
-    // shutdown waiter whose cancellation we exercise.
+    // Cancel a real stop while its admitted public read still owns the FSM.
+    // Shutdown drains that read before removing the Group, so map removal is
+    // deliberately not a prerequisite for releasing this consumer's read.
     let read_gate = Gate::default();
     let query_gate = read_gate.clone();
     let query_node = node.clone();
@@ -164,23 +168,23 @@ async fn cancelled_shutdown_retry_waits_for_actual_fsm_destructor_and_lease_rele
     tokio::time::timeout(Duration::from_secs(2), read_gate.entered.notified())
         .await
         .unwrap();
+    let shutdown_started = Arc::new(Notify::new());
+    let subscriber = tracing_subscriber::registry().with(ShutdownStarted {
+        entered: shutdown_started.clone(),
+        node: 1,
+    });
     let first_node = node.clone();
-    let first = tokio::spawn(async move { first_node.shutdown().await });
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if matches!(
-                node.observe_group(9),
-                Err(multiraft_core::MultiRaftError::UnknownGroup(9))
-            ) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    let first =
+        tokio::spawn(async move { first_node.shutdown().await }.with_subscriber(subscriber));
+    tokio::time::timeout(Duration::from_secs(2), shutdown_started.notified())
+        .await
+        .unwrap();
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
+    // The retry must drain the admitted read, then wait for actual destruction,
+    // irrespective of which worker drops the last native/FSM owner.
+    let second_node = node.clone();
+    let mut second = tokio::spawn(async move { second_node.shutdown().await });
     read_gate.release();
     tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
         .await
@@ -193,8 +197,6 @@ async fn cancelled_shutdown_retry_waits_for_actual_fsm_destructor_and_lease_rele
             .is_err(),
         "real consumer lease remains held while Drop is blocked"
     );
-    let second_node = node.clone();
-    let mut second = tokio::spawn(async move { second_node.shutdown().await });
     let early = tokio::time::timeout(Duration::from_millis(40), &mut second).await;
     gate.release();
     assert!(
@@ -228,9 +230,10 @@ async fn owned_cleanup_retains_actual_destructor_beyond_both_native_shutdown_win
     // One bounded public source observer for this test binary, filtered by its
     // distinct Node identity. Other native/runtime threads keep the same source
     // boundary observable; no thread-local dispatcher lifetime is assumed.
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::registry().with(ShutdownStarted(native_stopping.clone())),
-    )
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(ShutdownStarted {
+        entered: native_stopping.clone(),
+        node: 11,
+    }))
     .unwrap();
     let root = tempfile::tempdir().unwrap();
     let lease = root.path().join("late-consumer.lease");

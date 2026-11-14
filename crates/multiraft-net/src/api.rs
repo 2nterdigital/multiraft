@@ -13,6 +13,7 @@ use crate::encode;
 use multiraft_core::typ::*;
 use multiraft_fsm::StateMachine;
 use multiraft_store::Raft;
+use multiraft_store::StateMachineStore;
 
 pub async fn vote<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
     let res = raft.vote(decode(req)).await;
@@ -28,9 +29,10 @@ pub async fn append<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
 #[allow(clippy::result_large_err)]
 pub async fn snapshot<S: StateMachine>(
     raft: &Raft<S>,
+    state_machine: &StateMachineStore<S>,
     req: &[u8],
-    cap: usize,
 ) -> Result<Vec<u8>, tonic::Status> {
+    let cap = state_machine.snapshot_byte_limit();
     let (vote, snapshot_meta, snapshot_data) =
         decode_snapshot_request(req, cap).map_err(|error| match error {
             SnapshotDecodeError::SizeLimit => {
@@ -40,6 +42,18 @@ pub async fn snapshot<S: StateMachine>(
                 tonic::Status::invalid_argument("invalid native snapshot encoding")
             }
         })?;
+    if state_machine.is_disk_backed()
+        && multiraft_store::is_disk_snapshot(&snapshot_meta, &snapshot_data)
+    {
+        // Every recoverable problem with the streamed files is a refusal here,
+        // before OpenRaft dispatch; a storage error there would stop the Group.
+        state_machine
+            .verify_disk_snapshot(&snapshot_meta, &snapshot_data)
+            .await
+            .map_err(|error| {
+                tonic::Status::failed_precondition(format!("disk snapshot refused: {error}"))
+            })?;
+    }
     let snapshot = Snapshot {
         meta: snapshot_meta,
         snapshot: Cursor::new(snapshot_data),
@@ -49,6 +63,53 @@ pub async fn snapshot<S: StateMachine>(
         .await
         .map_err(RaftError::<Infallible>::Fatal);
     Ok(encode(res))
+}
+
+/// One chunk of a disk snapshot transfer (`multiraft_store::DiskChunk`).
+// tonic requires this concrete status type at the protocol boundary.
+#[allow(clippy::result_large_err)]
+pub async fn snapshot_chunk<S: StateMachine>(
+    state_machine: &StateMachineStore<S>,
+    req: &[u8],
+) -> Result<Vec<u8>, tonic::Status> {
+    let chunk = decode_disk_chunk(req)?;
+    state_machine
+        .receive_disk_chunk(chunk)
+        .await
+        .map_err(|error| {
+            tonic::Status::failed_precondition(format!("disk snapshot chunk refused: {error}"))
+        })?;
+    Ok(encode::<Result<(), RaftError>>(Ok(())))
+}
+
+/// Data chunks hold at most `MAX_CHUNK_BYTES`; `Begin` carries the manifest,
+/// which may be up to `MAX_MANIFEST_BYTES` (checkpoints with many files).
+// tonic requires this concrete status type at the protocol boundary.
+#[allow(clippy::result_large_err)]
+fn decode_disk_chunk(req: &[u8]) -> Result<multiraft_store::DiskChunk, tonic::Status> {
+    use bincode::Options;
+    use multiraft_store::disk_snapshot::{MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES};
+    let limit = (MAX_CHUNK_BYTES.max(MAX_MANIFEST_BYTES) + 64 * 1024) as u64;
+    if req.len() as u64 > limit {
+        return Err(tonic::Status::resource_exhausted(
+            "disk snapshot chunk too large",
+        ));
+    }
+    // Same encoding as `crate::encode`, with a decode bound.
+    let chunk: multiraft_store::DiskChunk = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(limit)
+        .deserialize(req)
+        .map_err(|_| tonic::Status::invalid_argument("invalid disk snapshot chunk"))?;
+    if let multiraft_store::DiskChunk::Data { bytes, .. } = &chunk {
+        if bytes.len() > MAX_CHUNK_BYTES {
+            return Err(tonic::Status::resource_exhausted(
+                "disk snapshot chunk too large",
+            ));
+        }
+    }
+    Ok(chunk)
 }
 
 pub async fn transfer_leader<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
@@ -116,6 +177,37 @@ fn decode_snapshot_request(
 #[cfg(test)]
 mod snapshot_bound_tests {
     use super::*;
+
+    #[test]
+    fn disk_begin_carries_a_large_manifest_but_data_chunks_stay_bounded() {
+        use multiraft_store::disk_snapshot::{MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES};
+        use multiraft_store::DiskChunk;
+        // A manifest far larger than one chunk (e.g. ~100k checkpoint files).
+        let begin = encode(DiskChunk::Begin {
+            transfer: 1,
+            manifest: vec![b'x'; 8 * 1024 * 1024],
+        });
+        assert!(matches!(
+            decode_disk_chunk(&begin),
+            Ok(DiskChunk::Begin { .. })
+        ));
+        let too_big = encode(DiskChunk::Begin {
+            transfer: 1,
+            manifest: vec![b'x'; MAX_MANIFEST_BYTES + 128 * 1024],
+        });
+        assert!(decode_disk_chunk(&too_big).is_err());
+        let data = |len| {
+            encode(DiskChunk::Data {
+                transfer: 1,
+                file: 0,
+                offset: 0,
+                bytes: vec![0; len],
+                sha256: None,
+            })
+        };
+        assert!(decode_disk_chunk(&data(MAX_CHUNK_BYTES)).is_ok());
+        assert!(decode_disk_chunk(&data(MAX_CHUNK_BYTES + 1)).is_err());
+    }
     #[test]
     fn oversized_declared_metadata_is_classified_before_payload_completeness() {
         let meta = SnapshotMeta {

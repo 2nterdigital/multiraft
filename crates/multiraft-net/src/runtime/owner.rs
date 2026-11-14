@@ -108,9 +108,14 @@ impl<S: StateMachine> NodeOwner<S> {
         node.election_source = source.map(|source| source.hub);
         let (completed, _) = watch::channel(None);
         let (abort_requests, _) = watch::channel(false);
+        let node = Arc::new(node);
         let owner = Self {
             shared: Arc::new(RuntimeShared {
-                node,
+                node: node.clone(),
+                controlled_generations: Mutex::default(),
+                controlled_jobs: OwnedTasks::default(),
+                controlled_endpoints: Mutex::default(),
+                next_controlled_endpoint: std::sync::atomic::AtomicU64::new(1),
                 accepting: AtomicBool::new(true),
                 admission: Arc::new(RwLock::new(())),
                 slots: Arc::new(Semaphore::new(config.max_inflight)),
@@ -118,6 +123,7 @@ impl<S: StateMachine> NodeOwner<S> {
                 group_creation: tokio::sync::Mutex::new(()),
                 startups: OwnedTasks::default(),
                 source_jobs: OwnedTasks::default(),
+                proposals: OwnedTasks::default(),
                 startup_admission: Mutex::new(startup::StartupAdmission::default()),
                 cleanup_started: AtomicBool::new(false),
                 completed,
@@ -127,6 +133,12 @@ impl<S: StateMachine> NodeOwner<S> {
                 cleanup_task: Mutex::new(None),
             }),
         };
+        let weak = Arc::downgrade(&owner.shared);
+        node.set_controlled_publication(Arc::new(move |group, generation, opened| {
+            if let Some(shared) = weak.upgrade() {
+                shared.publish_controlled(group, generation, opened);
+            }
+        }));
         if let Some(attachment) = &mut attachment {
             attachment.transfer();
         }
@@ -197,8 +209,19 @@ impl<S: StateMachine> RuntimeShared<S> {
 
     pub(super) fn begin_cleanup(self: &Arc<Self>) {
         self.accepting.store(false, Ordering::Release);
+        self.node.fence_carrier_installs();
+        self.ready
+            .lock()
+            .expect("runtime readiness lock poisoned")
+            .clear();
         self.closed.send_replace(true);
+        self.controlled_endpoints
+            .lock()
+            .expect("controlled endpoint registry lock poisoned")
+            .clear();
+        self.node.cancel_pending_validation();
         self.slots.close();
+        self.proposals.close();
         if self.cleanup_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -208,33 +231,46 @@ impl<S: StateMachine> RuntimeShared<S> {
         // Its Arc is the sole cleanup lifetime; request/observation handles remain Weak.
         let task =
             self.runtime.spawn(async move {
-                let cleanup = async {
-                    // Reserve part of the cleanup budget for native stop/join. If an
-                    // admitted request ignores a long caller deadline, interrupt its
-                    // waiter; interruption never retracts a dispatched write.
-                    let drained =
-                        tokio::time::timeout(CLEANUP_TIMEOUT / 2, shared.admission.write()).await;
-                    let _drained = match drained {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            shared.abort_requests.send_replace(true);
-                            shared.admission.write().await
-                        }
+                let cleanup =
+                    async {
+                        // Reserve part of the cleanup budget for native stop/join. If an
+                        // admitted request ignores a long caller deadline, interrupt its
+                        // waiter; interruption never retracts a dispatched write.
+                        let drained =
+                            tokio::time::timeout(CLEANUP_TIMEOUT / 2, shared.admission.write())
+                                .await;
+                        let _drained = match drained {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                shared.abort_requests.send_replace(true);
+                                shared.admission.write().await
+                            }
+                        };
+                        let source_result =
+                            shared.source_jobs.join().await.map_err(|error| {
+                                RuntimeError::Source(MultiRaftError::Other(error))
+                            });
+                        let startup_result =
+                            shared.startups.join().await.map_err(|error| {
+                                RuntimeError::Source(MultiRaftError::Other(error))
+                            });
+                        let proposal_result =
+                            shared.proposals.join().await.map_err(|error| {
+                                RuntimeError::Source(MultiRaftError::Other(error))
+                            });
+                        // A failed/panicked owner task must not bypass native cleanup.
+                        let controlled_result =
+                            shared.controlled_jobs.join().await.map_err(|error| {
+                                RuntimeError::Source(MultiRaftError::Other(error))
+                            });
+                        let native_result =
+                            shared.node.shutdown().await.map_err(RuntimeError::Source);
+                        source_result
+                            .and(startup_result)
+                            .and(proposal_result)
+                            .and(controlled_result)
+                            .and(native_result)
                     };
-                    let source_result = shared
-                        .source_jobs
-                        .join()
-                        .await
-                        .map_err(|error| RuntimeError::Source(MultiRaftError::Other(error)));
-                    let startup_result = shared
-                        .startups
-                        .join()
-                        .await
-                        .map_err(|error| RuntimeError::Source(MultiRaftError::Other(error)));
-                    // A failed/panicked owner task must not bypass native cleanup.
-                    let native_result = shared.node.shutdown().await.map_err(RuntimeError::Source);
-                    source_result.and(startup_result).and(native_result)
-                };
                 let graceful = match tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await {
                     Ok(result) => result,
                     Err(_) => Err(RuntimeError::Deadline {
@@ -254,6 +290,13 @@ impl<S: StateMachine> RuntimeShared<S> {
                             let startup_result = shared.startups.join().await.map_err(|error| {
                                 RuntimeError::Source(MultiRaftError::Other(error))
                             });
+                            let proposal_result = shared.proposals.join().await.map_err(|error| {
+                                RuntimeError::Source(MultiRaftError::Other(error))
+                            });
+                            let controlled_result =
+                                shared.controlled_jobs.join().await.map_err(|error| {
+                                    RuntimeError::Source(MultiRaftError::Other(error))
+                                });
                             // Keep this full stop/join future IN PLACE across every native
                             // budget window. A timer expiration abandons only that poll,
                             // never retained tasks, blocking children or FSM witnesses.
@@ -269,7 +312,11 @@ impl<S: StateMachine> RuntimeShared<S> {
                             let source_result = shared.source_jobs.join().await.map_err(|error| {
                                 RuntimeError::Source(MultiRaftError::Other(error))
                             });
-                            let retained = source_result.and(startup_result).and(native_result);
+                            let retained = source_result
+                                .and(startup_result)
+                                .and(proposal_result)
+                                .and(controlled_result)
+                                .and(native_result);
                             // A real graceful source failure remains the original cause.
                             // For an expired graceful wait, a subsequently observed source
                             // failure is more specific; otherwise retain its uncertainty.

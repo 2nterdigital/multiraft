@@ -42,15 +42,17 @@ struct MetaFile {
 pub struct SnapshotCatalog {
     root: PathBuf,
     keep: usize,
-    native_activation: std::sync::Arc<std::sync::Mutex<()>>,
+    native_activation: std::sync::Arc<std::sync::Mutex<native::NativeStageRegistry>>,
 }
 
 impl SnapshotCatalog {
     pub fn new(root: impl Into<PathBuf>, keep: usize) -> Self {
+        let root = root.into();
+        let native_activation = native::shared_registry(&root);
         Self {
-            root: root.into(),
+            root,
             keep: keep.max(1),
-            native_activation: Default::default(),
+            native_activation,
         }
     }
 

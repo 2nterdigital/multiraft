@@ -1,7 +1,9 @@
 //! A public source subscriber witnesses a native-received initialization request.
 //! No injected transport/storage/protocol seam or production probe is involved.
 mod startup_support;
-use multiraft_net::{InitializeDisposition, StartupCleanup, StartupPhase};
+use multiraft_net::{
+    InitializeDisposition, RuntimeError, RuntimePhase, StartupCleanup, StartupPhase,
+};
 use startup_support::*;
 use std::{
     sync::{
@@ -10,7 +12,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at, Instant};
 use tracing::{
     field::{Field, Visit},
     Event, Subscriber,
@@ -73,22 +75,45 @@ async fn native_received_request_losing_its_reply_keeps_unknown_until_true_resou
         .await
         .unwrap();
     assert!(witnessed.load(Ordering::Acquire));
+    // An expired probe stops at admission before acquiring a slot or read lock.
+    // It can observe the shutdown fence without queuing behind cleanup's writer.
+    assert!(matches!(
+        h.local_group_status(7, Instant::now()).await,
+        Err(RuntimeError::Deadline {
+            phase: RuntimePhase::Admission,
+            outcome_unknown: false,
+        })
+    ));
     let mut shutdown = tokio::spawn(async move { owner.shutdown(deadline()).await });
     // The native channel has actually delivered Initialize; its reply has not
     // been produced. Fence cancels only the waiting future, never this request.
-    timeout(Duration::from_secs(1), async {
+    let fence = timeout(Duration::from_secs(1), async {
         loop {
-            if matches!(
-                h.local_group_status(7, deadline()).await,
-                Err(multiraft_net::RuntimeError::Closed)
-            ) {
-                break;
+            match h.local_group_status(7, Instant::now()).await {
+                Err(RuntimeError::Closed) => return Ok(()),
+                Err(RuntimeError::Deadline {
+                    phase: RuntimePhase::Admission,
+                    outcome_unknown: false,
+                }) => (),
+                result => return Err(format!("unexpected shutdown fence probe: {result:?}")),
             }
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if !matches!(fence, Ok(Ok(()))) {
+        // Keep the live FSM's lease directory even if cleanup cannot finish.
+        let retained_root = root.keep();
+        gate.release();
+        let cleanup_until = deadline();
+        let startup_cleanup = timeout_at(cleanup_until, &mut startup).await;
+        let shutdown_cleanup = timeout_at(cleanup_until, &mut shutdown).await;
+        panic!(
+            "shutdown fence observation failed: {fence:?}; startup_cleanup={startup_cleanup:?}; \
+             shutdown_cleanup={shutdown_cleanup:?}; retained_root={}",
+            retained_root.display()
+        );
+    }
     assert!(timeout(Duration::from_millis(30), &mut startup)
         .await
         .is_err());

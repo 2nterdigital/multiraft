@@ -1,0 +1,449 @@
+//! Startup and listener assembly; owner cleanup remains shared across startup modes.
+use super::{Owners, Shared, SlotNodeConfig, SlotNodeOwner, SlotStateMachine};
+use crate::limits::Budget;
+use crate::runtime_error::{native, startup_failure};
+use crate::{RuntimeError, SlotManifest, SlotStartupDisposition, StrictSlotStartup};
+use multiraft_net::{
+    application_rpc::{ApplicationRpcConfig, ApplicationRpcOwner},
+    GroupConfig, NodeOwner, RuntimeConfig, StartupBatch, StartupGroup, StartupReport,
+    StateMachineFactory,
+};
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+use tokio::{sync::watch, task::JoinSet, time::Instant};
+
+/// Bound for confirming native release after a failed startup.
+const CLEANUP: Duration = Duration::from_secs(60);
+
+impl<S: SlotStateMachine> SlotNodeOwner<S> {
+    /// Verify or create the slot manifest, start the native node, bring up all
+    /// local voter slots with one native `start_groups_with_preference` batch
+    /// (see [`crate::SlotStartupPlan`]), then start the application RPC listener.
+    ///
+    /// Returns after local recovery of every voter slot, which is neither
+    /// quorum nor leader readiness. The batch's per-group budget is the plan's
+    /// `recovery_timeout` clamped to the time left before `deadline`, counted
+    /// from each group's native registration.
+    ///
+    /// # Errors
+    ///
+    /// Any group failing or timing out fails the whole start with
+    /// [`RuntimeError::StartupFailed`] carrying the native cause; everything
+    /// already started (groups, listener, database) is released first. No
+    /// retry or fallback beyond the native grace is attempted.
+    pub async fn start(
+        config: SlotNodeConfig,
+        factory: impl StateMachineFactory<S>,
+        deadline: Instant,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_inner(config, None, None, factory, deadline, None).await
+    }
+
+    /// Start with explicit creation/recovery authority and a separately versioned peer directory.
+    ///
+    /// Candidate startup owns both listeners, creates no Groups and refuses business calls.
+    /// Genesis is a one-time empty-directory operation. Existing source identities can only
+    /// recover; interrupted genesis and old manifest formats require explicit operator recovery.
+    /// Genesis completion requires every local Group's committed genesis membership to be
+    /// applied locally within the original startup budget.
+    /// The caller must authenticate the directory and authorize the data-space creation fact.
+    ///
+    /// # Errors
+    /// Rejects incompatible identities, incomplete creation facts and missing recovery state.
+    /// Failed startup retains normal cancellation-independent native/listener cleanup.
+    pub async fn start_strict(
+        config: SlotNodeConfig,
+        startup: StrictSlotStartup,
+        factory: impl StateMachineFactory<S>,
+        deadline: Instant,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_inner(config, Some(startup), None, factory, deadline, None).await
+    }
+
+    /// Start only catalog-authorized controlled replicas, with no ordinary startup fallback.
+    ///
+    /// Catalog availability is checked before creating local state or listeners. Genesis
+    /// basis collection and quorum-confirmed finalization are separate operations.
+    pub async fn start_controlled(
+        config: SlotNodeConfig,
+        startup: crate::ControlledSlotStartup,
+        factory: impl StateMachineFactory<S>,
+        deadline: Instant,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_controlled_inner(config, startup, factory, deadline, None).await
+    }
+    /// Cold start with an App-verified current carrier catalog installed before controlled Core opens.
+    /// Installation is local and requires no remote acknowledgements or Raft quorum.
+    /// The caller authenticates full persistent passports, native addresses and profile.
+    /// The validated local startup row controls advertised addresses and default listener binds;
+    /// explicit transport binds remain independent. Only remote rows come from the carrier catalog.
+    /// The reported directory version identifies that routing catalog, installed without rewriting
+    /// its local row, version or digest even when its local addresses are stale.
+    pub async fn start_controlled_with_carriers(
+        config: SlotNodeConfig,
+        mut startup: crate::ControlledSlotStartup,
+        carriers: multiraft_net::CarrierCatalog,
+        factory: impl StateMachineFactory<S>,
+        deadline: Instant,
+    ) -> Result<Self, RuntimeError> {
+        if carriers.validated_install().is_err()
+            || !carriers
+                .peers
+                .iter()
+                .any(|peer| peer.node_id == config.node_id)
+        {
+            return Err(RuntimeError::InvalidConfig);
+        }
+        startup.startup.validate_profile_coverage(
+            &config.layout,
+            config.node_id,
+            crate::CONTROLLED_SLOT_PROTOCOL_VERSION,
+            false,
+        )?;
+        let local = startup
+            .startup
+            .directory
+            .nodes
+            .iter()
+            .find(|node| node.node_id == config.node_id)
+            .expect("validated startup directory contains the local node")
+            .clone();
+        startup.startup.directory.version = carriers.version;
+        startup.startup.directory.nodes = carriers
+            .peers
+            .iter()
+            .map(|peer| {
+                if peer.node_id == config.node_id {
+                    local.clone()
+                } else {
+                    crate::NodeAddress {
+                        node_id: peer.node_id,
+                        raft: peer.raft,
+                        application_rpc: peer.application_rpc,
+                    }
+                }
+            })
+            .collect();
+        let scope = startup.transport_domain(&config.layout, config.node_id)?;
+        if carriers.scope != Some(scope) {
+            return Err(RuntimeError::InvalidConfig);
+        }
+        Self::start_controlled_inner(config, startup, factory, deadline, Some(carriers)).await
+    }
+    async fn start_controlled_inner(
+        config: SlotNodeConfig,
+        startup: crate::ControlledSlotStartup,
+        factory: impl StateMachineFactory<S>,
+        deadline: Instant,
+        carriers: Option<multiraft_net::CarrierCatalog>,
+    ) -> Result<Self, RuntimeError> {
+        let catalogs = startup
+            .catalogs(&config.layout, config.node_id, deadline)
+            .await?;
+        let strict = startup.startup.clone();
+        Self::start_inner(
+            config,
+            Some(strict),
+            Some((startup, catalogs)),
+            factory,
+            deadline,
+            carriers,
+        )
+        .await
+    }
+
+    async fn start_inner(
+        config: SlotNodeConfig,
+        strict: Option<StrictSlotStartup>,
+        controlled: Option<(
+            crate::ControlledSlotStartup,
+            Vec<(
+                crate::SlotId,
+                multiraft_net::controlled_startup::StartupCatalog,
+            )>,
+        )>,
+        factory: impl StateMachineFactory<S>,
+        deadline: Instant,
+        initial_carriers: Option<multiraft_net::CarrierCatalog>,
+    ) -> Result<Self, RuntimeError> {
+        if let Some(startup) = &strict {
+            if controlled.is_none() {
+                startup.validate(&config.layout, config.node_id)?;
+            }
+            config.validate_strict(&startup.directory.nodes)?;
+        } else {
+            config.validate()?;
+        }
+        if Instant::now() >= deadline {
+            return Err(RuntimeError::Deadline);
+        }
+        let layout = if let Some(startup) = &strict {
+            crate::strict_manifest::prepare(
+                &config.data_dir,
+                &config.layout,
+                config.node_id,
+                startup,
+            )?;
+            config.layout.clone()
+        } else {
+            SlotManifest::open_or_create(&config.data_dir, &config.layout, config.node_id)
+                .map_err(|_| RuntimeError::ManifestMismatch)?
+                .layout()
+                .clone()
+        };
+        let transport_digest = strict
+            .as_ref()
+            .map_or_else(|| layout.digest(), |s| s.transport_digest(layout.digest()));
+        let candidate = strict
+            .as_ref()
+            .is_some_and(|s| s.disposition == SlotStartupDisposition::Candidate);
+        let nodes = strict
+            .as_ref()
+            .map_or_else(|| layout.nodes().to_vec(), |s| s.directory.nodes.clone());
+        let transport_addresses = strict.as_ref().map(|startup| {
+            // Validation guaranteed coverage and nonzero binds before creating the manifest.
+            let advertised = nodes
+                .iter()
+                .find(|n| n.node_id == config.node_id)
+                .expect("strict validation checked local directory coverage")
+                .clone();
+            crate::SlotTransportAddresses {
+                raft_bind: config
+                    .transport
+                    .as_ref()
+                    .map_or(advertised.raft, |t| t.raft_bind),
+                application_rpc_bind: config
+                    .transport
+                    .as_ref()
+                    .map_or(advertised.application_rpc, |t| t.application_rpc_bind),
+                advertised,
+                directory_version: startup.directory.version,
+            }
+        });
+        let mut groups = Vec::new();
+        for assignment in
+            layout.config().slots.iter().filter(|a| {
+                controlled.is_none() && !candidate && a.voters.contains(&config.node_id)
+            })
+        {
+            let group = GroupConfig {
+                group_id: layout
+                    .group_for_slot(assignment.slot)
+                    .map_err(|_| RuntimeError::InvalidConfig)?,
+                voters: assignment.voters.clone(),
+            };
+            groups.push(StartupGroup {
+                group,
+                preferred_initializer: Some(assignment.preferred_initializer),
+            });
+        }
+        let mut cluster = config.native;
+        cluster.peers = nodes.iter().map(|n| (n.node_id, n.raft)).collect();
+        cluster.transport = config.transport.as_ref().map(|t| t.native());
+        // Strict native RPC and Slot RPC share one domain, bound to verified space/compatibility.
+        // The frozen manifest layout digest remains the unchanged origin identity.
+        cluster.raft_transport_fingerprint = Some(transport_digest.0);
+        // Groups are declared by the batch below, never by the owner itself.
+        let mut runtime = RuntimeConfig::new(cluster, Vec::new());
+        // The Slot budget is the public limit, native admission remains independently bounded.
+        runtime.max_inflight = config.limits.global_requests;
+        let native_owner = NodeOwner::start(runtime, factory, deadline)
+            .await
+            .map_err(|e| native(e, false))?;
+        if let Some(carriers) = &initial_carriers {
+            if let Err(error) = native_owner
+                .handle()
+                .install_carrier_catalog(carriers.clone(), deadline)
+                .await
+            {
+                tracing::warn!(%error,"initial native carrier installation refused");
+                let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(RuntimeError::Unavailable);
+            }
+        }
+        let controlled_state = if let Some((input, catalogs)) = controlled {
+            match super::controlled_start::open(
+                &native_owner.handle(),
+                &layout,
+                config.node_id,
+                input,
+                catalogs,
+                deadline,
+            )
+            .await
+            {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let startup = if groups.is_empty() {
+            // A router-only node hosts no voter slot and has nothing to recover.
+            StartupReport {
+                input_digest: Some(layout.digest().0),
+                node_id: config.node_id,
+                configuration_verified: false,
+                groups: Vec::new(),
+            }
+        } else if strict
+            .as_ref()
+            .is_some_and(|s| s.disposition == SlotStartupDisposition::RecoverExisting)
+        {
+            match super::recovery::recover_sources(
+                &native_owner.handle(),
+                &layout,
+                groups,
+                config.startup.recovery_timeout,
+                deadline,
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let recovery_timeout = config.startup.recovery_timeout.min(remaining);
+            if recovery_timeout.is_zero() {
+                let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(RuntimeError::Deadline);
+            }
+            let batch = StartupBatch {
+                // Opaque native correlation; the layout digest identifies the cohort input.
+                input_digest: Some(layout.digest().0),
+                groups,
+                grace: config.startup.bootstrap_grace,
+                recovery_timeout,
+            };
+            // On failure the native batch already fenced and released the owner;
+            // shutting it down here only confirms that release before returning.
+            match native_owner
+                .handle()
+                .start_groups_with_preference(batch)
+                .await
+            {
+                Ok(report) => report,
+                Err(failure) => {
+                    let error = startup_failure(&layout, &failure);
+                    let cleanup = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                    tracing::warn!(target: "multiraft_slot::startup", node_id = config.node_id,
+                        error = %failure, cleanup_confirmed = cleanup.is_ok(),
+                        "slot native preference startup failed; owner released");
+                    return Err(error);
+                }
+            }
+        };
+        if controlled_state.is_none()
+            && strict
+                .as_ref()
+                .is_some_and(|s| s.disposition == SlotStartupDisposition::Genesis)
+        {
+            if let Err(error) =
+                super::genesis::wait_for_basis(&native_owner.handle(), &layout, &startup, deadline)
+                    .await
+            {
+                let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(error);
+            }
+        }
+        if initial_carriers.is_some() {
+            controlled_state
+                .as_ref()
+                .expect("controlled initial carrier startup has controlled state")
+                .starting_carriers
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let shared = Arc::new(Shared {
+            native: native_owner.handle(),
+            budget: Budget::new(config.limits, layout.slot_count()),
+            layout: layout.clone(),
+            transport_digest,
+            node_id: config.node_id,
+            rpc: Mutex::new(None),
+            owners: Mutex::new(None),
+            accepting: AtomicBool::new(true),
+            business_enabled: !candidate,
+            controlled: controlled_state,
+            transport_addresses,
+            cleaning: AtomicBool::new(false),
+            tasks: Mutex::new(JoinSet::new()),
+            done: watch::channel(None).0,
+            unknown: AtomicU64::new(0),
+            panicked: AtomicBool::new(false),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        let address = nodes
+            .iter()
+            .find(|n| n.node_id == config.node_id)
+            .ok_or(RuntimeError::InvalidConfig)?
+            .application_rpc;
+        let peers = nodes
+            .iter()
+            .filter(|n| n.node_id != config.node_id)
+            .map(|n| (n.node_id, n.application_rpc))
+            .collect();
+        let mut rpc_config = ApplicationRpcConfig::new(config.node_id, address, peers);
+        if let Some(transport) = config.transport {
+            rpc_config.listen_address = transport.application_rpc_bind;
+            rpc_config.dial_addresses = Some(
+                transport
+                    .nodes
+                    .into_iter()
+                    .filter(|n| n.node_id != config.node_id)
+                    .map(|n| (n.node_id, n.application_rpc))
+                    .collect(),
+            );
+        }
+        let rpc_scope = shared.controlled.as_ref().map(|_| transport_digest.0);
+        let result = ApplicationRpcOwner::start_with_carrier_scope(
+            rpc_config,
+            Arc::new(crate::rpc::Handler {
+                shared: Arc::downgrade(&shared),
+            }),
+            deadline,
+            rpc_scope,
+        )
+        .await;
+        let (rpc_owner, rpc_handle) = match result {
+            Ok(rpc) => rpc,
+            Err(_) => {
+                let _ = native_owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(RuntimeError::Unavailable);
+            }
+        };
+        *shared.rpc.lock().unwrap() = Some(rpc_handle);
+        *shared.owners.lock().unwrap() = Some(Owners {
+            native: native_owner,
+            rpc: rpc_owner,
+        });
+        let owner = Self { shared, startup };
+        if let Some(carriers) = initial_carriers {
+            if let Err(error) = owner.shared.install_carriers(carriers, deadline).await {
+                tracing::warn!(%error,"initial composite carrier installation refused");
+                let _ = owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(RuntimeError::Unavailable);
+            }
+        }
+        if let Some(strict) = &strict {
+            if let Err(error) =
+                crate::strict_manifest::complete(&config.data_dir, &layout, config.node_id, strict)
+            {
+                let _ = owner.shutdown(Instant::now() + CLEANUP).await;
+                return Err(error);
+            }
+        }
+        Ok(owner)
+    }
+}

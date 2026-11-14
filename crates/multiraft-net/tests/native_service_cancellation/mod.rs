@@ -79,6 +79,7 @@ async fn cancelled_service_waiter_does_not_admit_another_native_install() {
     )])));
     let service = Arc::new(RaftServiceImpl {
         groups,
+        protocol: IngressProtocol::default(),
         tasks: Arc::new(crate::multiraft::tasks::OwnedTasks::default()),
         accepting: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         snapshot_slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -123,8 +124,11 @@ async fn cancelled_service_waiter_does_not_admit_another_native_install() {
     gate.1.notify_all();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if sm.get_current_snapshot().await.unwrap().is_some() {
-                break;
+            match sm.get_current_snapshot().await {
+                Ok(Some(_)) => break,
+                Ok(None) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(error) => panic!("snapshot observation failed: {error}"),
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

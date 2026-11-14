@@ -6,12 +6,73 @@ impl<S: StateMachine> MultiRaft<S> {
         &self,
         group: GroupId,
     ) -> Result<tokio::time::Instant, MultiRaftError> {
+        self.spawn_local_group_authorized(group, false, false, false)
+            .await
+    }
+    pub(super) async fn spawn_controlled_local_group(
+        &self,
+        group: GroupId,
+        quarantine: bool,
+    ) -> Result<tokio::time::Instant, MultiRaftError> {
+        self.spawn_local_group_authorized(group, true, quarantine, false)
+            .await
+    }
+    pub(super) async fn spawn_persisted_local_group(
+        &self,
+        group: GroupId,
+    ) -> Result<tokio::time::Instant, MultiRaftError> {
+        self.spawn_local_group_authorized(group, false, false, true)
+            .await
+    }
+    async fn spawn_local_group_authorized(
+        &self,
+        group: GroupId,
+        controlled_admission: bool,
+        quarantine: bool,
+        persisted_only: bool,
+    ) -> Result<tokio::time::Instant, MultiRaftError> {
+        let _construction = self.controlled_construction.read().await;
+        if self
+            .snapshot_rt
+            .stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "native node is stopping"
+            )));
+        }
+        self.ensure_node_log().await?;
+        let controlled = self
+            .controlled_db()
+            .ok()
+            .map(|db| db.lifecycle_receipt(group))
+            .transpose()
+            .map_err(|error| MultiRaftError::Other(error.into()))?
+            .flatten()
+            .is_some();
+        if controlled != controlled_admission {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "controlled group requires its private durable startup path"
+            )));
+        }
+        let membership_policy = if controlled {
+            openraft::MembershipChangePolicy::RequireGuard
+        } else {
+            openraft::MembershipChangePolicy::Unrestricted
+        };
+        if controlled {
+            if let NetBackend::Grpc { router } = &self.net {
+                router.enable_controlled_group(group);
+            }
+        }
         // Every admitted mode is manual-only. Native protocol snapshots still
         // use the configured provider; Disabled has no legacy 5000-log policy.
         let snapshot_policy = openraft::SnapshotPolicy::Never;
         let snapshot_policy_name = "never";
         let storage = if self.config.data_dir.as_os_str().is_empty() {
             "memory"
+        } else if self.config.log_storage_backend == LogStorageBackend::RocksDb {
+            "rocksdb"
         } else {
             "file"
         };
@@ -42,6 +103,8 @@ impl<S: StateMachine> MultiRaft<S> {
             "starting local Raft group"
         );
         let config = Config {
+            enable_elect: !quarantine,
+            enable_leader_restore: if quarantine { Some(false) } else { None },
             heartbeat_interval: self.config.heartbeat_interval_ms,
             election_timeout_min: self.config.election_timeout_min_ms,
             election_timeout_max: self.config.election_timeout_max_ms,
@@ -86,11 +149,16 @@ impl<S: StateMachine> MultiRaft<S> {
             MultiRaftError::Other(error.into())
         })?);
 
+        if persisted_only {
+            self.check_persisted_startup(group)
+                .await
+                .map_err(MultiRaftError::Other)?;
+        }
         let context = FsmFactoryContext {
             node_id: self.node_id,
             group_id: group,
         };
-        let fsm = self.fsm_factory.create(context).map_err(|source| {
+        let mut fsm = self.fsm_factory.create(context).map_err(|source| {
             tracing::error!(
                 target: "multiraft::recovery",
                 operation = "group_start",
@@ -109,6 +177,10 @@ impl<S: StateMachine> MultiRaft<S> {
                 context.group_id(),
             )))
         })?;
+        if controlled {
+            self.controlled_validate_fsm(group, &mut fsm)
+                .map_err(|error| MultiRaftError::Other(anyhow::Error::new(error)))?;
+        }
         // StandbyOffload: never hot-dump FSM in openraft build_snapshot (voters or standby).
         let allow_hot_build = self.config.snapshot_mode != SnapshotMode::StandbyOffload;
 
@@ -166,6 +238,14 @@ impl<S: StateMachine> MultiRaft<S> {
             }
         }
         let state_machine_store = if self.config.snapshot_mode == SnapshotMode::NativeDurable {
+            // Every native Group startup, including the legacy facade/owner path,
+            // bounds and validates orphan cleanup before loading recovery authority.
+            self.snapshot_rt
+                .catalog
+                .as_ref()
+                .expect("validated durable catalog")
+                .startup_provenance(group, self.config.max_snapshot_bytes)
+                .map_err(|error| MultiRaftError::Other(error.into()))?;
             StateMachineStore::with_native_options(
                 group,
                 fsm,
@@ -191,6 +271,52 @@ impl<S: StateMachine> MultiRaft<S> {
                 },
             )
         };
+        if controlled && !state_machine_store.is_disk_backed() {
+            return Err(MultiRaftError::Other(anyhow::anyhow!(
+                "controlled group requires a disk-backed FSM"
+            )));
+        }
+        if state_machine_store.is_disk_backed() {
+            // Disk mode (docs/specs/2026-10-18-disk-backed-fsm-mode.md) recovers its
+            // applied position from the FSM store and replays a durable local log.
+            // Only the RocksDB log returns from append after its synchronous
+            // write, so an entry is durable in the log before it can be applied.
+            let reason = if self.config.data_dir.as_os_str().is_empty()
+                || self.config.log_storage_backend != LogStorageBackend::RocksDb
+            {
+                Some("disk-backed state machine requires the RocksDB Raft log")
+            } else if self.config.snapshot_mode == SnapshotMode::StandbyOffload
+                || self.config.role != NodeRole::Voter
+            {
+                Some("disk-backed state machine requires a voter without StandbyOffload")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                tracing::error!(target: "multiraft::recovery", operation = "group_start", phase = "error",
+                    node_id = self.node_id, group_id = group, transport, storage,
+                    directory = %group_directory.display(), reason_code = "disk_fsm_mode_rejected",
+                    reason, "rejected disk-backed state machine configuration");
+                return Err(MultiRaftError::Other(anyhow::anyhow!(reason)));
+            }
+        }
+        let state_machine_store = state_machine_store
+            .with_validation_options(multiraft_store::ValidationOptions {
+                deadline: self.fsm_factory.validation_timeout(context),
+                budget: self
+                    .fsm_factory
+                    .validation_budget()
+                    .unwrap_or_else(|| self.snapshot_rt.validation_budget.clone()),
+            })
+            .map_err(|error| MultiRaftError::Other(error.into()))?;
+        state_machine_store.begin_recovery_validation();
+        if self
+            .snapshot_rt
+            .validation_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            state_machine_store.cancel_pending_validation();
+        }
         {
             let mut releases = self.fsm_releases.lock().unwrap();
             releases.retain(|release| !release.is_released());
@@ -198,125 +324,59 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         let _ = sm_holder.set(state_machine_store.downgrade());
 
-        let mut durable_basis = None;
+        let mut log_store = self.open_native_log(group).map_err(|error| {
+            tracing::error!(
+                target: "multiraft::recovery",
+                operation = "group_start",
+                phase = "error",
+                node_id = self.node_id,
+                group_id = group,
+                transport,
+                storage,
+                directory = %group_directory.display(),
+                error = %error,
+                error_debug = ?error,
+                "failed to open Raft log"
+            );
+            let message = format!(
+                "open {storage} log for node {}, group {} at {}: {error}",
+                self.node_id,
+                group,
+                group_directory.display()
+            );
+            MultiRaftError::Other(anyhow::Error::new(error).context(message))
+        })?;
+        state_machine_store
+            .check_disk_log_basis(&mut log_store)
+            .await
+            .map_err(|error| {
+                tracing::error!(target: "multiraft::recovery", operation = "group_start", phase = "error",
+                    node_id = self.node_id, group_id = group, transport, storage,
+                    directory = %group_directory.display(), error = %error,
+                    reason_code = "disk_fsm_basis_rejected", "rejected disk-backed FSM recovery basis");
+                MultiRaftError::Other(anyhow::Error::new(error).context(format!(
+                    "disk FSM basis for node {}, group {}",
+                    self.node_id, group
+                )))
+            })?;
+        if persisted_only {
+            self.check_persisted_fsm_basis(group, &mut log_store, &state_machine_store)
+                .await
+                .map_err(MultiRaftError::Other)?;
+        }
+        let durable_basis = if recovery::durable_local_mode(&self.config) {
+            Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?)
+        } else {
+            None
+        };
         let raft = match &self.net {
             NetBackend::InProcess { router, .. } => {
                 let network = crate::election_source::ObservedFactory::new(NetworkFactory::new(router.clone(), group), group, self.election_source.clone());
-                if self.config.data_dir.as_os_str().is_empty() {
-                    let log_store = MemLogStore::default();
-                    openraft::Raft::new_with_election_observer(
-                        self.node_id,
-                        config,
-                        network,
-                        log_store,
-                        state_machine_store.clone(),
-                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
-                    )
-                    .await
-                } else {
-                    let dir = self.config.data_dir.join(format!("group-{group}"));
-                    let mut log_store = FileLogStoreOf::open_with_full_options(
-                        &dir,
-                        self.config.file_log_coalesce_us,
-                        self.config.file_log_sync_level,
-                        FileLogStreamOptions {
-                            stream_buf_bytes: self.config.file_log_stream_buf_bytes,
-                            stream_flush_ms: self.config.file_log_stream_flush_ms,
-                            hold_overlap: self.config.file_log_hold_overlap,
-                        },
-                    )
-                    .map_err(|error| {
-                        tracing::error!(
-                            target: "multiraft::recovery",
-                            operation = "group_start",
-                            phase = "error",
-                            node_id = self.node_id,
-                            group_id = group,
-                            transport,
-                            storage,
-                            directory = %dir.display(),
-                            error = %error,
-                            error_debug = ?error,
-                            "failed to open file-backed Raft log"
-                        );
-                        let message = format!(
-                            "open file log for node {}, group {} at {}: {error}",
-                            self.node_id, group, dir.display()
-                        );
-                        MultiRaftError::Other(anyhow::Error::new(error).context(message))
-                    })?;
-                    if recovery::durable_local_mode(&self.config) {
-                        durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
-                    }
-                    openraft::Raft::new_with_election_observer(
-                        self.node_id,
-                        config,
-                        network,
-                        log_store,
-                        state_machine_store.clone(),
-                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
-                    )
-                    .await
-                }
+                openraft::Raft::new_with_election_observer_and_membership_policy(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>), membership_policy).await
             }
             NetBackend::Grpc { router } => {
                 let network = crate::election_source::ObservedFactory::new(GrpcNetworkFactory::new(router.clone(), group), group, self.election_source.clone());
-                if self.config.data_dir.as_os_str().is_empty() {
-                    let log_store = MemLogStore::default();
-                    openraft::Raft::new_with_election_observer(
-                        self.node_id,
-                        config,
-                        network,
-                        log_store,
-                        state_machine_store.clone(),
-                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
-                    )
-                    .await
-                } else {
-                    let dir = self.config.data_dir.join(format!("group-{group}"));
-                    let mut log_store = FileLogStoreOf::open_with_full_options(
-                        &dir,
-                        self.config.file_log_coalesce_us,
-                        self.config.file_log_sync_level,
-                        FileLogStreamOptions {
-                            stream_buf_bytes: self.config.file_log_stream_buf_bytes,
-                            stream_flush_ms: self.config.file_log_stream_flush_ms,
-                            hold_overlap: self.config.file_log_hold_overlap,
-                        },
-                    )
-                    .map_err(|error| {
-                        tracing::error!(
-                            target: "multiraft::recovery",
-                            operation = "group_start",
-                            phase = "error",
-                            node_id = self.node_id,
-                            group_id = group,
-                            transport,
-                            storage,
-                            directory = %dir.display(),
-                            error = %error,
-                            error_debug = ?error,
-                            "failed to open file-backed Raft log"
-                        );
-                        let message = format!(
-                            "open file log for node {}, group {} at {}: {error}",
-                            self.node_id, group, dir.display()
-                        );
-                        MultiRaftError::Other(anyhow::Error::new(error).context(message))
-                    })?;
-                    if recovery::durable_local_mode(&self.config) {
-                        durable_basis = Some(recovery::construction_basis(group, &mut log_store, &state_machine_store).await?);
-                    }
-                    openraft::Raft::new_with_election_observer(
-                        self.node_id,
-                        config,
-                        network,
-                        log_store,
-                        state_machine_store.clone(),
-                        self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>),
-                    )
-                    .await
-                }
+                openraft::Raft::new_with_election_observer_and_membership_policy(self.node_id, config, network, log_store, state_machine_store.clone(), self.election_source.clone().map(|hub| Arc::new(crate::election_source::NativeSourceObserver { group, hub }) as Arc<dyn openraft::election_observer::ElectionObserver<TypeConfig>>), membership_policy).await
             }
         }
         .map_err(|error| {
@@ -340,7 +400,12 @@ impl<S: StateMachine> MultiRaft<S> {
         }
         let registered_at;
         {
-            let mut g = self.groups.lock().unwrap();
+            let destination = if quarantine {
+                &self.quarantined_groups
+            } else {
+                &self.groups
+            };
+            let mut g = destination.lock().unwrap();
             g.insert(
                 group,
                 GroupApp {
@@ -353,8 +418,10 @@ impl<S: StateMachine> MultiRaft<S> {
             registered_at = tokio::time::Instant::now();
         }
 
-        self.spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
-        self.spawn_standby_throttle_watch(raft, self.standby_throttle.clone());
+        if !quarantine {
+            self.spawn_leader_watch(group, raft.clone(), self.leader_cbs.clone());
+            self.spawn_standby_throttle_watch(group, raft, self.standby_throttle.clone());
+        }
         tracing::info!(
             target: "multiraft::recovery",
             operation = "group_start",
@@ -396,7 +463,9 @@ impl<S: StateMachine> MultiRaft<S> {
             return;
         }
         let local_node_id = self.node_id;
-        self.tasks.spawn(async move {
+        let owner = self.group_owner(group);
+        let mut stopping = owner.stopping();
+        owner.watchers.spawn(async move {
             let mut rx = raft.metrics();
             let mut last: Option<(Option<NodeId>, crate::VoteObservation)> = None;
             loop {
@@ -420,15 +489,22 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                 }
                 last = Some((cur, vote));
-                if rx.changed().await.is_err() { break; }
+                tokio::select! { _ = stopping.changed() => break, result = rx.changed() => if result.is_err() { break; } }
             }
         });
     }
 
     /// Keep standby throttle in sync with committed learner membership so every
     /// potential leader throttles dynamically added Standbys after failover.
-    pub(super) fn spawn_standby_throttle_watch(&self, raft: Raft<S>, throttle: StandbyThrottle) {
-        self.tasks.spawn(async move {
+    pub(super) fn spawn_standby_throttle_watch(
+        &self,
+        group: GroupId,
+        raft: Raft<S>,
+        throttle: StandbyThrottle,
+    ) {
+        let owner = self.group_owner(group);
+        let mut stopping = owner.stopping();
+        owner.watchers.spawn(async move {
             let mut rx = raft.metrics();
             let mut last_learners: Option<BTreeSet<NodeId>> = None;
             loop {
@@ -446,9 +522,7 @@ impl<S: StateMachine> MultiRaft<S> {
                     }
                     last_learners = Some(learners);
                 }
-                if rx.changed().await.is_err() {
-                    break;
-                }
+                tokio::select! { _ = stopping.changed() => break, result = rx.changed() => if result.is_err() { break; } }
             }
         });
     }

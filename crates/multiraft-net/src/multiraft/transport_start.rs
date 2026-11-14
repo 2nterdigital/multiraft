@@ -8,9 +8,14 @@ impl<S: StateMachine> MultiRaft<S> {
         glue: ClusterGlue,
         factory: Arc<dyn StateMachineFactory<S>>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.raft_transport_fingerprint.is_none() && config.transport.is_none(),
+            "fingerprinted or overridden Raft transport requires gRPC"
+        );
         config
             .validate_snapshot_storage()
             .map_err(anyhow::Error::msg)?;
+        recovery::check_node_log(&config)?;
         let groups: GroupMap<S> = Arc::new(Mutex::new(BTreeMap::new()));
         let (node, _tx) = Node::with_groups(config.node_id, router.clone(), groups.clone());
         let tasks = tasks::OwnedTasks::default();
@@ -26,10 +31,17 @@ impl<S: StateMachine> MultiRaft<S> {
         Ok(Self {
             node_id: config.node_id,
             config,
+            rocks_log_db: Arc::new(Mutex::new(None)),
+            log_opening: Arc::new(tokio::sync::Mutex::new(false)),
+            log_open_tasks: tasks::OwnedTasks::default(),
             net: NetBackend::InProcess { router, glue },
             groups,
+            quarantined_groups: Arc::new(Mutex::new(BTreeMap::new())),
             tasks,
             control_slot: tokio::sync::Semaphore::new(1),
+            group_owners: Mutex::new(BTreeMap::new()),
+            controlled_publication: Mutex::new(None),
+            controlled_construction: tokio::sync::RwLock::new(()),
             leader_watch_groups: Mutex::new(BTreeSet::new()),
             fsm_releases: Mutex::new(Vec::new()),
             construction_recovery: Mutex::new(BTreeMap::new()),
@@ -65,6 +77,12 @@ impl<S: StateMachine> MultiRaft<S> {
                 )
             })?;
 
+        if let Some(transport) = &config.transport {
+            transport
+                .validate(&config.peers)
+                .map_err(anyhow::Error::msg)?;
+        }
+        recovery::check_node_log(&config)?;
         let groups: GroupMap<S> = Arc::new(Mutex::new(BTreeMap::new()));
         let grpc_router = GrpcRouter::from_config(&config);
         let standby_throttle = grpc_router.throttle().clone();
@@ -72,7 +90,15 @@ impl<S: StateMachine> MultiRaft<S> {
 
         let groups_for_server = groups.clone();
         let snapshot_cap = config.max_snapshot_bytes;
-        let listener = tokio::net::TcpListener::bind(self_addr).await?;
+        let protocol = crate::grpc::server::IngressProtocol {
+            fingerprint: config.raft_transport_fingerprint,
+            controlled_groups: grpc_router.controlled_groups(),
+        };
+        let bind = config
+            .transport
+            .as_ref()
+            .map_or(self_addr, |t| t.listen_address);
+        let listener = tokio::net::TcpListener::bind(bind).await?;
         let tasks = tasks::OwnedTasks::default();
         let ingress_tasks = Arc::new(tasks::OwnedTasks::default());
         let ingress_accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -80,12 +106,13 @@ impl<S: StateMachine> MultiRaft<S> {
         let service_tasks = ingress_tasks.clone();
         let service_accepting = ingress_accepting.clone();
         tasks.spawn_result(async move {
-            GrpcServer::serve_owned(
+            GrpcServer::serve_owned_protocol(
                 listener,
                 groups_for_server,
                 snapshot_cap,
                 service_tasks,
                 service_accepting,
+                protocol,
                 async move {
                     let _ = stopped.await;
                 },
@@ -96,12 +123,19 @@ impl<S: StateMachine> MultiRaft<S> {
         Ok(Self {
             node_id: config.node_id,
             config,
+            rocks_log_db: Arc::new(Mutex::new(None)),
+            log_opening: Arc::new(tokio::sync::Mutex::new(false)),
+            log_open_tasks: tasks::OwnedTasks::default(),
             net: NetBackend::Grpc {
                 router: grpc_router,
             },
             groups,
+            quarantined_groups: Arc::new(Mutex::new(BTreeMap::new())),
             tasks,
             control_slot: tokio::sync::Semaphore::new(1),
+            group_owners: Mutex::new(BTreeMap::new()),
+            controlled_publication: Mutex::new(None),
+            controlled_construction: tokio::sync::RwLock::new(()),
             leader_watch_groups: Mutex::new(BTreeSet::new()),
             fsm_releases: Mutex::new(Vec::new()),
             construction_recovery: Mutex::new(BTreeMap::new()),

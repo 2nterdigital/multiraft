@@ -274,3 +274,71 @@ async fn closed_pool_fences_lease_publication_and_retains_typed_identity() {
     drop(lease);
     server.shutdown().await;
 }
+
+fn carrier(version: u64, peer: u64, address: SocketAddr) -> multiraft_net::CarrierCatalog {
+    multiraft_net::CarrierCatalog {
+        version,
+        scope: None,
+        peers: vec![multiraft_net::CarrierPeer {
+            node_id: peer,
+            identity: vec![peer as u8],
+            raft: address,
+            application_rpc: "127.0.0.1:1".parse().unwrap(),
+        }],
+    }
+}
+#[tokio::test]
+async fn catalog_address_replacement_routes_existing_pool_clients_and_fences_old_lease_failure() {
+    let old_server = TestNodeRpcServer::start(vec![8]).await;
+    let new_server = TestNodeRpcServer::start(vec![9]).await;
+    let pool = GrpcPeerChannelPool::new(vec![(4, old_server.addr())]);
+    pool.install_carrier_catalog(&carrier(1, 4, old_server.addr()))
+        .unwrap();
+    let old = pool.lease(4).await.unwrap();
+    assert_eq!(call_marker(old.channel()).await, vec![8]);
+    pool.install_carrier_catalog(&carrier(2, 4, new_server.addr()))
+        .unwrap();
+    let fresh = pool.lease(4).await.unwrap();
+    assert_eq!(fresh.catalog_version(), 2);
+    assert_eq!(call_marker(fresh.channel()).await, vec![9]);
+    assert!(
+        !pool.invalidate(&old),
+        "old endpoint failure cannot evict the new catalog's connection"
+    );
+    assert_eq!(
+        pool.lease(4).await.unwrap().generation(),
+        fresh.generation()
+    );
+    pool.shutdown().await;
+    drop((old, fresh));
+    old_server.shutdown().await;
+    new_server.shutdown().await;
+}
+#[tokio::test]
+async fn configured_dial_override_survives_only_an_unchanged_advertised_address() {
+    use multiraft_net::CarrierService;
+    let old_server = TestNodeRpcServer::start(vec![8]).await;
+    let new_server = TestNodeRpcServer::start(vec![9]).await;
+    let advertised = SocketAddr::from(([127, 0, 0, 2], old_server.addr().port()));
+    let pool = GrpcPeerChannelPool::with_carrier_config(
+        vec![(4, advertised)],
+        Some(vec![(4, old_server.addr().to_string())]),
+        None,
+        CarrierService::Raft,
+    );
+    pool.install_carrier_catalog(&carrier(1, 4, advertised))
+        .unwrap();
+    assert_eq!(
+        call_marker(pool.lease(4).await.unwrap().channel()).await,
+        vec![8]
+    );
+    pool.install_carrier_catalog(&carrier(2, 4, new_server.addr()))
+        .unwrap();
+    assert_eq!(
+        call_marker(pool.lease(4).await.unwrap().channel()).await,
+        vec![9]
+    );
+    pool.shutdown().await;
+    old_server.shutdown().await;
+    new_server.shutdown().await;
+}

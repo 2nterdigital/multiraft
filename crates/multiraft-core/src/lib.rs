@@ -12,10 +12,16 @@ mod startup;
 pub use startup::{
     InitializationLogId, InitializationVote, InitializeDisposition, StartupProvenance,
 };
+mod native_control;
 mod type_config;
+pub use native_control::{
+    ControlRejection, ControlReply, NativeControl, NativeLedger, OperationId, OperationRecord,
+    ReplacementSpec, TargetOpenReceipt, TerminalProof,
+};
 
 pub use config::ClusterConfig;
 pub use config::FileLogSyncLevel;
+pub use config::LogStorageBackend;
 pub use config::NodeRole;
 pub use config::SnapshotMode;
 pub use error::MultiRaftError;
@@ -40,3 +46,6 @@ pub use error::{
     NativeFailure, ProposalError, ProposalFailure, ReadIndexFailure, RecoveryError,
     RecoveryFailure, RecoveryStage,
 };
+
+mod transport;
+pub use transport::{valid_dial_address, validate_dial_catalog, RaftTransportConfig};

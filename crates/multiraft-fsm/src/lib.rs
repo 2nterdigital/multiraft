@@ -1,10 +1,35 @@
 //! Pluggable state machine for multiraft.
 
 mod counter_fsm;
+mod disk;
 pub use counter_fsm::CounterFsm;
+pub use disk::{
+    AppliedState, ColumnFamilyMemoryStats, DiskState, DiskStoragePaths, SharedStorageMemoryStats,
+    StorageMemoryStats,
+};
 
 pub type GroupId = u64;
 pub type NodeId = u64;
+
+/// The actual application generation frozen for external recovery validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationContext {
+    pub group_id: GroupId,
+    pub generation: u64,
+    pub applied: Option<(u64, u64)>,
+    pub kind: ValidationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationKind {
+    Startup,
+    PeerInstall,
+}
+
+/// Own all inputs and remote resources. Dropping this future must cancel and
+/// release its work; do not detach tasks or perform remote IO in `apply`.
+pub type ValidationFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOut {
@@ -33,6 +58,31 @@ pub trait StateMachine: Send + 'static {
     fn snapshot(&self, group: GroupId) -> Result<Vec<u8>, Self::Error>;
 
     fn restore(&mut self, group: GroupId, snapshot: &[u8]) -> Result<(), Self::Error>;
+
+    /// `Some` selects disk-backed mode ([`DiskState`]) for this state machine's
+    /// whole lifetime; the default `None` keeps whole-image snapshots.
+    fn disk_state(&mut self) -> Option<&mut dyn DiskState> {
+        None
+    }
+
+    /// Opt into gating reads/capture from construction until startup validation.
+    fn requires_recovery_validation(&self) -> bool {
+        false
+    }
+
+    /// Freeze bounded, owned validation inputs from this exact restored image.
+    /// Called under the brief FSM lock; the returned future runs outside it.
+    /// Startup includes the committed suffix; peer install includes its candidate.
+    fn recovery_validation(&self, _context: ValidationContext) -> Option<ValidationFuture> {
+        None
+    }
+
+    /// Prepare a consumer readiness marker after proof and local checks succeed.
+    /// Rejection precedes new provider publication. The bridge keeps business
+    /// access gated until publication completes. This hook cannot wait on IO.
+    fn recovery_validated(&mut self, _context: ValidationContext) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Capture within the supplied byte bound, checking while constructing bytes.
     /// The default refuses without calling the legacy unbounded serializer.

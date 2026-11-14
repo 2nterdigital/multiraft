@@ -1,0 +1,20 @@
+[package]
+name = "multiraft-slot-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "multiraft-slot-demo"
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+multiraft-fsm = { path = "../multiraft-fsm" }
+multiraft-net = { path = "../multiraft-net" }
+multiraft-slot = { path = "../multiraft-slot" }
+multiraft-store = { path = "../multiraft-store" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

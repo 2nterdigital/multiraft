@@ -1,6 +1,10 @@
 //! Native generations extend the existing catalog. Standby entries remain isolated.
+mod lifecycle;
 use super::{hex_sha256, write_fsync, SnapshotCatalog};
 use crate::durability::sync_dir;
+pub(super) use lifecycle::shared_registry;
+pub(super) use lifecycle::NativeStageRegistry;
+use lifecycle::TemporaryGeneration;
 use multiraft_core::TypeConfig;
 use multiraft_fsm::GroupId;
 use openraft::alias::SnapshotMetaOf;
@@ -9,10 +13,12 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 const VERSION: u32 = 1;
 const META_LIMIT: usize = 1024 * 1024;
 const BYTE_LIMIT: usize = 64 * 1024 * 1024;
+const NAMESPACE_ENTRY_LIMIT: usize = 64;
 static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -48,13 +54,17 @@ struct Active {
 }
 
 /// A fully synced candidate which has not yet become recovery authority.
-/// Dropping this value leaves an inert generation; it never activates implicitly.
+/// Dropping the last candidate owner discards its inactive generation. Active
+/// generations are protected; candidates never activate implicitly.
 pub struct NativeSnapshotStage {
     group: GroupId,
     root: PathBuf,
     active: Active,
     meta: SnapshotMetaOf<TypeConfig>,
     max_bytes: usize,
+    lifecycle: Arc<Mutex<NativeStageRegistry>>,
+    released: bool,
+    _admission: tokio::sync::OwnedSemaphorePermit,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -104,30 +114,41 @@ fn validate_meta(meta: &SnapshotMetaOf<TypeConfig>) -> io::Result<()> {
 
 impl SnapshotCatalog {
     /// Validate the complete Group snapshot namespace before native construction.
-    /// Fully validated inactive generations remain inert; unknown/incomplete
-    /// namespaces fail closed and are never promoted to recovery authority.
+    /// Fully validated ownerless generations are discarded after the complete
+    /// namespace validates. Unknown/incomplete namespaces fail closed without
+    /// mutation. At most 64 entries are scanned, bounding diagnostic work.
     pub fn startup_provenance(
         &self,
         group: GroupId,
         max_bytes: usize,
     ) -> io::Result<multiraft_core::StartupProvenance> {
         use multiraft_core::StartupProvenance;
+        check_cap(max_bytes)?;
+        let mut registry = self
+            .native_activation
+            .lock()
+            .map_err(|_| invalid("snapshot activation poisoned"))?;
         self.validate_native_paths(group)?;
         let group_root = self.root.join(group.to_string());
         let entries = match fs::read_dir(&group_root) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(StartupProvenance::Pristine)
+                registry.cleanup_completed(group);
+                return Ok(StartupProvenance::Pristine);
             }
             Err(e) => return Err(e),
         };
-        let mut persisted = false;
+        let mut inactive = Vec::new();
+        let mut pending_path = None;
         for entry in entries {
             let entry = entry?;
             if entry.file_name() != "native-v1" || !entry.file_type()?.is_dir() {
                 return Err(invalid("unrecognized native snapshot namespace"));
             }
-            for native in fs::read_dir(entry.path())? {
+            for (ordinal, native) in fs::read_dir(entry.path())?.enumerate() {
+                if ordinal >= NAMESPACE_ENTRY_LIMIT {
+                    return Err(invalid("native snapshot namespace exceeds entry budget"));
+                }
                 let native = native?;
                 let name = native.file_name();
                 let name = name
@@ -141,6 +162,7 @@ impl SnapshotCatalog {
                         serde_json::from_slice(&bounded_read(&native.path(), META_LIMIT)?)
                             .map_err(io::Error::other)?;
                     self.read_native_generation(group, max_bytes, &entry.path(), &pending)?;
+                    pending_path = Some(native.path());
                     continue;
                 }
                 if !native.file_type()?.is_dir()
@@ -168,10 +190,50 @@ impl SnapshotCatalog {
                     metadata_sha256: hex_sha256(&metadata),
                 };
                 self.read_native_generation(group, max_bytes, &entry.path(), &candidate)?;
+                inactive.push((name.to_owned(), native.path()));
             }
-            let info = self.describe_native(group, max_bytes)?;
-            persisted |= info.is_some();
         }
+        // Validate authority last and only then remove anything. A failed scan
+        // preserves all diagnostic bytes, including valid inert candidates.
+        let persisted = self.load_native_unlocked(group, max_bytes)?.is_some();
+        let root = self.native_root(group);
+        let active = if persisted {
+            Some(
+                serde_json::from_slice::<Active>(&bounded_read(
+                    &root.join("active.json"),
+                    META_LIMIT,
+                )?)
+                .map_err(io::Error::other)?,
+            )
+        } else {
+            None
+        };
+        if !persisted {
+            // Missing authority may be a damaged committed recovery basis, not
+            // an abandoned first candidate. Preserve its bytes for native log
+            // coverage checks and exact repair; the namespace budget still applies.
+            return Ok(StartupProvenance::Pristine);
+        }
+        let mut removed = false;
+        if let Some(path) = pending_path {
+            fs::remove_file(path)?;
+            removed = true;
+        }
+        for (generation, path) in inactive {
+            if active
+                .as_ref()
+                .is_some_and(|active| active.generation == generation)
+                || registry.owns(group, &generation)
+            {
+                continue;
+            }
+            fs::remove_dir_all(path)?;
+            removed = true;
+        }
+        if removed {
+            sync_dir(&root)?;
+        }
+        registry.cleanup_completed(group);
         Ok(if persisted {
             StartupProvenance::Persisted
         } else {
@@ -367,7 +429,27 @@ impl SnapshotCatalog {
         }
         let generation = hex_sha256(&metadata_bytes);
         let root = self.native_root(group);
+        let mut registry = self
+            .native_activation
+            .lock()
+            .map_err(|_| invalid("snapshot activation poisoned"))?;
+        let admission = registry.admit(group)?;
         self.validate_native_paths(group)?;
+        // Refuse new staging while a manifest is unreadable. Its diagnostic
+        // bytes must survive, and failed cleanup must not accumulate candidates.
+        for name in ["active.json", "active.pending"] {
+            let bytes = match bounded_read(&root.join(name), META_LIMIT) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let active: Active = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            self.read_native_metadata(group, max_bytes, &root, &active)?;
+        }
+        let cleanup_failed = registry.cleanup_flag(group);
+        drop(registry);
+        // Admission covers incomplete writes, but readers of the old active
+        // generation do not wait for candidate data IO or its fsync.
         fs::create_dir_all(&root)?;
         // Persist every new directory component down to the caller-owned root.
         sync_dir(&root)?;
@@ -382,16 +464,22 @@ impl SnapshotCatalog {
             NEXT_STAGE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&stage)?;
+        let mut temporary = TemporaryGeneration {
+            path: Some(stage.clone()),
+            cleanup_failed,
+        };
         write_fsync(&stage.join("data.bin"), data)?;
         tracing::debug!(target: "multiraft::native_catalog", phase = "data_synced", "native snapshot publication");
         write_fsync(&stage.join("native-meta.json"), &metadata_bytes)?;
         tracing::debug!(target: "multiraft::native_catalog", phase = "metadata_synced", "native snapshot publication");
         sync_dir(&stage)?;
         tracing::debug!(target: "multiraft::native_catalog", phase = "generation_synced", "native snapshot publication");
-        let _guard = self
+        let mut registry = self
             .native_activation
             .lock()
             .map_err(|_| invalid("snapshot activation poisoned"))?;
+        registry.ensure_clean(group)?;
+        self.validate_native_paths(group)?;
         let final_dir = root.join(&generation);
         if final_dir.exists() {
             // Content addressing never permits overwriting an immutable generation.
@@ -401,12 +489,16 @@ impl SnapshotCatalog {
                 return Err(invalid("existing snapshot generation is corrupt"));
             }
             fs::remove_dir_all(&stage)?;
+            temporary.path = None;
         } else {
             fs::rename(&stage, &final_dir)?;
         }
-        sync_dir(&root)?;
-        tracing::debug!(target: "multiraft::native_catalog", phase = "generation_published", "native snapshot publication");
-        Ok(NativeSnapshotStage {
+        // Reference ownership starts before dropping publication's lock. If
+        // directory sync then fails, Stage::drop cannot delete a generation
+        // already acquired or activated by another equal-content candidate.
+        registry.acquire(group, &generation);
+        temporary.path = None;
+        let staged = NativeSnapshotStage {
             group,
             root,
             active: Active {
@@ -417,14 +509,23 @@ impl SnapshotCatalog {
             },
             meta: meta.clone(),
             max_bytes,
-        })
+            lifecycle: self.native_activation.clone(),
+            released: false,
+            _admission: admission,
+        };
+        drop(registry);
+        sync_dir(&staged.root)?;
+        tracing::debug!(target: "multiraft::native_catalog", phase = "generation_published", "native snapshot publication");
+        Ok(staged)
     }
 
     pub fn activate_native(&self, staged: NativeSnapshotStage) -> io::Result<()> {
-        if staged.root != self.native_root(staged.group) {
+        if staged.root != self.native_root(staged.group)
+            || !Arc::ptr_eq(&staged.lifecycle, &self.native_activation)
+        {
             return Err(invalid("foreign snapshot stage"));
         }
-        let _guard = self
+        let mut registry = self
             .native_activation
             .lock()
             .map_err(|_| invalid("snapshot activation poisoned"))?;
@@ -457,15 +558,32 @@ impl SnapshotCatalog {
         tracing::debug!(target: "multiraft::native_catalog", phase = "manifest_synced", "native snapshot publication");
         fs::rename(&pending, staged.root.join("active.json"))?;
         tracing::debug!(target: "multiraft::native_catalog", phase = "manifest_renamed", "native snapshot publication");
-        sync_dir(&staged.root)?;
+        if let Err(error) = sync_dir(&staged.root) {
+            registry
+                .cleanup_flag(staged.group)
+                .store(true, Ordering::Release);
+            return Err(error);
+        }
         tracing::debug!(target: "multiraft::native_catalog", phase = "active_synced", "native snapshot publication");
         // Readers share activation's lock and return owned bytes. No live reader
         // holds a file after this point. Other staged generations are untouched.
         if let Some(previous) = previous {
-            if previous.generation != staged.active.generation {
-                fs::remove_dir_all(staged.root.join(previous.generation))?;
+            if previous.generation != staged.active.generation
+                && !registry.owns(staged.group, &previous.generation)
+            {
+                if let Err(error) = fs::remove_dir_all(staged.root.join(previous.generation)) {
+                    registry
+                        .cleanup_flag(staged.group)
+                        .store(true, Ordering::Release);
+                    return Err(error);
+                }
                 tracing::debug!(target: "multiraft::native_catalog", phase = "obsolete_removed", "native snapshot publication");
-                sync_dir(&staged.root)?;
+                if let Err(error) = sync_dir(&staged.root) {
+                    registry
+                        .cleanup_flag(staged.group)
+                        .store(true, Ordering::Release);
+                    return Err(error);
+                }
             }
         }
         Ok(())

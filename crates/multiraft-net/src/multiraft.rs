@@ -54,6 +54,7 @@ use crate::GroupControlRequestResult;
 use crate::StateMachineFactory;
 use multiraft_core::ClusterConfig;
 use multiraft_core::GroupId;
+use multiraft_core::LogStorageBackend;
 use multiraft_core::MultiRaftError;
 use multiraft_core::NodeId;
 use multiraft_core::NodeRole;
@@ -77,6 +78,7 @@ use multiraft_store::SmOptions;
 use multiraft_store::SnapshotCatalog;
 use multiraft_store::StateMachineStore;
 use multiraft_store::TriggerCb;
+use multiraft_store::{NativeRaftLogStore, RocksLogDb};
 use openraft::async_runtime::WatchReceiver;
 use openraft::error::InitializeError;
 use openraft::error::RaftError;
@@ -89,7 +91,15 @@ use openraft::ReadPolicy;
 #[cfg(test)]
 use tokio::sync::Notify;
 
+mod authority;
+pub use authority::{LocalAuthoritativeMembership, LocalAuthorityError};
 mod application;
+mod carriers;
+mod controlled;
+pub use controlled::{
+    ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,
+    ControlledSeed, ControlledTerminal, ManagedGenesisBasis,
+};
 mod control;
 mod election_source;
 mod group_start;
@@ -200,10 +210,17 @@ enum NetBackend {
 pub struct MultiRaft<S: StateMachine = CounterFsm> {
     node_id: NodeId,
     config: ClusterConfig,
+    rocks_log_db: Arc<Mutex<Option<RocksLogDb<TypeConfig>>>>,
+    log_opening: Arc<tokio::sync::Mutex<bool>>,
+    log_open_tasks: tasks::OwnedTasks,
     net: NetBackend,
     groups: GroupMap<S>,
+    quarantined_groups: GroupMap<S>,
     tasks: tasks::OwnedTasks,
     control_slot: tokio::sync::Semaphore,
+    group_owners: Mutex<BTreeMap<GroupId, Arc<controlled::GroupOwner>>>,
+    controlled_publication: Mutex<Option<controlled::Publication>>,
+    controlled_construction: tokio::sync::RwLock<()>,
     leader_watch_groups: Mutex<BTreeSet<GroupId>>,
     fsm_releases: Mutex<Vec<multiraft_store::StateMachineRelease>>,
     // Immutable native storage basis captured before successful Group construction.
@@ -638,4 +655,9 @@ where
 }
 
 #[cfg(test)]
+mod read_quorum_tests;
+#[cfg(test)]
 mod tests;
+
+/// Portable native target transport and untrusted wire protocol.
+pub use controlled::portable;

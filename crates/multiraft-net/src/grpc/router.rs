@@ -1,5 +1,4 @@
 //! Native RPC adapter over shared generation-aware channels; Raft owns retries.
-use crate::encode;
 use crate::grpc::proto::{raft_service_client::RaftServiceClient, RaftRequest};
 use crate::grpc::{GrpcPeerChannelError, GrpcPeerChannelPool};
 use crate::standby_throttle::StandbyThrottle;
@@ -13,8 +12,11 @@ use openraft::raft::{
 };
 use openraft::OptionalSend;
 use openraft_multi::GroupRouter;
+use std::collections::BTreeSet;
+use std::sync::RwLock;
 use std::{fmt, future::Future, net::SocketAddr, sync::Arc};
 
+mod disk_snapshot_send;
 mod snapshot_send;
 use snapshot_send::SnapshotSender;
 
@@ -24,6 +26,7 @@ enum SendCause {
     Rpc(Box<tonic::Status>),
     Native(typ::RaftError),
     InvalidResponse(bincode::Error),
+    Json(serde_json::Error),
     Closed,
     Deadline { dispatched: bool },
 }
@@ -53,6 +56,7 @@ impl std::error::Error for SendFailure {
             SendCause::Rpc(error) => Some(error.as_ref()),
             SendCause::Native(error) => Some(error),
             SendCause::InvalidResponse(error) => Some(error.as_ref()),
+            SendCause::Json(error) => Some(error),
             SendCause::Closed | SendCause::Deadline { .. } => None,
         }
     }
@@ -64,6 +68,7 @@ impl SendFailure {
             SendCause::Rpc(_) => "rpc",
             SendCause::Native(_) => "native",
             SendCause::InvalidResponse(_) => "invalid_response",
+            SendCause::Json(_) => "json_encoding",
             SendCause::Closed => "closed",
             SendCause::Deadline { dispatched: false } => "deadline_before_dispatch",
             SendCause::Deadline { dispatched: true } => "deadline_unconfirmed",
@@ -78,6 +83,7 @@ struct RpcTransport {
     channels: GrpcPeerChannelPool,
     throttle: StandbyThrottle,
     snapshot_cap: usize,
+    fingerprint: Option<[u8; 32]>,
 }
 impl RpcTransport {
     async fn send<Req, Resp>(
@@ -125,22 +131,33 @@ impl RpcTransport {
                     .max_decoding_message_size(self.snapshot_cap + 1024 * 1024);
             }
             let result = with_deadline(deadline, true, async {
-                let payload = encode(&req);
+                let json = method == super::controlled_append::PATH;
+                let payload = if json {
+                    serde_json::to_vec(&req).map_err(SendCause::Json)?
+                } else {
+                    bincode::serialize(&req).map_err(SendCause::InvalidResponse)?
+                };
                 if deadline.is_some_and(|at| tokio::time::Instant::now() >= at) {
                     return Err(SendCause::Deadline { dispatched: false });
                 }
+                let mut request = tonic::Request::new(RaftRequest {
+                    group_id: group,
+                    path: method.to_owned(),
+                    payload,
+                });
+                super::fingerprint::insert(request.metadata_mut(), self.fingerprint);
                 let response = client
-                    .call(RaftRequest {
-                        group_id: group,
-                        path: method.to_owned(),
-                        payload,
-                    })
+                    .call(request)
                     .await
                     .map_err(|error| SendCause::Rpc(Box::new(error)))?;
-                let result = bincode::deserialize::<Result<Resp, typ::RaftError>>(
-                    &response.into_inner().payload,
-                )
-                .map_err(SendCause::InvalidResponse)?;
+                super::fingerprint::validate(response.metadata(), self.fingerprint)
+                    .map_err(|error| SendCause::Rpc(Box::new(error)))?;
+                let payload = response.into_inner().payload;
+                let result: Result<Resp, typ::RaftError> = if json {
+                    serde_json::from_slice(&payload).map_err(SendCause::Json)?
+                } else {
+                    bincode::deserialize(&payload).map_err(SendCause::InvalidResponse)?
+                };
                 result.map_err(SendCause::Native)
             })
             .await;
@@ -189,6 +206,7 @@ pub struct GrpcRouter {
     self_id: NodeId,
     transport: RpcTransport,
     snapshot_sender: Arc<SnapshotSender>,
+    controlled_groups: Arc<RwLock<BTreeSet<GroupId>>>,
 }
 impl GrpcRouter {
     pub fn new(peers: Vec<(NodeId, SocketAddr)>, self_id: NodeId) -> Self {
@@ -205,8 +223,10 @@ impl GrpcRouter {
                 channels: GrpcPeerChannelPool::new(peers),
                 throttle,
                 snapshot_cap: 64 * 1024 * 1024,
+                fingerprint: None,
             },
             snapshot_sender: Arc::new(SnapshotSender::default()),
+            controlled_groups: Arc::default(),
         }
     }
     pub fn from_config(config: &ClusterConfig) -> Self {
@@ -215,8 +235,53 @@ impl GrpcRouter {
             config.node_id,
             StandbyThrottle::from_config(config),
         );
+        router.transport.channels = GrpcPeerChannelPool::with_carrier_config(
+            config.peers.clone(),
+            config
+                .transport
+                .as_ref()
+                .map(|transport| transport.peers.clone()),
+            config.raft_transport_fingerprint,
+            crate::CarrierService::Raft,
+        );
         router.transport.snapshot_cap = config.max_snapshot_bytes;
+        router.transport.fingerprint = config.raft_transport_fingerprint;
         router
+    }
+    /// Permanently select the versioned control-capable protocol for this group.
+    pub(crate) fn install_carrier_catalog(
+        &self,
+        catalog: &crate::CarrierCatalog,
+    ) -> Result<crate::CarrierInstall, crate::CarrierError> {
+        self.transport.channels.install_carrier_catalog(catalog)
+    }
+    pub(crate) fn carrier_catalog(
+        &self,
+    ) -> Result<Option<crate::CarrierCatalog>, crate::CarrierError> {
+        self.transport.channels.carrier_catalog()
+    }
+    pub(crate) fn peer_carrier_address(&self, peer: NodeId) -> Option<SocketAddr> {
+        self.transport.channels.peer_address(peer)
+    }
+    pub(crate) fn fence_carrier_installs(&self) {
+        self.transport.channels.fence_carrier_installs();
+    }
+    /// Unsupported peers are rejected; no binary fallback is attempted.
+    pub fn enable_controlled_group(&self, group: GroupId) {
+        self.controlled_groups
+            .write()
+            .expect("controlled transport lock poisoned")
+            .insert(group);
+    }
+
+    pub(crate) async fn join_group_sends(&self, group: GroupId) -> anyhow::Result<()> {
+        self.snapshot_sender.join_group(group).await
+    }
+    pub(crate) fn reopen_group_sends(&self, group: GroupId) {
+        self.snapshot_sender.reopen_group(group);
+    }
+    pub(crate) fn controlled_groups(&self) -> Arc<RwLock<BTreeSet<GroupId>>> {
+        self.controlled_groups.clone()
     }
     pub fn self_id(&self) -> NodeId {
         self.self_id
@@ -255,8 +320,15 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
+        let controlled = self.controlled_groups.read().expect("controlled transport lock poisoned").contains(&group_id)
+            || rpc.entries.iter().any(|entry| matches!(&entry.payload, openraft::EntryPayload::Normal(request) if request.control.is_some()));
+        let path = if controlled {
+            super::controlled_append::PATH
+        } else {
+            "/raft/append"
+        };
         self.transport
-            .send(target, group_id, "/raft/append", rpc, None)
+            .send(target, group_id, path, rpc, None)
             .await
             .map_err(RPCError::Unreachable)
     }
@@ -320,3 +392,7 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
 #[cfg(test)]
 #[path = "../../tests/native_transport_owner/mod.rs"]
 mod ownership_tests;
+
+#[cfg(test)]
+#[path = "../../tests/controlled_append_transport/wire.rs"]
+mod controlled_append_tests;

@@ -1,5 +1,6 @@
 //! Durable-native builder/install seams; application lock never spans filesystem IO.
 use super::*;
+mod install;
 use multiraft_fsm::{CaptureError, CaptureRefusal};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -11,8 +12,8 @@ pub struct NativeSmOptions {
     pub build_budget: Arc<Semaphore>,
 }
 
-pub(super) struct NativeRuntime {
-    options: NativeSmOptions,
+pub(in crate::sm_bridge) struct NativeRuntime {
+    pub(in crate::sm_bridge) options: NativeSmOptions,
     closing: std::sync::atomic::AtomicBool,
     group_budget: Arc<Semaphore>,
     transition: tokio::sync::Mutex<()>,
@@ -20,12 +21,58 @@ pub(super) struct NativeRuntime {
     pending: std::sync::Mutex<Option<Capture>>,
 }
 
-struct Capture {
-    meta: SnapshotMetaOf<TypeConfig>,
+pub(in crate::sm_bridge) struct Capture {
+    pub(in crate::sm_bridge) meta: SnapshotMetaOf<TypeConfig>,
     data: Vec<u8>,
     _permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
     already_durable: bool,
     completion: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Disk mode: the captured checkpoint, published by the builder.
+    disk: Option<crate::disk_snapshot::TempCheckpoint>,
+}
+
+type BuildPermits = (OwnedSemaphorePermit, OwnedSemaphorePermit);
+
+impl Capture {
+    pub(in crate::sm_bridge) fn disk(
+        meta: SnapshotMetaOf<TypeConfig>,
+        checkpoint: crate::disk_snapshot::TempCheckpoint,
+        permits: BuildPermits,
+    ) -> Self {
+        Self {
+            meta,
+            data: Vec::new(),
+            _permits: Some(permits),
+            already_durable: false,
+            completion: None,
+            disk: Some(checkpoint),
+        }
+    }
+
+    /// Tell a reserved compaction that its build finished.
+    pub(in crate::sm_bridge) fn complete(&mut self) {
+        if let Some(sender) = self.completion.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+impl NativeRuntime {
+    /// Node-wide, then per-Group heavy build admission.
+    pub(in crate::sm_bridge) fn admit(&self) -> Result<BuildPermits, CaptureRefusal> {
+        let node = self
+            .options
+            .build_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CaptureRefusal::Busy)?;
+        let group = self
+            .group_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| CaptureRefusal::Busy)?;
+        Ok((node, group))
+    }
 }
 
 /// Disposable observation of one reserved native build, never persisted intent.
@@ -79,12 +126,14 @@ impl<S: StateMachine> StateMachineStore<S> {
 
     /// Close new native snapshot intake while allowing already-started transitions to finish.
     pub fn close_native_intake(&self) {
+        self.validation.close();
         if let Some(native) = &self.native {
             native
                 .closing
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             native.pending.lock().unwrap().take();
         }
+        self.disk_rt.incoming.lock().unwrap().take();
     }
 
     pub(super) fn native_is_closing(&self) -> bool {
@@ -93,12 +142,25 @@ impl<S: StateMachine> StateMachineStore<S> {
             .is_some_and(|native| native.closing.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    /// Called after native core shutdown; wait for owned transition/capture work.
+    /// Wait for admitted transition, capture and receive work to finish.
+    /// Closing owners also drain staged transfers; open owners preserve them for install.
     pub async fn wait_native_quiescent(&self) {
-        if let Some(native) = &self.native {
-            let _transition = native.transition.lock().await;
-            let _application = self.inner.lock().await;
+        let _validation = self.validation.transition.lock().await;
+        let _work = self.validation.work.clone().acquire_owned().await;
+        let _transition = match &self.native {
+            Some(native) => Some(native.transition.lock().await),
+            None => None,
+        };
+        let _disk = self.disk_rt.transition.lock().await;
+        let _receiving = self.disk_rt.receiving.lock().await;
+        // A receive/verification admitted before close may have restored its
+        // transfer after close's first drain. No receiver can restore it now.
+        if self.native_is_closing() {
+            let incoming = self.disk_rt.incoming.lock().unwrap().take();
+            drop(incoming);
         }
+        self.disk_rt.cleanup.wait().await;
+        let _application = self.inner.lock().await;
     }
 
     pub fn snapshot_capture_refusal(&self) -> Option<CaptureRefusal> {
@@ -108,13 +170,21 @@ impl<S: StateMachine> StateMachineStore<S> {
     }
 
     pub(super) async fn prepare_builder(&self, force: bool) -> Option<SnapshotBuilder<S>> {
+        if self.disk && (self.native.is_none() || !self.disk_snapshots_supported().await) {
+            // Disk snapshots need the durable native runtime (NativeDurable)
+            // and an FSM implementing the DiskState snapshot hooks.
+            return force.then(|| SnapshotBuilder {
+                store: self.clone(),
+                capture: Some(Err(super::disk::unsupported("snapshot"))),
+            });
+        }
         let Some(native) = &self.native else {
             return Some(SnapshotBuilder {
                 store: self.clone(),
                 capture: None,
             });
         };
-        if self.native_is_closing() {
+        if self.native_is_closing() || self.validation.readable().is_err() {
             return if force {
                 Some(SnapshotBuilder {
                     store: self.clone(),
@@ -158,6 +228,7 @@ impl<S: StateMachine> StateMachineStore<S> {
                             _permits: None,
                             already_durable: true,
                             completion: None,
+                            disk: None,
                         });
                     }
                 }
@@ -209,19 +280,13 @@ impl<S: StateMachine> StateMachineStore<S> {
     }
 
     async fn capture_native(&self, native: &NativeRuntime) -> Result<Capture, NativeCaptureError> {
-        let node_permit = native
-            .options
-            .build_budget
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| NativeCaptureError::Refused(CaptureRefusal::Busy))?;
-        let group_permit = native
-            .group_budget
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| NativeCaptureError::Refused(CaptureRefusal::Busy))?;
+        if self.disk {
+            return self.capture_disk(native).await;
+        }
+        let (node_permit, group_permit) = native.admit().map_err(NativeCaptureError::Refused)?;
         let _transition = native.transition.lock().await;
         let inner = self.inner.lock().await;
+        self.validation.readable().map_err(NativeCaptureError::Io)?;
         if self.native_is_closing() {
             return Err(NativeCaptureError::Io(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -269,11 +334,16 @@ impl<S: StateMachine> StateMachineStore<S> {
             _permits: Some((node_permit, group_permit)),
             already_durable: false,
             completion: None,
+            disk: None,
         })
     }
 
     /// Read validated provider facts without allocating the full application image.
+    /// Disk mode: the published disk checkpoint (`size` = its total file bytes).
     pub async fn native_snapshot_info(&self) -> io::Result<Option<crate::NativeSnapshotInfo>> {
+        if self.disk {
+            return self.disk_snapshot_info().await;
+        }
         let Some(native) = self.native.clone() else {
             return Ok(None);
         };
@@ -291,6 +361,9 @@ impl<S: StateMachine> StateMachineStore<S> {
     pub(super) async fn load_native_snapshot(
         &self,
     ) -> io::Result<Option<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>>> {
+        if self.disk {
+            return self.load_disk_snapshot().await;
+        }
         let native = self.native.as_ref().unwrap().clone();
         let group = self.group_id;
         tokio::task::spawn_blocking(move || {
@@ -307,67 +380,6 @@ impl<S: StateMachine> StateMachineStore<S> {
                 snapshot: Cursor::new(snapshot.data),
             })
         })
-    }
-
-    pub(super) async fn install_native_snapshot(
-        &self,
-        meta: &SnapshotMetaOf<TypeConfig>,
-        data: Vec<u8>,
-    ) -> io::Result<()> {
-        let native = self.native.as_ref().unwrap().clone();
-        if data.len() > native.options.max_snapshot_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "snapshot install limit",
-            ));
-        }
-        let _transition = native.transition.lock().await;
-        if self.native_is_closing() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "native snapshot owner closed",
-            ));
-        }
-        // Stage before restoring business state; no success/ack before durable activation.
-        let options = native.options.clone();
-        let owned_meta = meta.clone();
-        let group = self.group_id;
-        let stage_started = std::time::Instant::now();
-        let (stage, data) = tokio::task::spawn_blocking(move || {
-            let stage = options.catalog.stage_native(
-                group,
-                &owned_meta,
-                &data,
-                options.max_snapshot_bytes,
-            )?;
-            Ok::<_, io::Error>((stage, data))
-        })
-        .await
-        .map_err(io::Error::other)??;
-        tracing::info!(target: "multiraft::native_install", phase = "staged", group_id = group, snapshot_bytes = data.len(), stage_elapsed_us = stage_started.elapsed().as_micros() as u64, "native snapshot install");
-        {
-            let mut inner = self.inner.lock().await;
-            if inner.last_applied_log > meta.last_log_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "snapshot install would regress applied state",
-                ));
-            }
-            inner.fsm.restore(group, &data).map_err(io::Error::other)?;
-        }
-        tracing::debug!(target: "multiraft::native_install", phase = "application_restored", group_id = group, "native snapshot install");
-        let catalog = native.options.catalog.clone();
-        tokio::task::spawn_blocking(move || catalog.activate_native(stage))
-            .await
-            .map_err(io::Error::other)??;
-        tracing::debug!(target: "multiraft::native_install", phase = "activated", group_id = group, "native snapshot install");
-        let mut inner = self.inner.lock().await;
-        inner.last_applied_log = meta.last_log_id;
-        inner.last_membership = meta.last_membership.clone();
-        // Durable bytes remain owned by the catalog, not a historical RAM snapshot.
-        inner.current_snapshot = None;
-        tracing::debug!(target: "multiraft::native_install", phase = "bridge_updated", group_id = group, "native snapshot install");
-        Ok(())
     }
 }
 
@@ -387,6 +399,9 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
             return self.store.build_legacy_snapshot().await;
         };
         let mut captured = capture?;
+        if let Some(checkpoint) = captured.disk.take() {
+            return self.store.publish_disk(captured, checkpoint).await;
+        }
         if captured.already_durable {
             if let Some(sender) = captured.completion.take() {
                 let _ = sender.send(());
@@ -398,6 +413,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
         }
         let native = self.store.native.as_ref().unwrap().clone();
         let _transition = native.transition.lock().await;
+        self.store.validation.readable()?;
         if self.store.native_is_closing() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,

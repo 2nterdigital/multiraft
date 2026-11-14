@@ -10,8 +10,14 @@ set -euo pipefail
 export PATH="${HOME}/.cargo/bin:${PATH}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/cluster_lib.sh
+. "$ROOT/scripts/cluster_lib.sh"
 BASE_PORT="${BASE_PORT:-21000}"
-GROUPS="${GROUPS:-10}"
+# Read only exported GROUPS; Bash otherwise supplies the system group IDs.
+CLUSTER_GROUP_COUNT="$(printenv GROUPS || true)"
+CLUSTER_GROUP_COUNT="${CLUSTER_GROUP_COUNT:-10}"
+unset GROUPS
+GROUPS="$CLUSTER_GROUP_COUNT"
 NODES="${NODES:-3}"
 DATA="${ACCEPTANCE_DATA:-$ROOT/.acceptance-data}"
 WORKDIR=""
@@ -34,10 +40,7 @@ cleanup() {
 trap cleanup EXIT
 
 admin_url() {
-  # admin for node id $1
-  local id="$1"
-  local port=$((BASE_PORT + 100 + id - 1))
-  echo "http://127.0.0.1:${port}"
+  DATA_DIR="$DATA" cluster_admin_url "$1"
 }
 
 http_get() {
@@ -76,17 +79,9 @@ start_cluster() {
 
 start_one_node() {
   local id="$1"
-  local node_data="$DATA/node-$id"
-  mkdir -p "$node_data"
-  "$ROOT/target/debug/multiraft-demo" \
-    --mode node \
-    --node-id "$id" \
-    --nodes "$NODES" \
-    --base-port "$BASE_PORT" \
-    --groups "$GROUPS" \
-    --data-dir "$node_data" \
-    >"$DATA/node-$id.log" 2>&1 &
-  echo $! >"$DATA/node-$id.pid"
+  DATA_DIR="$DATA" BASE_PORT="$BASE_PORT" GROUPS="$GROUPS" NODES="$NODES" \
+    MULTIRAFT_ROOT="$ROOT" \
+    "$ROOT/scripts/start_one_node.sh" "$id"
   log "restarted node ${id} pid=$(cat "$DATA/node-$id.pid")"
 }
 

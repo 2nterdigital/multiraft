@@ -2,10 +2,14 @@
 //!
 //! Adapted from openraft `examples/sm-mem` at tag `v0.10.0-alpha.30`.
 
+mod disk;
 mod native;
 mod release;
+mod validation;
+pub use disk::ControlledCheckpointState;
 pub use native::{NativeBuildReservation, NativeCaptureError, NativeSmOptions, SnapshotBuilder};
 pub use release::{StateMachineRelease, WeakStateMachineStore};
+pub use validation::ValidationOptions;
 
 use std::io;
 use std::io::Cursor;
@@ -63,6 +67,11 @@ struct StateMachineStoreInner<S: StateMachine> {
     fsm: S,
     snapshot_idx: AtomicU64,
     current_snapshot: Option<StoredSnapshot>,
+    /// Disk mode: applied position/membership already read from the FSM store.
+    disk_loaded: bool,
+    /// Disk mode: the FSM's snapshot workspace, opened with the store.
+    disk_workspace: Option<crate::disk_snapshot::Workspace>,
+    control: Option<multiraft_core::NativeLedger>,
     // Fields drop in declaration order: signal only AFTER application FSM Drop.
     _release: release::ReleaseOnDrop,
 }
@@ -76,6 +85,9 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
             fsm,
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: None,
+            disk_loaded: false,
+            disk_workspace: None,
+            control: None,
             _release: release::ReleaseOnDrop(release),
         }
     }
@@ -90,10 +102,14 @@ pub struct StateMachineStore<S: StateMachine> {
     group_id: GroupId,
     inner: Arc<Mutex<StateMachineStoreInner<S>>>,
     native: Option<Arc<native::NativeRuntime>>,
+    /// Fixed at construction from [`StateMachine::disk_state`].
+    disk: bool,
+    disk_rt: Arc<disk::DiskRuntime>,
     allow_hot_build: bool,
     catalog: Option<Arc<SnapshotCatalog>>,
     on_standby_trigger: Option<TriggerCb>,
     release: StateMachineRelease,
+    validation: Arc<validation::ValidationRuntime>,
 }
 
 impl<S: StateMachine> std::fmt::Debug for StateMachineStore<S> {
@@ -101,6 +117,7 @@ impl<S: StateMachine> std::fmt::Debug for StateMachineStore<S> {
         f.debug_struct("StateMachineStore")
             .field("group_id", &self.group_id)
             .field("allow_hot_build", &self.allow_hot_build)
+            .field("disk", &self.disk)
             .field("has_catalog", &self.catalog.is_some())
             .field("has_trigger", &self.on_standby_trigger.is_some())
             .finish()
@@ -113,10 +130,13 @@ impl<S: StateMachine> Clone for StateMachineStore<S> {
             group_id: self.group_id,
             inner: self.inner.clone(),
             native: self.native.clone(),
+            disk: self.disk,
+            disk_rt: self.disk_rt.clone(),
             allow_hot_build: self.allow_hot_build,
             catalog: self.catalog.clone(),
             on_standby_trigger: self.on_standby_trigger.clone(),
             release: self.release.clone(),
+            validation: self.validation.clone(),
         }
     }
 }
@@ -134,8 +154,10 @@ impl<S: StateMachine> StateMachineStore<S> {
         )
     }
 
-    pub fn with_options(group_id: GroupId, fsm: S, opts: SmOptions) -> Self {
+    pub fn with_options(group_id: GroupId, mut fsm: S, opts: SmOptions) -> Self {
+        let disk = fsm.disk_state().is_some();
         let released = Arc::new(release::ReleaseState::default());
+        let required = fsm.requires_recovery_validation();
         Self {
             group_id,
             inner: Arc::new(Mutex::new(StateMachineStoreInner::new(
@@ -144,10 +166,16 @@ impl<S: StateMachine> StateMachineStore<S> {
                 released.clone(),
             ))),
             native: None,
+            disk,
+            disk_rt: Arc::default(),
             allow_hot_build: opts.allow_hot_build,
             catalog: opts.catalog,
             on_standby_trigger: opts.on_standby_trigger,
             release: StateMachineRelease { state: released },
+            validation: Arc::new(validation::ValidationRuntime::new(
+                required,
+                ValidationOptions::default(),
+            )),
         }
     }
 
@@ -166,8 +194,9 @@ impl<S: StateMachine> StateMachineStore<S> {
 
     /// Inspect the underlying FSM (for tests / local reads).
     pub async fn with_fsm<R>(&self, f: impl FnOnce(&S) -> R) -> R {
-        let inner = self.inner.lock().await;
-        f(&inner.fsm)
+        self.try_with_fsm(f)
+            .await
+            .expect("application generation is not validated")
     }
 
     /// Last applied `(index, term)` from the SM store (source of truth for FSM watermark).
@@ -190,8 +219,12 @@ impl<S: StateMachine> StateMachineStore<S> {
         term: u64,
         serialize_delay: Option<Duration>,
     ) -> Result<CatalogEntry, io::Error> {
+        if self.disk {
+            return Err(disk::unsupported("snapshot"));
+        }
         let data = {
             let inner = self.inner.lock().await;
+            self.validation.readable()?;
             inner
                 .fsm
                 .freeze_for_snapshot(group)
@@ -255,6 +288,9 @@ impl<S: StateMachine> StateMachineStore<S> {
     async fn build_legacy_snapshot(
         &mut self,
     ) -> io::Result<SnapshotOf<TypeConfig, Cursor<Vec<u8>>>> {
+        if self.disk {
+            return Err(disk::unsupported("snapshot"));
+        }
         if !self.allow_hot_build {
             // StandbyOffload: never sync-dump FSM; serve only an OpenRaft snapshot.
             {
@@ -273,6 +309,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         }
 
         let mut inner = self.inner.lock().await;
+        self.validation.readable()?;
 
         let data = inner
             .fsm
@@ -344,7 +381,10 @@ where
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogIdOf<TypeConfig>>, StoredMembershipOf<TypeConfig>), io::Error> {
-        let inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().await;
+        if self.disk {
+            inner.load_disk_state()?;
+        }
         Ok((inner.last_applied_log, inner.last_membership.clone()))
     }
 
@@ -353,6 +393,8 @@ where
     where
         Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend,
     {
+        let _transition = self.validation.transition.lock().await;
+        self.validation.applicable()?;
         let mut pending_triggers: Vec<(GroupId, u64, u64)> = Vec::new();
 
         {
@@ -366,6 +408,31 @@ where
             }
             while let Some((entry, responder)) = entries.try_next().await? {
                 tracing::trace!(%entry.log_id, "replicate to sm");
+
+                if matches!(&entry.payload, EntryPayload::Normal(request) if request.control.is_some() && !request.data.is_empty())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native entry also contains application bytes",
+                    ));
+                }
+
+                if self.disk {
+                    self.validation.changed();
+                    let response = inner.apply_disk_entry(&entry)?;
+                    if let Some(responder) = responder {
+                        responder.send(response);
+                    }
+                    continue;
+                }
+
+                if matches!(&entry.payload, EntryPayload::Normal(request) if request.control.is_some())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "native control requires a disk-backed state machine",
+                    ));
+                }
 
                 if self.native.is_some() {
                     let expected = inner
@@ -381,6 +448,7 @@ where
                         ));
                     }
                 }
+                self.validation.changed();
                 inner.last_applied_log = Some(entry.log_id);
 
                 let response = match &entry.payload {
@@ -436,54 +504,32 @@ where
         meta: &SnapshotMetaOf<TypeConfig>,
         snapshot: Self::SnapshotData,
     ) -> Result<(), io::Error> {
+        if self.disk {
+            let data = snapshot.into_inner();
+            if !crate::disk_snapshot::is_disk_snapshot(meta, &data) {
+                return Err(disk::unsupported("snapshot install"));
+            }
+            return self.install_disk_snapshot(meta, data).await;
+        }
         if self.native.is_some() {
             return self
                 .install_native_snapshot(meta, snapshot.into_inner())
                 .await;
         }
-        tracing::info!(
-            { snapshot_size = snapshot.get_ref().len() },
-            "decoding snapshot for installation"
-        );
-
-        let data = snapshot.into_inner();
-        let new_snapshot = StoredSnapshot {
-            meta: meta.clone(),
-            data: data.clone(),
-        };
-
-        let mut inner = self.inner.lock().await;
-        let group_id = inner.group_id;
-        inner
-            .fsm
-            .restore(group_id, &data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        inner.last_applied_log = meta.last_log_id;
-        inner.last_membership = meta.last_membership.clone();
-        inner.current_snapshot = Some(new_snapshot);
-        drop(inner);
-
-        if let Some(catalog) = &self.catalog {
-            let (last_index, last_term) = match &meta.last_log_id {
-                Some(id) => (id.index(), id.committed_leader_id().term),
-                None => (0, 0),
-            };
-            catalog.write(
-                group_id,
-                last_index,
-                last_term,
-                meta.snapshot_id.clone(),
-                &data,
-            )?;
-        }
-
-        Ok(())
+        self.install_legacy_validated(meta, snapshot.into_inner())
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<SnapshotOf<TypeConfig, Self::SnapshotData>>, io::Error> {
+        if !self.validation.recovering() {
+            self.validation.readable()?;
+        }
+        if self.disk {
+            return self.load_disk_snapshot().await;
+        }
         if self.native.is_some() {
             return self.load_native_snapshot().await;
         }

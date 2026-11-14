@@ -3,6 +3,33 @@ use super::*;
 use crate::{LocalGroupStatus, TryReadError};
 
 impl<S: StateMachine> RuntimeHandle<S> {
+    /// Sample this published local replica's durable applied id, full membership and native ledger.
+    /// This is a LOCAL observation: it requires no leadership and grants no ReadIndex,
+    /// quorum, freshness or business authority. No Group, log or FSM state is created or written.
+    ///
+    /// # Errors
+    /// Missing/closed Groups, deadline expiry and malformed or unavailable disk state fail closed.
+    pub async fn inspect_controlled_applied(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+    ) -> Result<crate::ControlledCheckpointState, RuntimeError> {
+        let admitted = self.admit(deadline).await?;
+        admitted.ensure_group(group)?;
+        let sample = admitted
+            .run(
+                deadline,
+                RuntimePhase::LocalRead,
+                false,
+                admitted.shared.node.inspect_local_controlled_applied(group),
+            )
+            .await?;
+        if !admitted.shared.accepting.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        Ok(sample)
+    }
+
     /// Query this replica's applied FSM under its application lock, without
     /// confirming authority. It may be stale and must not authorize business work.
     /// Applications own query meaning; callbacks must be bounded and nonblocking.
@@ -31,6 +58,37 @@ impl<S: StateMachine> RuntimeHandle<S> {
             .await
             .map_err(TryReadError::Runtime)?
             .map_err(TryReadError::Application)
+    }
+
+    /// Query this replica and capture its applied watermark in the same FSM view.
+    /// No authority or freshness is implied. Callbacks must be bounded and
+    /// nonblocking, and execute under the local application lock.
+    pub async fn try_read_applied_with_watermark<R, E>(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+        query: impl FnOnce(&S) -> Result<R, E>,
+    ) -> Result<crate::AppliedView<R>, TryReadError<E>> {
+        let admitted = self.admit(deadline).await.map_err(TryReadError::Runtime)?;
+        admitted
+            .ensure_group(group)
+            .map_err(TryReadError::Runtime)?;
+        let view = admitted
+            .run(
+                deadline,
+                RuntimePhase::LocalRead,
+                false,
+                admitted
+                    .shared
+                    .node
+                    .read_applied_with_watermark(group, query),
+            )
+            .await
+            .map_err(TryReadError::Runtime)?;
+        Ok(crate::AppliedView {
+            value: view.value.map_err(TryReadError::Application)?,
+            applied: view.applied,
+        })
     }
 
     /// Copy one local full-metrics point. No ReadIndex, network work or scan of

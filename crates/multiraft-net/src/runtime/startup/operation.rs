@@ -76,10 +76,14 @@ impl<S: StateMachine> RuntimeShared<S> {
                 group.phase = StartupPhase::Validate
             });
             // Application validators are deliberately outside the native budget.
-            self.node
-                .validate_recovered(input.group.group_id)
-                .await
-                .map_err(|e| failure(&progress, index, RuntimeError::Source(e)))?;
+            let mut closed = self.closed.subscribe();
+            self.check_open(&progress, index)?;
+            tokio::select! {
+                biased;
+                _ = closed.changed() => return Err(failure(&progress, index, RuntimeError::Closed)),
+                result = self.node.validate_recovered(input.group.group_id) =>
+                    result.map_err(|e| failure(&progress, index, RuntimeError::Source(e)))?,
+            }
             self.node
                 .ensure_recovery_running(input.group.group_id)
                 .map_err(|e| failure(&progress, index, RuntimeError::Source(e)))?;

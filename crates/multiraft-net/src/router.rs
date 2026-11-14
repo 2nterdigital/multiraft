@@ -59,6 +59,8 @@ pub enum RaftReply {
     Vote(Result<VoteResponse<TypeConfig>, RaftError>),
     Append(Result<AppendEntriesResponse<TypeConfig>, RaftError>),
     Snapshot(Result<SnapshotResponse<TypeConfig>, RaftError>),
+    /// Snapshot was refused at ingress without dispatching to the native Core.
+    SnapshotUnavailable,
     Transfer(Result<TransferLeaderResponse<TypeConfig>, RaftError>),
     /// Target group missing on the node.
     MissingGroup,
@@ -227,6 +229,9 @@ impl Router {
         match reply {
             RaftReply::Snapshot(Ok(r)) => Ok(r),
             RaftReply::Snapshot(Err(e)) => Err(Unreachable::new(&RouterError(e.to_string()))),
+            RaftReply::SnapshotUnavailable => Err(Unreachable::new(&RouterError(
+                "application validation pending; peer snapshot not dispatched".into(),
+            ))),
             RaftReply::MissingGroup => Err(Unreachable::new(&RouterError("missing group".into()))),
             _ => Err(Unreachable::new(&RouterError("reply type mismatch".into()))),
         }

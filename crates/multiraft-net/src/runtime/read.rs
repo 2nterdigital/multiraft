@@ -3,7 +3,8 @@ use super::*;
 use crate::read_observation::{ReadGuard, ReadObserver, ReadOutcome, ReadStage, TryReadError};
 
 impl<S: StateMachine> RuntimeHandle<S> {
-    /// One native ReadIndex then this invocation's local FSM query. No hidden retry.
+    /// Native ReadIndex then this invocation's local FSM query. A ReadIndex round
+    /// that misses its quorum is re-confirmed within `deadline`; nothing else retries.
     /// The synchronous query must be bounded. For fallible queries use `try_read_linearizable`.
     pub async fn read_linearizable<R>(
         &self,
@@ -12,6 +13,19 @@ impl<S: StateMachine> RuntimeHandle<S> {
         query: impl FnOnce(&S) -> R,
     ) -> Result<R, RuntimeError> {
         self.read_with_observer(group, deadline, query, None, |_| ReadOutcome::Completed)
+            .await
+    }
+    /// One native ReadIndex then this invocation's local FSM query, returning the
+    /// value with the applied log id sampled under the same FSM lock. The id is
+    /// what the value reflects and is at or beyond the confirmed read point.
+    /// Same ReadIndex retry as `read_linearizable`; the synchronous query must be bounded.
+    pub async fn read_linearizable_with_applied<R>(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+        query: impl FnOnce(&S) -> R,
+    ) -> Result<crate::LinearizableView<R>, RuntimeError> {
+        self.read_view_with_observer(group, deadline, query, None, |_| ReadOutcome::Completed)
             .await
     }
     /// Per-caller neutral source observations with isolated observer failure.
@@ -54,6 +68,18 @@ impl<S: StateMachine> RuntimeHandle<S> {
         observer: Option<&dyn ReadObserver>,
         application_outcome: impl FnOnce(&R) -> ReadOutcome,
     ) -> Result<R, RuntimeError> {
+        self.read_view_with_observer(group, deadline, query, observer, application_outcome)
+            .await
+            .map(|view| view.value)
+    }
+    async fn read_view_with_observer<R>(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+        query: impl FnOnce(&S) -> R,
+        observer: Option<&dyn ReadObserver>,
+        application_outcome: impl FnOnce(&R) -> ReadOutcome,
+    ) -> Result<crate::LinearizableView<R>, RuntimeError> {
         let mut admission = ReadGuard::new(
             group,
             self.node_id,
@@ -94,7 +120,7 @@ impl<S: StateMachine> RuntimeHandle<S> {
                 deadline,
                 RuntimePhase::Read,
                 false,
-                admitted.shared.node.read_observed(
+                admitted.shared.node.read_observed_view(
                     group,
                     deadline,
                     query,

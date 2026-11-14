@@ -4,12 +4,21 @@
 //! the runtime constructs and recovers native Groups before publishing handles.
 //! No operation exposes native Raft handles. Commands and effects stay opaque.
 
+mod authority;
+mod carriers;
 mod control;
+mod controlled;
+pub use controlled::{
+    ManagedControlError, ManagedControlledGroup, ManagedOperation, ManagedTargetEndpoint,
+    ReplicaStorageUsage,
+};
 mod election_source;
 mod local;
 mod maintenance;
 mod observation;
 mod owner;
+mod proposal;
+pub use proposal::ProposalReceipt;
 mod read;
 mod recovery;
 mod requests;
@@ -160,7 +169,12 @@ impl<S: StateMachine> Clone for RuntimeHandle<S> {
 }
 
 pub(super) struct RuntimeShared<S: StateMachine> {
-    pub(super) node: MultiRaft<S>,
+    node: Arc<MultiRaft<S>>,
+    controlled_generations: Mutex<std::collections::BTreeMap<GroupId, u64>>,
+    controlled_jobs: OwnedTasks,
+    controlled_endpoints:
+        Mutex<std::collections::BTreeMap<u64, crate::portable::NativeTargetEndpoint<S>>>,
+    next_controlled_endpoint: std::sync::atomic::AtomicU64,
     accepting: AtomicBool,
     pub(super) admission: Arc<RwLock<()>>,
     pub(super) slots: Arc<Semaphore>,
@@ -168,6 +182,7 @@ pub(super) struct RuntimeShared<S: StateMachine> {
     pub(super) group_creation: tokio::sync::Mutex<()>,
     pub(super) startups: OwnedTasks,
     source_jobs: OwnedTasks,
+    proposals: OwnedTasks,
     startup_admission: Mutex<startup::StartupAdmission>,
     cleanup_started: AtomicBool,
     completed: watch::Sender<Option<Result<(), Arc<RuntimeError>>>>,

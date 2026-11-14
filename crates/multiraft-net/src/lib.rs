@@ -9,7 +9,14 @@
 
 mod api;
 pub mod application_rpc;
+mod carrier;
+pub use carrier::{CarrierCatalog, CarrierError, CarrierInstall, CarrierPeer, CarrierService};
 mod conn_metrics;
+#[cfg(test)]
+extern crate self as multiraft_net;
+#[cfg(test)]
+mod controlled_bootstrap_test_gate;
+pub mod controlled_startup;
 mod election_source;
 mod fsm_factory;
 mod group_control;
@@ -51,6 +58,26 @@ pub use group_observation::LocalMembershipRole;
 pub use group_observation::MembershipObservation;
 pub use group_observation::ObservedLogId;
 pub use group_observation::VoteObservation;
+
+/// A local FSM query and the applied log identity captured under the same lock.
+/// This replica may be stale; the watermark does not establish quorum authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedView<R> {
+    pub value: R,
+    /// `None` means no log has been applied to this FSM generation.
+    pub applied: Option<ObservedLogId>,
+}
+
+/// A linearizable FSM query and the applied log identity captured under the
+/// same lock, after this call's own ReadIndex confirmation. `applied` is the
+/// serving FSM's own applied id, which the value reflects; it is at or beyond
+/// the confirmed read point but is sampled, not copied from that point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinearizableView<R> {
+    pub value: R,
+    pub applied: ObservedLogId,
+}
+
 pub use grpc::node_rpc;
 pub use grpc::GrpcPeerChannelError;
 pub use grpc::GrpcPeerChannelLease;
@@ -65,7 +92,15 @@ pub use multiraft::{
     CompactionProgress, CompactionRejection, CompactionSubmission, DurableSnapshotObservation,
     LocalStorageStatus, NATIVE_SNAPSHOT_COMPACTION_CONTRACT,
 };
+pub use multiraft::{
+    ControlledError, ControlledExecutor, ControlledGroup, ControlledOpen, ControlledOpenMode,
+    ControlledSeed, ControlledTerminal, ManagedGenesisBasis,
+};
+pub use multiraft::{LocalAuthoritativeMembership, LocalAuthorityError};
 pub use multiraft_core::ObservationClosed;
+pub use multiraft_store::{
+    ControlledCheckpointState, ControlledGroupReceipt, ControlledGroupStage,
+};
 pub use network::GrpcNetworkFactory;
 pub use network::NetworkFactory;
 pub use node::create_node;
@@ -93,8 +128,9 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
 }
 
 pub use runtime::{
-    GroupConfig, NodeOwner, RuntimeConfig, RuntimeError, RuntimeHandle, RuntimePhase,
-    RuntimeTransport,
+    GroupConfig, ManagedControlError, ManagedControlledGroup, ManagedOperation,
+    ManagedTargetEndpoint, NodeOwner, ProposalReceipt, ReplicaStorageUsage, RuntimeConfig,
+    RuntimeError, RuntimeHandle, RuntimePhase, RuntimeTransport,
 };
 
 pub use leader_hint::{HintSource, LeaderHint, LeaderHintReceiver};
@@ -117,3 +153,6 @@ pub use election_source::{
     NativeElectionKind, NativeElectionTiming, SourceRpcFailure, VoteRequestDisposition,
     VoteResponseDisposition,
 };
+
+/// Portable native target transport and untrusted wire protocol.
+pub use multiraft::portable;

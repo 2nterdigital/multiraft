@@ -48,9 +48,19 @@ pub struct LocalStorageStatus {
     pub durable_snapshot: Option<DurableSnapshotObservation>,
     pub native_snapshot: Option<ObservedLogId>,
     pub purged: Option<ObservedLogId>,
+    /// Actual local log backend; None identifies an in-memory log.
+    pub log_storage_backend: Option<LogStorageBackend>,
+    /// FileLog: physical log.bin bytes; RocksDB: retained encoded entry bytes,
+    /// excluding shared WAL, SST overhead, metadata and other groups.
     pub retained_log_bytes: Option<u64>,
+    /// "physical_file" for FileLog, "encoded_entries" for RocksDB, or "unavailable".
+    pub retained_log_bytes_kind: &'static str,
     pub progress: CompactionProgress,
     pub no_purge_needed: bool,
+    /// Fixed, read-only per-FSM database memory observations.
+    pub fsm_memory: Option<multiraft_fsm::StorageMemoryStats>,
+    /// Shared Raft engine observations, deduplicated by database identity by consumers.
+    pub raft_engine_memory: Option<multiraft_fsm::StorageMemoryStats>,
 }
 
 impl std::fmt::Display for CompactionRejection {
@@ -128,7 +138,7 @@ impl<S: StateMachine> MultiRaft<S> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let stopping = self.snapshot_rt.stopping.clone();
         let retain = self.config.retain_log_entries;
-        if !self.snapshot_rt.maintenance_tasks.spawn(operation::run(
+        if !self.group_owner(group).maintenance.spawn(operation::run(
             raft, sm, terminal, stopping, retain, deadline, sender,
         )) {
             return Err(CompactionRejection::ShuttingDown);
@@ -167,14 +177,20 @@ impl<S: StateMachine> MultiRaft<S> {
             .unwrap()
             .get(&group)
             .map(|operation| operation.state.clone());
-        let directory = (!self.config.data_dir.as_os_str().is_empty())
-            .then(|| self.config.data_dir.join(format!("group-{group}")));
+        let db = self.rocks_log_db.lock().unwrap().clone();
+        let inspection = if let Some(db) = db {
+            status::LogInspection::Rocks(db)
+        } else if self.config.data_dir.as_os_str().is_empty() {
+            status::LogInspection::Memory
+        } else {
+            status::LogInspection::File(self.config.data_dir.join(format!("group-{group}")))
+        };
         let node_id = self.node_id;
         let mode = self.config.snapshot_mode;
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        if !self.snapshot_rt.maintenance_tasks.spawn(async move {
-            let _permit = permit;
-            let result = status::collect(node_id, group, mode, raft, sm, directory, state).await;
+        if !self.group_owner(group).maintenance.spawn(async move {
+            let result =
+                status::collect(node_id, group, mode, raft, sm, inspection, state, permit).await;
             let _ = sender.send(result);
         }) {
             return Err(CompactionRejection::ShuttingDown);

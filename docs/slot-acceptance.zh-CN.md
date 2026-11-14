@@ -1,0 +1,82 @@
+# 固定 Slot 本机验收
+
+`multiraft-slot-demo` 是 `multiraft-slot` 的测试消费者，使用新数据、不可变布局、
+RocksDB 日志及 NativeDurable FSM 快照。计数器和 command-id 表用于证明精确
+effects、业务 key 身份校验与确定性去重；不实现生产 Admit、TiKV、消息顺序协议，
+也不认证容量。
+
+`76ce0dd` 首验证运行已通过三组场景共七项检查；精确源码绑定、限额、保留失败和历史 observer 未定位风险见[证据台账](./evidence/2026-10-16-slot-foundation.zh-CN.md)。
+
+
+[Channel 公平准入规范](./specs/2026-10-16-slot-channel-fair-admission.zh-CN.md)和 [G0–G6/H1 计划](./plans/2026-10-16-slot-channel-fair-admission.zh-CN.md)规划后续混合负载 harness；均 Planned、未实现、未运行，没有新增 CLI flags。当前 gate 断言仅证明一次 different-Slot 进展，不证明 same-Slot Channel 公平、持续 cold SLO 或共享 DB 隔离。新证据须覆盖 same-Slot/cross-Slot 热冷、实际 leader、多源入口、全新自有 data、source/binary/harness 身份、冻结 profile/limits 和进程清理；保留旧 runner 收据及场景能力。
+
+在仓库根目录运行：
+
+```sh
+mkdir -p .tmp/slot-foundation/tmp
+env TMPDIR="$PWD/.tmp/slot-foundation/tmp" \
+  CARGO_TARGET_DIR="$PWD/.tmp/slot-foundation/target" \
+  cargo build -p multiraft-slot-demo
+python3 scripts/slot_acceptance.py
+```
+
+macOS 从源码构建 RocksDB 时可能需要将 `LIBCLANG_PATH`、`DYLD_LIBRARY_PATH`
+设为 Xcode toolchain 的 `usr/lib`。`--binary PATH` 指定已构建二进制；
+`--output-dir PATH` 必须是尚不存在的目录，默认在 `.tmp/slot-foundation/`
+创建唯一目录。`--case normal`、`--case recovery` 或 `--case fingerprint` 可分别运行三个独立场景集；`--case all` 运行全部三组。
+`--case disk` 运行独立的[落盘状态机](./specs/2026-10-18-disk-backed-fsm-mode.zh-CN.md)场景（`--fsm-storage disk`，使用新的 `disk-data-N` 目录，不包含在 `all` 中）：
+精确效果与幂等、压缩发布 RocksDB checkpoint（从不生成整块快照）并裁剪日志、被 SIGKILL 的 leader 重新打开其 RocksDB 状态、三节点同时 SIGKILL 后冷重启，
+以及正常关停后的冷重启与新提交后缀。每个节点上值和 apply 次数必须一致，FSM 中存的 applied index 必须等于 bridge 的
+applied index，且各节点该 index 相同。其他用例传入默认的整块模式 `--fsm-storage image`，行为不变。
+
+`--case disk-snapshot` 运行[落盘流式快照](./specs/2026-10-19-disk-fsm-streaming-snapshot.zh-CN.md)场景（使用新的
+`disk-snapshot-data-N` 目录，不包含在 `all` 中）。`--snapshot-mib N`（默认 1024）指定 follower 停机期间写入一个 Slot 的数据量。
+仅测试用的 `/bulk` 端点提议小命令，每个副本的 FSM 据此生成相同的、不可压缩的 4 MiB 行，因此 FSM（以及快照）达到 GB 级，
+而 Raft 日志保持很小；RocksDB Raft 日志用 JSON 编码条目，经日志写入 GB 级载荷在本脚本中慢得不可行。两个存活副本先压缩
+（checkpoint 加裁剪），然后被停的 follower 重启，必须通过快照安装追上（工作区中的 `installed` 标记、相同的 blob 计数、
+SHA-256 链与最新几行）。从 follower 启动到追上，每 50 ms 采样三个进程的 RSS，每个峰值都不得超过 256 MiB。随后：追上后立即
+重启；再一轮中接收端在暂存传输时被 SIGKILL，必须以旧 applied index 重新打开，然后追上；最后一轮用
+`MULTIRAFT_TEST_DISK_INSTALL_FAULT=abort_after_retire` 让接收端在两次安装改名之间中止（活目录缺失、存在 `retired-*`），
+之后正常重启必须回滚到旧库，然后追上。请使用 release 构建运行（`cargo build --release -p multiraft-slot-demo`）。
+记录的运行见[流式快照规格](./specs/2026-10-19-disk-fsm-streaming-snapshot.zh-CN.md#记录的运行)。
+
+Python 标准库脚本通过 `Popen` 启动三个真实 OS 进程，分别持有不同 PID、
+loopback Raft／应用 RPC／管理端口和数据目录。候选端口同时保留，启动前释放；
+若本机其他进程抢占端口，验收明确失败。仅清理本次创建的进程组，先 SIGTERM，
+超时才 SIGKILL；切主场景明确使用 SIGKILL。SIGINT／SIGTERM 处理器只记录首个信号，HTTP（socket timeout 最多 10 秒）、poll
+和阶段检查点执行协作式停止；KeyboardInterrupt 同样进入必达清理并写入失败收据。
+清理期间继续使用不抛异常的处理器，重复信号不会打断清理。最终收据提交为完成点；
+子进程回收与证据关闭后，仅在恢复两项原处理器时同时屏蔽 SIGINT／SIGTERM，随后
+恢复原 mask，此后信号按原处理器语义处理；新子进程不会继承该 mask。不能拦截 SIGKILL。正常关闭必须 exit 0，demo 同时要求
+owner 完成关闭且无剩余请求。脚本不访问实验室、SSH 或其他进程。
+
+验收逐项断言：
+
+- 三节点相同 manifest、RocksDB／NativeDurable、本地多个固定 Slot、follower
+  入口转发、精确 effects 和线性读。
+- 相同 command-id／intent 重试返回原 effects；修改 intent 得到业务拒绝，值不变。
+- leader 上测试专用、有上限的 Condvar apply gate；明确观察 entered 后，检查
+  caller Unknown、Slot inflight 仍占用、同 Slot Busy、其他 Slot 继续完成；释放后
+  核对恰好一次 apply，无自动重提交。
+- 真实 public HTTP socket 提交 gated write，独立 status 确认 entered 后才关闭／RST，
+  不读取响应。后台仍占 Slot 额度，释放 gate 后只增加一次业务值，显式相同 ID 重试
+  返回原 effects。原始 socket 事件记录进入与断连先后，不称 caller 收到了 Unknown。
+- 真实杀死 leader，剩余 quorum 选主并写入，原端口／原数据重启恢复。
+- compaction 返回提交后继续轮询每节点每 Slot 的 durable snapshot、purge 和
+  CompletedObserved；追加 committed suffix；全部进程关闭／重启后核对值及去重结果。
+- 磁盘 manifest 身份错配启动拒绝，原数据保留且可用原布局重新打开。
+- 独立新数据 RF3 场景：两个 digest A 节点加一个 digest B 节点。A+A 可提交，
+  只剩 A+B 时写不能 Applied，B 未应用 A 的值。恢复 A quorum 后显式用相同
+  command-id 重试消歧；Unknown 不能解释为“未提交”。
+
+仅 `--test-controls` 开启 `/gate`。gate 有 45 秒保护上限，管理线程可独立释放；
+本测试服务不应暴露为生产服务。`/compact` 只代表提交，`/status` 是本地瞬时事实，
+不代表 quorum readiness。本地 `/read` 保留 `result` 字段，并增加与值在同一 FSM
+锁内采集的 `applied`（term、node_id、index，或 null）。线性一致 `/read` 同样增加
+`applied`（不为 null）：由提供服务的副本在 ReadIndex 之后、与值在同一 FSM 锁内采集，
+即该值所反映的 applied index，不小于读之前已完成的任何写。
+
+所有 HTTP 请求、原始响应／传输错误写入 `requests.jsonl`。布局、每次启动日志、
+数据和 `receipt.json` 在成功或失败时均保留。收据包括 PID、完整启动命令、通过
+场景、清理结果和失败原因。只有选定场景及清理全部成功才 exit 0；这些是本次
+本机正确性证据，不证明吞吐、延迟或生产恢复认证。

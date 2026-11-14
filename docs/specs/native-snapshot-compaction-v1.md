@@ -34,6 +34,8 @@ Immutable generations bind Group identity, full SnapshotMeta and checked
 application bytes. Stage and sync before atomic active-manifest publication;
 serialize activation and reject checkpoint regression. A build is usable only
 after activation; an install succeeds only after restore and activation.
+Opt-in external application proof and candidate isolation follow the
+[asynchronous recovery validation contract](async-recovery-validation.md).
 Data/All file logs persist the existing committed frontier before returning
 from save_committed, after ordered log IO. Recovery does not rely on another
 append or a live peer to rediscover the committed suffix.
