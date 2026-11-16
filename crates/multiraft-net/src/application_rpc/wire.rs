@@ -9,7 +9,6 @@ use prost::Message;
 use std::sync::Weak;
 use std::time::Duration;
 use tokio::sync::oneshot;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Code, Request, Response, Status};
 
 #[derive(Clone)]
@@ -25,7 +24,7 @@ pub(super) async fn serve(
     io_stop: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     use futures::StreamExt;
-    let incoming = TcpListenerStream::new(listener)
+    let incoming = crate::grpc::server::nodelay_incoming(listener)?
         .map(move |accepted| accepted.map(|io| connection::RpcIo::new(io, io_stop.clone())));
     tonic::transport::Server::builder()
         .max_concurrent_streams(Some(service.limit))

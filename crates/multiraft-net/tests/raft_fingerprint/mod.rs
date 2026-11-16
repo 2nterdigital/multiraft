@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio_stream::wrappers::TcpListenerStream;
 
 struct Noop;
 impl StateMachine for Noop {
