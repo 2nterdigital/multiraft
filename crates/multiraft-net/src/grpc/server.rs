@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::Server;
 use tonic::Request;
 use tonic::Response;
@@ -102,7 +102,7 @@ impl GrpcServer {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(cap > 0 && cap <= 64 * 1024 * 1024, "invalid snapshot cap");
-        let incoming = TcpListenerStream::new(listener);
+        let incoming = nodelay_incoming(listener)?;
         let wire_limit = (cap + 1024 * 1024).max(4 * 1024 * 1024);
         let svc = RaftServiceServer::new(RaftServiceImpl {
             groups,
@@ -120,6 +120,12 @@ impl GrpcServer {
             .await?;
         Ok(())
     }
+}
+
+/// Accepts with `TCP_NODELAY`. Raft and application RPC replies are small; with Nagle on, a
+/// second reply on a connection waits for the peer's delayed ACK (~40 ms on Linux).
+pub(crate) fn nodelay_incoming(listener: tokio::net::TcpListener) -> anyhow::Result<TcpIncoming> {
+    TcpIncoming::from_listener(listener, true, None).map_err(|error| anyhow::anyhow!(error))
 }
 
 #[derive(Default)]
@@ -250,3 +256,19 @@ mod cancellation_tests;
 #[cfg(test)]
 #[path = "../../tests/raft_fingerprint/mod.rs"]
 mod fingerprint_tests;
+
+#[cfg(test)]
+mod nodelay_tests {
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn accepted_connections_disable_nagle() -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut incoming = super::nodelay_incoming(listener)?;
+        let _client = tokio::net::TcpStream::connect(addr).await?;
+        let accepted = incoming.next().await.expect("one connection")?;
+        assert!(accepted.nodelay()?);
+        Ok(())
+    }
+}
