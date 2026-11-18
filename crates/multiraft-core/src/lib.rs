@@ -24,6 +24,7 @@ pub use config::FileLogSyncLevel;
 pub use config::LogStorageBackend;
 pub use config::NodeRole;
 pub use config::SnapshotMode;
+pub use config::DEFAULT_RAFT_LOG_COMPACTION_WRITE_BYTES_PER_SEC;
 pub use error::MultiRaftError;
 pub use error::ObservationClosed;
 pub use error::ProposeApplied;

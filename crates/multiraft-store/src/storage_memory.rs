@@ -59,5 +59,6 @@ pub(crate) fn collect(db: &DB, db_id: String, names: &[String]) -> StorageMemory
         num_running_compactions: read("rocksdb.num-running-compactions", None),
         shared: None,
         errors,
+        io_latency: Default::default(),
     }
 }

@@ -2,6 +2,7 @@
 use std::fmt::Debug;
 use std::io;
 use std::ops::{Bound, RangeBounds};
+use std::time::Instant;
 
 use openraft::alias::{LogIdOf, VoteOf};
 use openraft::entry::RaftEntry;
@@ -131,23 +132,28 @@ where
     }
 
     async fn save_committed(&mut self, committed: Option<LogIdOf<C>>) -> io::Result<()> {
-        self.blocking(move |store| {
-            let mut meta = store.required_metadata()?;
-            if let Some(old) = meta.committed.as_ref() {
-                if committed.as_ref().is_none_or(|new| new < old) {
-                    return Err(invalid("committed log cannot regress"));
+        let started = Instant::now();
+        let result = self
+            .blocking(move |store| {
+                let mut meta = store.required_metadata()?;
+                if let Some(old) = meta.committed.as_ref() {
+                    if committed.as_ref().is_none_or(|new| new < old) {
+                        return Err(invalid("committed log cannot regress"));
+                    }
                 }
-            }
-            if let Some(id) = committed.as_ref() {
-                store.check_recoverable(&meta, id)?;
-            }
-            meta.ever_written |= committed.is_some();
-            meta.committed = committed;
-            let mut batch = WriteBatch::default();
-            store.put_metadata(&mut batch, &meta)?;
-            store.owner.engine.write(batch)
-        })
-        .await
+                if let Some(id) = committed.as_ref() {
+                    store.check_recoverable(&meta, id)?;
+                }
+                meta.ever_written |= committed.is_some();
+                meta.committed = committed;
+                let mut batch = WriteBatch::default();
+                store.put_metadata(&mut batch, &meta)?;
+                store.owner.engine.write(batch)
+            })
+            .await;
+        let latency = &self.owner.engine.io_latency;
+        latency.save_committed.record(started.elapsed());
+        result
     }
 
     async fn read_committed(&mut self) -> io::Result<Option<LogIdOf<C>>> {
@@ -164,13 +170,17 @@ where
         // caller must not abandon notification after a durable write finishes.
         // Returning only after the write is also what keeps a disk-backed FSM
         // behind the durable log (docs/specs/2026-10-18-disk-backed-fsm-mode.md).
+        let entered = Instant::now();
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
+            let latency = &store.owner.engine.io_latency;
+            latency.append_queue.record(entered.elapsed());
             let result = (|| {
-                let _guard = super::lock(&store.gate)?;
+                let _guard = store.lock_gate()?;
                 store.check_generation()?;
                 store.append_entries(entries)
             })();
+            latency.append_total.record(entered.elapsed());
             callback.io_completed(
                 result
                     .as_ref()

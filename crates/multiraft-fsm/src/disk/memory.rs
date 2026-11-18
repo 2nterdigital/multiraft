@@ -11,6 +11,9 @@ pub struct StorageMemoryStats {
     pub num_running_compactions: Option<u64>,
     pub shared: Option<SharedStorageMemoryStats>,
     pub errors: Vec<String>,
+    /// Cumulative I/O latency histograms of this database, by stage name
+    /// (`log_*` for the Raft log engine, `fsm_*` for an FSM database).
+    pub io_latency: std::collections::BTreeMap<&'static str, crate::LatencySnapshot>,
 }
 /// Column-family scoped RocksDB estimates, including obsolete pinned memtables.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

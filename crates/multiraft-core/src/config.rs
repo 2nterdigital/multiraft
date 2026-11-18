@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use crate::NodeId;
 
+/// Default [`ClusterConfig::raft_log_compaction_write_bytes_per_sec`] (32 MiB/s).
+pub const DEFAULT_RAFT_LOG_COMPACTION_WRITE_BYTES_PER_SEC: u64 = 32 * 1024 * 1024;
+
 /// Local Raft role for this process/node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NodeRole {
@@ -136,6 +139,13 @@ pub struct ClusterConfig {
     /// synchronizes WAL writes: Os/Data use fdatasync and All selects fsync.
     /// Default [`FileLogSyncLevel::Os`] (page-cache writes, Aeron level 0).
     pub file_log_sync_level: FileLogSyncLevel,
+    /// Rate limit, in bytes per second, for flush and compaction writes of the
+    /// node-shared RocksDB Raft log (`0` = unlimited). WAL (foreground append)
+    /// writes are never limited. Too low and compaction falls behind until L0
+    /// stalls block Raft appends; too high and compaction bursts saturate the
+    /// disk and delay synchronous appends. Ignored for [`LogStorageBackend::FileLog`].
+    /// Default [`DEFAULT_RAFT_LOG_COMPACTION_WRITE_BYTES_PER_SEC`].
+    pub raft_log_compaction_write_bytes_per_sec: u64,
     /// Minimum pending `log.bin` bytes before a stream flush at [`FileLogSyncLevel::Os`]
     /// (`0` = no size threshold). Ignored for Data/All sync.
     pub file_log_stream_buf_bytes: usize,
@@ -241,6 +251,8 @@ impl ClusterConfig {
             enable_stale_queries: false,
             file_log_coalesce_us: 0,
             file_log_sync_level: FileLogSyncLevel::Os,
+            raft_log_compaction_write_bytes_per_sec:
+                DEFAULT_RAFT_LOG_COMPACTION_WRITE_BYTES_PER_SEC,
             file_log_stream_buf_bytes: 0,
             file_log_stream_flush_ms: 0,
             file_log_hold_overlap: false,
@@ -293,6 +305,7 @@ mod sync_level_tests {
         let c = ClusterConfig::for_test(1, &[1, 2, 3]);
         assert_eq!(c.file_log_sync_level, FileLogSyncLevel::Os);
         assert_eq!(c.file_log_coalesce_us, 0);
+        assert_eq!(c.raft_log_compaction_write_bytes_per_sec, 32 * 1024 * 1024);
         assert_eq!(c.role, NodeRole::Voter);
         let c = c.with_stale_queries(true);
         assert!(c.enable_stale_queries);

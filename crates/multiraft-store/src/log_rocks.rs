@@ -7,8 +7,11 @@ use std::io;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use multiraft_core::StartupProvenance;
+use multiraft_core::DEFAULT_RAFT_LOG_COMPACTION_WRITE_BYTES_PER_SEC;
+use multiraft_fsm::LatencyHistogram;
 use openraft::alias::{LogIdOf, VoteOf};
 use openraft::entry::RaftEntry;
 use openraft::RaftTypeConfig;
@@ -30,6 +33,8 @@ const CONTROLLED_SCHEMA: &[u8] = b"multiraft-rocks-log-v2-controlled";
 const RAFT_LOG_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// Node-shared Raft log memtable budget (`allow_stall = false`).
 const RAFT_LOG_WRITE_BUFFER_MANAGER_BYTES: usize = 64 * 1024 * 1024;
+/// WAL files kept for reuse instead of being deleted.
+const RAFT_LOG_RECYCLED_WAL_FILES: usize = 4;
 
 struct Engine {
     db: DB,
@@ -37,6 +42,22 @@ struct Engine {
     cache: Cache,
     write_buffer_manager: WriteBufferManager,
     db_id: String,
+    io_latency: IoLatency,
+}
+
+/// Cumulative per-engine I/O stage latencies; diagnostics only.
+#[derive(Default)]
+struct IoLatency {
+    /// `append` entry until just before `io_completed`: how long RaftCore waits.
+    append_total: LatencyHistogram,
+    /// `append` entry until its blocking closure starts.
+    append_queue: LatencyHistogram,
+    /// Waiting for the per-group gate in `append` and `blocking`.
+    gate_wait: LatencyHistogram,
+    /// Every synchronous `Engine::write`.
+    sync_write: LatencyHistogram,
+    /// Whole `save_committed`, scheduling included.
+    save_committed: LatencyHistogram,
 }
 
 /// One node's shared log engine. Clones and group handles keep the DB alive.
@@ -117,7 +138,10 @@ impl Engine {
     fn write(&self, batch: WriteBatch) -> io::Result<()> {
         let mut options = WriteOptions::default();
         options.set_sync(true);
-        self.db.write_opt(batch, &options).map_err(db_error)
+        let started = Instant::now();
+        let result = self.db.write_opt(batch, &options).map_err(db_error);
+        self.io_latency.sync_write.record(started.elapsed());
+        result
     }
     fn gate(&self, group: u64) -> io::Result<Arc<Mutex<()>>> {
         Ok(Arc::clone(
@@ -142,6 +166,20 @@ where
 
     /// Select fsync (`true`) instead of fdatasync for synchronous WAL writes.
     pub fn open_with_sync_all(path: impl AsRef<Path>, sync_all: bool) -> io::Result<Self> {
+        Self::open_with(
+            path,
+            sync_all,
+            DEFAULT_RAFT_LOG_COMPACTION_WRITE_BYTES_PER_SEC,
+        )
+    }
+
+    /// [`Self::open_with_sync_all`] with a flush/compaction write limit in
+    /// bytes per second (`0` = unlimited); WAL writes are never limited.
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        sync_all: bool,
+        background_write_bytes_per_sec: u64,
+    ) -> io::Result<Self> {
         let cache = Cache::new_lru_cache(RAFT_LOG_CACHE_BYTES);
         let write_buffer_manager = WriteBufferManager::new_write_buffer_manager(
             RAFT_LOG_WRITE_BUFFER_MANAGER_BYTES,
@@ -159,6 +197,17 @@ where
         // a ~100 MiB burst of dirty SST pages otherwise lands in the journal
         // commit that every synchronous WAL append waits for.
         options.set_bytes_per_sync(1024 * 1024);
+        // Cap flush/compaction writes: an L0 compaction rewrites the whole
+        // retained log (~100 MiB) in a burst that saturated the shared disk and
+        // put every synchronous append behind it. WAL writes are not limited.
+        if background_write_bytes_per_sec > 0 {
+            let rate = i64::try_from(background_write_bytes_per_sec).unwrap_or(i64::MAX);
+            options.set_ratelimiter(rate, 100_000, 10);
+        }
+        // Reuse WAL files: overwriting already-allocated blocks lets fdatasync
+        // skip the ext4 journal commit (Lab sync-write p50 3.2 -> 0.7 ms).
+        // RocksDB keeps this on under the default point-in-time recovery.
+        options.set_recycle_log_file_num(RAFT_LOG_RECYCLED_WAL_FILES);
         options.create_if_missing(true);
         options.set_use_fsync(sync_all);
         let db = DB::open(&options, path.as_ref()).map_err(db_error)?;
@@ -184,6 +233,7 @@ where
                 cache,
                 write_buffer_manager,
                 db_id: std::fs::canonicalize(path.as_ref())?.display().to_string(),
+                io_latency: IoLatency::default(),
             }),
             config: PhantomData,
         })
@@ -219,6 +269,17 @@ where
             write_buffer_manager_limit_bytes: engine.write_buffer_manager.get_buffer_size() as u64,
             write_buffer_manager_usage_bytes: engine.write_buffer_manager.get_usage() as u64,
         });
+        let latency = &engine.io_latency;
+        stats.io_latency = [
+            ("log_append_total", &latency.append_total),
+            ("log_append_queue", &latency.append_queue),
+            ("log_gate_wait", &latency.gate_wait),
+            ("log_sync_write", &latency.sync_write),
+            ("log_save_committed", &latency.save_committed),
+        ]
+        .into_iter()
+        .map(|(name, histogram)| (name, histogram.snapshot()))
+        .collect();
         Ok(stats)
     }
 
@@ -449,6 +510,17 @@ where
         }
         Err(invalid("committed/truncate identity is not recoverable"))
     }
+    /// Take the group gate, recording the wait.
+    fn lock_gate(&self) -> io::Result<MutexGuard<'_, ()>> {
+        let started = Instant::now();
+        let guard = lock(&self.gate);
+        self.owner
+            .engine
+            .io_latency
+            .gate_wait
+            .record(started.elapsed());
+        guard
+    }
     async fn blocking<T, F>(&self, operation: F) -> io::Result<T>
     where
         T: Send + 'static,
@@ -456,7 +528,7 @@ where
     {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _guard = lock(&store.gate)?;
+            let _guard = store.lock_gate()?;
             store.check_generation()?;
             operation(store.clone())
         })

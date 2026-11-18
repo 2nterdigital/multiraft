@@ -2,11 +2,13 @@
 
 mod counter_fsm;
 mod disk;
+pub mod latency;
 pub use counter_fsm::CounterFsm;
 pub use disk::{
     AppliedState, ColumnFamilyMemoryStats, DiskState, DiskStoragePaths, SharedStorageMemoryStats,
     StorageMemoryStats,
 };
+pub use latency::{LatencyHistogram, LatencySnapshot};
 
 pub type GroupId = u64;
 pub type NodeId = u64;

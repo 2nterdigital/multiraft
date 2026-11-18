@@ -274,3 +274,37 @@ async fn snapshot_purge_can_advance_past_tail_then_accept_only_contiguous_suffix
         2
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn append_and_save_committed_record_io_latency() {
+    let root = tempfile::tempdir().unwrap();
+    let db = RocksLogDb::<TypeConfig>::open(root.path()).unwrap();
+    let mut group = db.group(7).unwrap();
+    let count = |name: &str| db.storage_memory_stats().unwrap().io_latency[name].count;
+    let names = [
+        "log_append_total",
+        "log_append_queue",
+        "log_gate_wait",
+        "log_sync_write",
+        "log_save_committed",
+    ];
+    let before = names.map(count);
+    group.blocking_append(entries(1, 0..3)).await.unwrap();
+    group.save_committed(Some(id(1, 2))).await.unwrap();
+    let after = names.map(count);
+    // One append, one save_committed; gate and sync write are taken by both.
+    assert_eq!(
+        after
+            .iter()
+            .zip(before)
+            .map(|(a, b)| a - b)
+            .collect::<Vec<_>>(),
+        vec![1, 1, 2, 2, 1]
+    );
+    let total = &db.storage_memory_stats().unwrap().io_latency["log_append_total"];
+    assert!(total.sum_ns > 0 && total.max_ns > 0);
+    assert_eq!(
+        total.sparse_buckets().map(|(_, c)| c).sum::<u64>(),
+        total.count
+    );
+}
