@@ -32,6 +32,10 @@ const CONTROLLED_SCHEMA: &[u8] = b"multiraft-rocks-log-v2-controlled";
 const RAFT_LOG_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// Node-shared Raft log memtable budget (`allow_stall = false`).
 const RAFT_LOG_WRITE_BUFFER_MANAGER_BYTES: usize = 64 * 1024 * 1024;
+/// Flush/compaction write budget for the shared Raft log DB.
+const RAFT_LOG_BACKGROUND_WRITE_BYTES_PER_SEC: i64 = 32 * 1024 * 1024;
+/// WAL files kept for reuse instead of being deleted.
+const RAFT_LOG_RECYCLED_WAL_FILES: usize = 4;
 
 struct Engine {
     db: DB,
@@ -88,25 +92,6 @@ where
     purged: Option<LogIdOf<C>>,
     tail: Option<LogIdOf<C>>,
     bytes: u64,
-}
-
-/// shortcut: Lab-only experiment knobs read from the environment; replace with
-/// real config (or drop) once the rate-limit / WAL-recycle experiment decides.
-/// `MULTIRAFT_RAFT_LOG_RATE_LIMIT_MIB`: flush/compaction write rate cap.
-/// `MULTIRAFT_RAFT_LOG_RECYCLE_WAL`: number of WAL files to recycle.
-fn experimental_tuning(options: &mut Options) {
-    let read = |name| {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-    };
-    if let Some(mib) = read("MULTIRAFT_RAFT_LOG_RATE_LIMIT_MIB") {
-        options.set_ratelimiter((mib * 1024 * 1024) as i64, 100_000, 10);
-    }
-    if let Some(files) = read("MULTIRAFT_RAFT_LOG_RECYCLE_WAL") {
-        options.set_recycle_log_file_num(files as usize);
-    }
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -199,7 +184,14 @@ where
         // a ~100 MiB burst of dirty SST pages otherwise lands in the journal
         // commit that every synchronous WAL append waits for.
         options.set_bytes_per_sync(1024 * 1024);
-        experimental_tuning(&mut options);
+        // Cap flush/compaction writes: an L0 compaction rewrites the whole
+        // retained log (~100 MiB) in a burst that saturated the shared disk and
+        // put every synchronous append behind it. WAL writes are not limited.
+        options.set_ratelimiter(RAFT_LOG_BACKGROUND_WRITE_BYTES_PER_SEC, 100_000, 10);
+        // Reuse WAL files: overwriting already-allocated blocks lets fdatasync
+        // skip the ext4 journal commit (Lab sync-write p50 3.2 -> 0.7 ms).
+        // RocksDB keeps this on under the default point-in-time recovery.
+        options.set_recycle_log_file_num(RAFT_LOG_RECYCLED_WAL_FILES);
         options.create_if_missing(true);
         options.set_use_fsync(sync_all);
         let db = DB::open(&options, path.as_ref()).map_err(db_error)?;

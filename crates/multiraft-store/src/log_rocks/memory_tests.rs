@@ -35,6 +35,8 @@ fn group_handles_share_engine_resources_and_effective_options() {
         "max_write_buffer_number=2",
         "max_open_files=64",
         "bytes_per_sync=1048576",
+        // Persisted only if RocksDB did not sanitize WAL recycling away.
+        "recycle_log_file_num=4",
         "use_fsync=true",
     ] {
         assert!(
@@ -42,6 +44,8 @@ fn group_handles_share_engine_resources_and_effective_options() {
             "missing effective option {expected}"
         );
     }
+    let log = std::fs::read_to_string(root.path().join("LOG")).unwrap();
+    assert!(log.contains("Options.rate_limiter: 0x"), "no rate limiter");
     drop(db);
     assert!(
         first.owner.storage_memory_stats().unwrap().column_families[0]
@@ -63,26 +67,4 @@ fn old_default_options_schema_reopens_with_bounded_resources() {
         db.storage_memory_stats().unwrap().column_families[0].name,
         "default"
     );
-}
-
-#[test]
-fn experiment_knobs_reach_the_persisted_options() {
-    // Env is process-wide; this is the only test that sets these variables.
-    std::env::set_var("MULTIRAFT_RAFT_LOG_RATE_LIMIT_MIB", "32");
-    std::env::set_var("MULTIRAFT_RAFT_LOG_RECYCLE_WAL", "4");
-    let root = tempfile::tempdir().unwrap();
-    let db = RocksLogDb::<TypeConfig>::open(root.path()).unwrap();
-    std::env::remove_var("MULTIRAFT_RAFT_LOG_RATE_LIMIT_MIB");
-    std::env::remove_var("MULTIRAFT_RAFT_LOG_RECYCLE_WAL");
-    let options = std::fs::read_dir(root.path())
-        .unwrap()
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("OPTIONS-"))
-        .unwrap();
-    let text = std::fs::read_to_string(options.path()).unwrap();
-    assert!(
-        text.contains("recycle_log_file_num=4"),
-        "WAL recycling was sanitized away"
-    );
-    drop(db);
 }
