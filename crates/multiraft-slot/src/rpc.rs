@@ -10,6 +10,7 @@ use multiraft_net::application_rpc::{
     ApplicationRpcHandler, RpcCall, RpcContext, RpcDispatch, RpcErrorKind, RpcFuture,
     RpcHandlerError, RpcReply, APPLICATION_RPC_OUTER_BYTES,
 };
+use openraft::ReadPolicy;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Weak};
 use tokio::time::Instant;
@@ -63,6 +64,10 @@ enum Operation {
     // Appended so older variants keep their encoding; a peer that predates it
     // rejects the request as invalid instead of misreading it.
     ReadWithApplied(Vec<u8>),
+    // Leader lease reads, appended for the same reason; answered with the
+    // Read / ReadWithApplied values.
+    LeasedRead(Vec<u8>),
+    LeasedReadWithApplied(Vec<u8>),
 }
 #[derive(Serialize, Deserialize)]
 struct Reply {
@@ -185,17 +190,52 @@ impl<S: SlotStateMachine> ApplicationRpcHandler for Handler<S> {
                             .await
                             .map(Value::Applied)
                     }
-                    Operation::Read(query) | Operation::ReadWithApplied(query)
+                    Operation::Read(query)
+                    | Operation::ReadWithApplied(query)
+                    | Operation::LeasedRead(query)
+                    | Operation::LeasedReadWithApplied(query)
                         if query.len() > MAX_QUERY_BYTES =>
                     {
                         Err(RuntimeError::PayloadTooLarge)
                     }
                     Operation::Read(query) => shared
-                        .local_query(slot, request.key.len(), &query, context.deadline)
+                        .local_query(
+                            slot,
+                            request.key.len(),
+                            &query,
+                            ReadPolicy::ReadIndex,
+                            context.deadline,
+                        )
                         .await
                         .map(|view| read_value(view, false)),
                     Operation::ReadWithApplied(query) => shared
-                        .local_query(slot, request.key.len(), &query, context.deadline)
+                        .local_query(
+                            slot,
+                            request.key.len(),
+                            &query,
+                            ReadPolicy::ReadIndex,
+                            context.deadline,
+                        )
+                        .await
+                        .map(|view| read_value(view, true)),
+                    Operation::LeasedRead(query) => shared
+                        .local_query(
+                            slot,
+                            request.key.len(),
+                            &query,
+                            ReadPolicy::LeaseRead,
+                            context.deadline,
+                        )
+                        .await
+                        .map(|view| read_value(view, false)),
+                    Operation::LeasedReadWithApplied(query) => shared
+                        .local_query(
+                            slot,
+                            request.key.len(),
+                            &query,
+                            ReadPolicy::LeaseRead,
+                            context.deadline,
+                        )
                         .await
                         .map(|view| read_value(view, true)),
                 }
@@ -346,9 +386,10 @@ pub(crate) async fn route_read<S: SlotStateMachine>(
     slot: SlotId,
     key: Vec<u8>,
     query: Vec<u8>,
+    policy: ReadPolicy,
     deadline: Instant,
 ) -> Result<Vec<u8>, RuntimeError> {
-    match route_query(shared, slot, key, query, deadline, false).await? {
+    match route_query(shared, slot, key, query, policy, deadline, false).await? {
         Value::Read(v) if v.len() <= MAX_EFFECTS_BYTES => Ok(v),
         _ => Err(RuntimeError::Unavailable),
     }
@@ -358,9 +399,10 @@ pub(crate) async fn route_read_with_applied<S: SlotStateMachine>(
     slot: SlotId,
     key: Vec<u8>,
     query: Vec<u8>,
+    policy: ReadPolicy,
     deadline: Instant,
 ) -> Result<LinearizableView<Vec<u8>>, RuntimeError> {
-    match route_query(shared, slot, key, query, deadline, true).await? {
+    match route_query(shared, slot, key, query, policy, deadline, true).await? {
         Value::ReadWithApplied { value, applied } if value.len() <= MAX_EFFECTS_BYTES => {
             Ok(LinearizableView {
                 value,
@@ -375,6 +417,7 @@ async fn route_query<S: SlotStateMachine>(
     slot: SlotId,
     key: Vec<u8>,
     query: Vec<u8>,
+    policy: ReadPolicy,
     deadline: Instant,
     with_applied: bool,
 ) -> Result<Value, RuntimeError> {
@@ -384,13 +427,15 @@ async fn route_query<S: SlotStateMachine>(
         .acquire(slot, key.len() + query.len() + MAX_EFFECTS_BYTES)?;
     let target = destination(shared, slot, &key, deadline).await?;
     if target == shared.node_id {
-        let view = shared.execute_query(slot, &query, deadline).await?;
+        let view = shared.execute_query(slot, &query, policy, deadline).await?;
         return Ok(read_value(view, with_applied));
     }
-    let operation = if with_applied {
-        Operation::ReadWithApplied(query)
-    } else {
-        Operation::Read(query)
+    // The destination executes the read locally with the same policy; it never forwards.
+    let operation = match (policy == ReadPolicy::LeaseRead, with_applied) {
+        (false, false) => Operation::Read(query),
+        (false, true) => Operation::ReadWithApplied(query),
+        (true, false) => Operation::LeasedRead(query),
+        (true, true) => Operation::LeasedReadWithApplied(query),
     };
     remote(shared, target, slot, key, operation, deadline, false).await
 }

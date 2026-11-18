@@ -27,6 +27,7 @@ use multiraft_net::{
     NodeOwner, RuntimeHandle, StartupReport,
 };
 pub use node_config::SlotNodeConfig;
+use openraft::ReadPolicy;
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -320,20 +321,22 @@ impl<S: SlotStateMachine> Shared<S> {
         slot: SlotId,
         key_bytes: usize,
         query: &[u8],
+        policy: ReadPolicy,
         deadline: Instant,
     ) -> Result<crate::LinearizableView<Vec<u8>>, RuntimeError> {
         self.check(deadline)?;
         let _guard = self
             .budget
             .acquire(slot, key_bytes + query.len() + MAX_EFFECTS_BYTES)?;
-        self.execute_query(slot, query, deadline).await
+        self.execute_query(slot, query, policy, deadline).await
     }
     /// The value and the applied id it reflects, sampled under one FSM lock
-    /// after this call's ReadIndex confirmation.
+    /// after this call's ReadIndex (or leader lease) confirmation.
     pub(crate) async fn execute_query(
         self: &Arc<Self>,
         slot: SlotId,
         query: &[u8],
+        policy: ReadPolicy,
         deadline: Instant,
     ) -> Result<crate::LinearizableView<Vec<u8>>, RuntimeError> {
         self.check(deadline)?;
@@ -341,13 +344,18 @@ impl<S: SlotStateMachine> Shared<S> {
             .layout
             .group_for_slot(slot)
             .map_err(|_| RuntimeError::InvalidRequest)?;
-        let result = std::panic::AssertUnwindSafe(self.native.read_linearizable_with_applied(
-            group,
-            deadline,
-            |s| s.query(group, query),
-        ))
-        .catch_unwind()
-        .await;
+        let query = |s: &S| s.query(group, query);
+        let read = if policy == ReadPolicy::LeaseRead {
+            futures::future::Either::Left(
+                self.native.read_leased_with_applied(group, deadline, query),
+            )
+        } else {
+            futures::future::Either::Right(
+                self.native
+                    .read_linearizable_with_applied(group, deadline, query),
+            )
+        };
+        let result = std::panic::AssertUnwindSafe(read).catch_unwind().await;
         let view = match result {
             Ok(result) => {
                 let view = result.map_err(|e| native(e, false))?;
@@ -454,7 +462,15 @@ impl<S: SlotStateMachine> SlotHandle<S> {
     ) -> Result<Vec<u8>, RuntimeError> {
         let slot = self.validate(key, query, MAX_QUERY_BYTES)?;
         let shared = self.shared()?;
-        crate::rpc::route_read(&shared, slot, key.to_vec(), query.to_vec(), deadline).await
+        crate::rpc::route_read(
+            &shared,
+            slot,
+            key.to_vec(),
+            query.to_vec(),
+            ReadPolicy::ReadIndex,
+            deadline,
+        )
+        .await
     }
     /// Linearizable read that also returns the applied log id the value
     /// reflects, sampled under the same FSM lock on the replica that confirmed
@@ -470,8 +486,62 @@ impl<S: SlotStateMachine> SlotHandle<S> {
     ) -> Result<crate::LinearizableView<Vec<u8>>, RuntimeError> {
         let slot = self.validate(key, query, MAX_QUERY_BYTES)?;
         let shared = self.shared()?;
-        crate::rpc::route_read_with_applied(&shared, slot, key.to_vec(), query.to_vec(), deadline)
-            .await
+        crate::rpc::route_read_with_applied(
+            &shared,
+            slot,
+            key.to_vec(),
+            query.to_vec(),
+            ReadPolicy::ReadIndex,
+            deadline,
+        )
+        .await
+    }
+    /// Leader lease read with the same routing as [`Self::read_linearizable`]:
+    /// a non-leader forwards it and the leader answers locally. A leader whose
+    /// lease is valid skips the ReadIndex quorum round; an unconfirmed or
+    /// expired lease falls back once to ReadIndex within `deadline`.
+    /// Linearizable only while clock-rate drift between nodes stays within the
+    /// lease margin; use it only where the caller tolerates a stale read then.
+    /// A forwarded read needs a destination that also has this API: a peer
+    /// built before it rejects the request with `InvalidRequest`.
+    pub async fn read_leased(
+        &self,
+        key: &[u8],
+        query: &[u8],
+        deadline: Instant,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        let slot = self.validate(key, query, MAX_QUERY_BYTES)?;
+        let shared = self.shared()?;
+        crate::rpc::route_read(
+            &shared,
+            slot,
+            key.to_vec(),
+            query.to_vec(),
+            ReadPolicy::LeaseRead,
+            deadline,
+        )
+        .await
+    }
+    /// [`Self::read_leased`] that also returns the applied log id the value
+    /// reflects, sampled under the same FSM lock; same caveats as
+    /// [`Self::read_linearizable_with_applied`].
+    pub async fn read_leased_with_applied(
+        &self,
+        key: &[u8],
+        query: &[u8],
+        deadline: Instant,
+    ) -> Result<crate::LinearizableView<Vec<u8>>, RuntimeError> {
+        let slot = self.validate(key, query, MAX_QUERY_BYTES)?;
+        let shared = self.shared()?;
+        crate::rpc::route_read_with_applied(
+            &shared,
+            slot,
+            key.to_vec(),
+            query.to_vec(),
+            ReadPolicy::LeaseRead,
+            deadline,
+        )
+        .await
     }
     /// Value and applied watermark sampled atomically under the same FSM lock.
     /// This local view never establishes leader authority or quorum freshness.

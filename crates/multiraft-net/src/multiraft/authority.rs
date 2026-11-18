@@ -90,7 +90,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 .ok_or(LocalAuthorityError::LocalMissing)?;
             sm.application_ready()
                 .map_err(|_| LocalAuthorityError::Unavailable)?;
-            let read_barrier = read::confirm(&raft, deadline).await?;
+            let read_barrier = read::confirm(&raft, ReadPolicy::ReadIndex, deadline).await?;
             let committed_before = raft
                 .with_raft_state(|state| state.membership_state.committed().as_ref().clone())
                 .await

@@ -155,6 +155,10 @@ where
         options.set_write_buffer_size(16 * 1024 * 1024);
         options.set_max_write_buffer_number(2);
         options.set_max_open_files(64);
+        // Write compaction output back in 1 MiB steps: on ext4 (data=ordered)
+        // a ~100 MiB burst of dirty SST pages otherwise lands in the journal
+        // commit that every synchronous WAL append waits for.
+        options.set_bytes_per_sync(1024 * 1024);
         options.create_if_missing(true);
         options.set_use_fsync(sync_all);
         let db = DB::open(&options, path.as_ref()).map_err(db_error)?;

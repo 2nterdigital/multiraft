@@ -19,9 +19,10 @@ fn native_failure(error: openraft::error::Fatal<TypeConfig>) -> ReadIndexFailure
 /// Returns the confirmed read point; OpenRaft has applied at least that far.
 pub(super) async fn confirm<S: StateMachine>(
     raft: &Raft<S>,
+    policy: ReadPolicy,
     deadline: Instant,
 ) -> Result<Option<openraft::alias::LogIdOf<TypeConfig>>, MultiRaftError> {
-    match tokio::time::timeout_at(deadline, raft.ensure_linearizable(ReadPolicy::ReadIndex)).await {
+    match tokio::time::timeout_at(deadline, raft.ensure_linearizable(policy)).await {
         Ok(Ok(read_log_id)) => Ok(read_log_id),
         Ok(Err(error)) => {
             if let Some(fwd) = error.forward_to_leader() {
@@ -65,9 +66,15 @@ impl<S: StateMachine> MultiRaft<S> {
         deadline: Instant,
         query: impl FnOnce(&S) -> R,
     ) -> Result<R, MultiRaftError> {
-        self.read_observed_view(group, deadline, query, None, None, |_| {
-            ReadOutcome::Completed
-        })
+        self.read_observed_view(
+            group,
+            ReadPolicy::ReadIndex,
+            deadline,
+            query,
+            None,
+            None,
+            |_| ReadOutcome::Completed,
+        )
         .await
         .map(|view| view.value)
     }
@@ -80,14 +87,44 @@ impl<S: StateMachine> MultiRaft<S> {
         deadline: Instant,
         query: impl FnOnce(&S) -> R,
     ) -> Result<crate::LinearizableView<R>, MultiRaftError> {
-        self.read_observed_view(group, deadline, query, None, None, |_| {
-            ReadOutcome::Completed
-        })
+        self.read_observed_view(
+            group,
+            ReadPolicy::ReadIndex,
+            deadline,
+            query,
+            None,
+            None,
+            |_| ReadOutcome::Completed,
+        )
         .await
     }
+    /// Leader lease read: like [`Self::read_linearizable_with_applied_at`], but
+    /// a leader whose lease is still valid answers without a quorum round. An
+    /// unconfirmed or expired lease falls back once to ReadIndex within the same
+    /// deadline. Linearizable only while clock-rate drift between nodes stays
+    /// within the lease margin.
+    pub async fn read_leased_with_applied_at<R>(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+        query: impl FnOnce(&S) -> R,
+    ) -> Result<crate::LinearizableView<R>, MultiRaftError> {
+        self.read_observed_view(
+            group,
+            ReadPolicy::LeaseRead,
+            deadline,
+            query,
+            None,
+            None,
+            |_| ReadOutcome::Completed,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn read_observed_view<R>(
         &self,
         group: GroupId,
+        policy: ReadPolicy,
         deadline: Instant,
         query: impl FnOnce(&S) -> R,
         observer: Option<&dyn ReadObserver>,
@@ -113,8 +150,16 @@ impl<S: StateMachine> MultiRaft<S> {
             // quorum; a follower that answers a little later (busy applying
             // or syncing) is not lost authority. Retry within this caller's
             // budget; leadership loss and terminal failures still propagate.
+            let mut policy = policy;
             loop {
-                match confirm(&raft, deadline).await {
+                match confirm(&raft, policy.clone(), deadline).await {
+                    // No hint: this node's lease is unconfirmed or expired, so
+                    // ReadIndex decides leadership. A known other leader is returned as is.
+                    Err(MultiRaftError::NotLeader { hint: None })
+                        if policy == ReadPolicy::LeaseRead =>
+                    {
+                        policy = ReadPolicy::ReadIndex;
+                    }
                     Err(MultiRaftError::ReadIndex(ReadIndexFailure::QuorumUnavailable {
                         ..
                     })) if Instant::now() + QUORUM_RETRY < deadline => {
