@@ -406,6 +406,10 @@ where
                     "native state machine closed",
                 ));
             }
+            if self.disk {
+                // Syncs and answers before the FSM lock is released.
+                return self.apply_disk_batch(&mut inner, &mut entries).await;
+            }
             while let Some((entry, responder)) = entries.try_next().await? {
                 tracing::trace!(%entry.log_id, "replicate to sm");
 
@@ -415,15 +419,6 @@ where
                         io::ErrorKind::InvalidData,
                         "native entry also contains application bytes",
                     ));
-                }
-
-                if self.disk {
-                    self.validation.changed();
-                    let response = inner.apply_disk_entry(&entry)?;
-                    if let Some(responder) = responder {
-                        responder.send(response);
-                    }
-                    continue;
                 }
 
                 if matches!(&entry.payload, EntryPayload::Normal(request) if request.control.is_some())

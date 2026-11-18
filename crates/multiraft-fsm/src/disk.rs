@@ -94,9 +94,11 @@ pub trait DiskState {
     }
 
     /// Apply one entry exactly once. `data` is `None` for entries without an
-    /// application payload (blank, membership, internal). Before returning,
-    /// make the entry's rows and `applied.record()` durable in ONE atomic
-    /// write; an error stops the Group and the entry is replayed on restart.
+    /// application payload (blank, membership, internal). Write the entry's
+    /// rows and `applied.record()` in ONE atomic write, durable before this
+    /// returns; when [`Self::defers_sync`] is true it is durable once
+    /// [`Self::sync_applied`] returns. An error stops the Group and the entry
+    /// is replayed on restart.
     fn apply_durable(
         &mut self,
         group: GroupId,
@@ -104,6 +106,20 @@ pub trait DiskState {
         data: Option<&[u8]>,
         applied: &AppliedState,
     ) -> io::Result<ApplyOut>;
+
+    /// true: [`Self::apply_durable`] does not sync; durability comes from
+    /// [`Self::sync_applied`], which the bridge calls before answering clients
+    /// and before releasing the FSM lock. Read once per apply batch.
+    fn defers_sync(&self) -> bool {
+        false
+    }
+
+    /// Make every entry written by [`Self::apply_durable`] since the last call
+    /// durable. Called only when [`Self::defers_sync`] is true; an error stops
+    /// the Group and the unsynced entries are replayed on restart.
+    fn sync_applied(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 
     /// A directory owned by this Group's store, on the same filesystem as the
     /// live store (checkpoints are hard links and installs are renames). The

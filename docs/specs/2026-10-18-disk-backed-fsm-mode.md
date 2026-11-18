@@ -77,10 +77,12 @@ In `multiraft-fsm` (no RocksDB dependency):
 - `DiskState::apply_durable(&mut self, group, index, data: Option<&[u8]>,
   applied: &AppliedState) -> io::Result<ApplyOut>` is called exactly once
   per applied entry. `data` is `None` for blank, membership and internal
-  entries. The implementation must make the entry's rows and
-  `applied.record()` durable in **one** atomic write before returning. In
-  disk mode the bridge never calls `apply`, `snapshot`, `restore` or the
-  capture hooks.
+  entries. The implementation must write the entry's rows and
+  `applied.record()` in **one** atomic write, durable before returning, or,
+  when `DiskState::defers_sync` is true, once `DiskState::sync_applied`
+  returns (ADR 0022 in ech0: one sync per apply batch, every 256 entries at
+  most). In disk mode the bridge never calls `apply`, `snapshot`, `restore`
+  or the capture hooks.
 
 In `multiraft-store`, `DiskFsmDb` is the RocksDB helper that implements the
 layout above: it opens (or creates) the instance, checks the schema, Group
@@ -91,8 +93,11 @@ writes it once. `DiskFsmDb::group_path(data_dir, group)` gives the canonical
 location. The rocksdb crate is re-exported so consumers use the same pinned
 version.
 
-The bridge sends an entry's client response, and advances its in-memory
-applied position and membership, only after `apply_durable` returns.
+The bridge advances its in-memory applied position and membership only after
+`apply_durable` returns, and sends an entry's client response only once the
+entry is durable: right after `apply_durable`, or with `defers_sync` after the
+`sync_applied` that covers it, before the FSM lock is released. A failed sync
+sends no response and stops the Group; the entries replay on restart.
 
 For #190 the plan is to add checkpoint/export and install hooks to
 `DiskState`, with default implementations that refuse. Existing
@@ -143,11 +148,14 @@ reopen the instance. ech0's composite FSM (#191) implements `DiskState` over
   the leader works, because this mode never purges. #190 can make the forced
   build succeed.
 - Every write uses a synchronous WAL by default (`DiskFsmOptions::sync_writes`).
-  Turning it off survives SIGKILL (the WAL is still written). After power
-  loss the FSM may move back to an earlier applied position, which is safe
-  only while the local log keeps every entry after the FSM's durable point.
-  That is always true while disk mode cannot compact. #190 must flush the FSM
-  before purging the log.
+  With `false`, commits are not synced and the caller syncs them with
+  `DiskFsmDb::sync_wal` (forward `defers_sync` / `sync_applied` to it). They
+  survive SIGKILL (the WAL is still written); after power loss the FSM
+  normally moves back by at most the unsynced, unanswered entries, which
+  replay from the local log. If a WAL switch falls inside that unsynced
+  window, power loss can instead leave a WAL hole (newer WAL kept, older
+  tail lost) that point-in-time recovery does not detect, so the replica can
+  silently diverge; ech0 ADR 0022 accepts this residual risk. Checkpoints sync the WAL before the log is purged.
 
 ## Risks recorded
 

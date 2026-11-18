@@ -32,9 +32,11 @@ pub struct DiskFsmOptions {
     pub column_families: Vec<String>,
     /// Application format tag; an existing database with another tag fails.
     pub app_format: Vec<u8>,
-    /// Synchronous WAL for every commit (default). `false` still survives a
-    /// process kill; after power loss the applied position may move back,
-    /// which is safe only while the Raft log keeps the entries after it.
+    /// Synchronous WAL for every commit (default). `false`: commits are not
+    /// synced; the caller syncs them with [`DiskFsmDb::sync_wal`] (the bridge
+    /// does so once per apply batch, through `DiskState::sync_applied`, when
+    /// [`DiskFsmDb::defers_sync`] is forwarded). Unsynced commits survive a
+    /// process kill but not power loss.
     pub sync_writes: bool,
     /// Base RocksDB tuning (shared cache, write-buffer manager, file limits).
     /// Creation flags are set by `open`. Only database-wide settings (such as
@@ -80,6 +82,8 @@ pub struct DiskFsmDb {
     options: DiskFsmOptions,
     /// Duration of each [`Self::commit`] write; diagnostics only.
     commit_latency: LatencyHistogram,
+    /// Duration of each [`Self::sync_wal`]; diagnostics only.
+    batch_sync_latency: LatencyHistogram,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -126,6 +130,7 @@ impl DiskFsmDb {
             group,
             options,
             commit_latency: LatencyHistogram::default(),
+            batch_sync_latency: LatencyHistogram::default(),
         })
     }
 
@@ -192,6 +197,9 @@ impl DiskFsmDb {
         stats
             .io_latency
             .insert("fsm_commit_sync", self.commit_latency.snapshot());
+        stats
+            .io_latency
+            .insert("fsm_batch_sync", self.batch_sync_latency.snapshot());
         Ok(stats)
     }
 
@@ -241,6 +249,22 @@ impl DiskFsmDb {
         let started = std::time::Instant::now();
         let result = db.write_opt(batch, &write).map_err(db_error);
         self.commit_latency.record(started.elapsed());
+        result
+    }
+
+    /// Whether commits leave syncing to [`Self::sync_wal`] (`sync_writes = false`);
+    /// forward it from `DiskState::defers_sync`.
+    pub fn defers_sync(&self) -> bool {
+        !self.options.sync_writes
+    }
+
+    /// Sync the WAL, closed WAL files included, making every earlier
+    /// [`Self::commit`] durable; forward it from `DiskState::sync_applied`.
+    pub fn sync_wal(&self) -> io::Result<()> {
+        let db = self.live()?;
+        let started = std::time::Instant::now();
+        let result = db.flush_wal(true).map_err(db_error);
+        self.batch_sync_latency.record(started.elapsed());
         result
     }
 }
@@ -336,6 +360,47 @@ mod memory_tests {
         assert_eq!(count(), 0);
         db.commit(WriteBatch::default(), &AppliedState::new(1, 1, vec![]))
             .unwrap();
+        assert_eq!(count(), 1);
+    }
+
+    /// `rocksdb.wal.synced` after `commits` commits, then after one `sync_wal`.
+    fn wal_syncs(sync_writes: bool, commits: u64) -> (u64, u64, u64) {
+        let root = tempfile::tempdir().unwrap();
+        let mut options = DiskFsmOptions::new(b"test");
+        options.sync_writes = sync_writes;
+        options.db_options.enable_statistics();
+        // The statistics object is shared with the copy `open` hands to RocksDB.
+        let stats = options.db_options.clone();
+        let synced = || stats.get_ticker_count(rocksdb::statistics::Ticker::WalFileSynced);
+        let db = DiskFsmDb::open(root.path().join("db"), 7, options).unwrap();
+        assert_eq!(db.defers_sync(), !sync_writes);
+        let opened = synced();
+        for index in 1..=commits {
+            db.commit(WriteBatch::default(), &AppliedState::new(index, 1, vec![]))
+                .unwrap();
+        }
+        let committed = synced();
+        db.sync_wal().unwrap();
+        (opened, committed, synced())
+    }
+
+    #[test]
+    fn deferred_commits_are_synced_only_by_sync_wal() {
+        let (opened, committed, after_sync) = wal_syncs(false, 5);
+        assert_eq!(committed, opened, "deferred commits do not sync");
+        assert!(after_sync > committed, "sync_wal syncs the WAL");
+
+        let (opened, committed, _) = wal_syncs(true, 5);
+        assert_eq!(committed - opened, 5, "each synchronous commit syncs");
+    }
+
+    #[test]
+    fn sync_wal_records_io_latency() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DiskFsmDb::open(root.path().join("db"), 7, DiskFsmOptions::new(b"test")).unwrap();
+        let count = || db.storage_memory_stats().unwrap().io_latency["fsm_batch_sync"].count;
+        assert_eq!(count(), 0);
+        db.sync_wal().unwrap();
         assert_eq!(count(), 1);
     }
 }

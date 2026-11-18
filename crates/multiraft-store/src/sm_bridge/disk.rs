@@ -2,6 +2,7 @@
 use super::*;
 use crate::disk_snapshot::{Incoming, Workspace};
 use multiraft_fsm::AppliedState;
+use openraft::storage::ApplyResponder;
 use openraft::storage::{RaftLogReader, RaftLogStorage};
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +68,96 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
 
+/// Entries written per sync when the FSM defers syncing: bounds the power-loss
+/// rollback and how long the first client of a long batch (replay, catch-up) waits.
+const SYNC_EVERY: usize = 256;
+
+type PendingAnswers = Vec<(Option<ApplyResponder<TypeConfig>>, Response)>;
+
+impl<S: StateMachine> StateMachineStore<S> {
+    /// Apply one OpenRaft batch under the caller's FSM lock (ADR 0022). When the
+    /// FSM defers syncing, each answer waits for a [`multiraft_fsm::DiskState::sync_applied`]
+    /// covering its entry: every [`SYNC_EVERY`] entries and at the batch end,
+    /// also when an entry fails. A failed sync answers nothing and stops the Group.
+    pub(super) async fn apply_disk_batch<Strm>(
+        &self,
+        inner: &mut StateMachineStoreInner<S>,
+        entries: &mut Strm,
+    ) -> io::Result<()>
+    where
+        Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend,
+    {
+        let defers = inner
+            .fsm
+            .disk_state()
+            .is_some_and(|disk| disk.defers_sync());
+        let mut pending = PendingAnswers::new();
+        let result = self
+            .apply_disk_entries(inner, entries, defers, &mut pending)
+            .await;
+        if !pending.is_empty() {
+            // Entries written before an early exit are synced and answered too.
+            if let Err(sync) = inner.sync_and_answer(&mut pending) {
+                if let Err(apply) = &result {
+                    // Only one error goes up; keep the one that started the exit.
+                    tracing::error!(%apply, %sync, "FSM apply failed, then syncing the entries before it failed too");
+                }
+                return Err(sync);
+            }
+        }
+        result
+    }
+
+    async fn apply_disk_entries<Strm>(
+        &self,
+        inner: &mut StateMachineStoreInner<S>,
+        entries: &mut Strm,
+        defers: bool,
+        pending: &mut PendingAnswers,
+    ) -> io::Result<()>
+    where
+        Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend,
+    {
+        while let Some((entry, responder)) = entries.try_next().await? {
+            tracing::trace!(%entry.log_id, "replicate to sm");
+            if matches!(&entry.payload, EntryPayload::Normal(request) if request.control.is_some() && !request.data.is_empty())
+            {
+                return Err(invalid("native entry also contains application bytes"));
+            }
+            self.validation.changed();
+            let response = inner.apply_disk_entry(&entry)?;
+            if !defers {
+                if let Some(responder) = responder {
+                    responder.send(response);
+                }
+                continue;
+            }
+            pending.push((responder, response));
+            if pending.len() == SYNC_EVERY {
+                inner.sync_and_answer(pending)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<S: StateMachine> StateMachineStoreInner<S> {
+    /// Sync the entries written so far, then answer them. On a sync error the
+    /// answers are dropped unsent, so `pending` is empty either way.
+    fn sync_and_answer(&mut self, pending: &mut PendingAnswers) -> io::Result<()> {
+        let answers = std::mem::take(pending);
+        self.fsm
+            .disk_state()
+            .ok_or_else(|| invalid("state machine left disk-backed mode"))?
+            .sync_applied()?;
+        for (responder, response) in answers {
+            if let Some(responder) = responder {
+                responder.send(response);
+            }
+        }
+        Ok(())
+    }
+
     /// Seed the applied position and membership from the FSM's store, and open
     /// its snapshot workspace (removing stale transfer leftovers), once.
     pub(super) fn load_disk_state(&mut self) -> io::Result<()> {
@@ -164,7 +254,8 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
             .disk_state()
             .ok_or_else(|| invalid("state machine left disk-backed mode"))?;
         let out = disk.apply_durable(group, entry.log_id.index, data, &applied)?;
-        // Durable now: only then advance the in-memory view and answer.
+        // Written (durable unless the FSM defers its sync to the batch end):
+        // advance the in-memory view; the caller answers once it is durable.
         self.last_applied_log = Some(record.last_applied);
         self.last_membership = record.membership;
         self.control = record.control;
