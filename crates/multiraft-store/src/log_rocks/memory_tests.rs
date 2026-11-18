@@ -34,6 +34,7 @@ fn group_handles_share_engine_resources_and_effective_options() {
         "write_buffer_size=16777216",
         "max_write_buffer_number=2",
         "max_open_files=64",
+        "bytes_per_sync=1048576",
         "use_fsync=true",
     ] {
         assert!(
