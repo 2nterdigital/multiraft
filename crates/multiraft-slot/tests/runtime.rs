@@ -230,6 +230,22 @@ async fn timeout_and_drop_hold_slot_budget_until_native_completion_other_slot_pr
             .await,
         Err(RuntimeError::PayloadTooLarge)
     );
+    let leased = h
+        .read_leased_with_applied(&k0, &[], deadline())
+        .await
+        .unwrap();
+    assert_eq!(leased.value, committed.effects);
+    assert_eq!(leased.applied.index, committed.index);
+    assert_eq!(leased.applied.term, committed.term);
+    assert_eq!(
+        h.read_leased(&k0, &[], deadline()).await.unwrap(),
+        committed.effects
+    );
+    assert_eq!(
+        h.read_leased_with_applied(&k0, &[0; MAX_QUERY_BYTES + 1], deadline())
+            .await,
+        Err(RuntimeError::PayloadTooLarge)
+    );
     assert_eq!(
         u64::from_be_bytes(
             h.read_linearizable(&k0, &[], deadline())
@@ -659,6 +675,23 @@ async fn real_grpc_nonhosted_node_routes_single_write_and_linearizable_read() {
         view.applied.index >= result.index,
         "{view:?} must reflect write {result:?}"
     );
+    // Lease reads take the same forwarding route; the leader answers locally.
+    let leased = retry_across_transition(
+        || h.read_leased_with_applied(&k, &[], until),
+        observe,
+        until,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("forwarded lease read failed: {e:?}"));
+    assert_eq!(leased.value, 1u64.to_be_bytes());
+    assert!(
+        leased.applied.index >= result.index,
+        "{leased:?} must reflect write {result:?}"
+    );
+    let leased = retry_across_transition(|| h.read_leased(&k, &[], until), observe, until)
+        .await
+        .unwrap_or_else(|e| panic!("forwarded lease read failed: {e:?}"));
+    assert_eq!(leased, 1u64.to_be_bytes());
     assert!(h
         .leader_hint(SlotId(0), deadline())
         .await

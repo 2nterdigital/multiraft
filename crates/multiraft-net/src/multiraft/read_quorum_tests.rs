@@ -151,3 +151,50 @@ async fn lost_leadership_fails_the_read_promptly() {
         "leadership loss must end the retry well before the deadline; elapsed {elapsed:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_lease_falls_back_to_read_index() {
+    let group = 9;
+    let (nodes, leader_id, _fault) = three_nodes(group).await;
+    let leader = nodes.iter().find(|n| n.node_id() == leader_id).unwrap();
+    leader
+        .propose(group, CounterFsm::encode_add(5, 1))
+        .await
+        .expect("propose");
+    // No heartbeats and no elections: leadership stays put while the lease
+    // (election_timeout_max = 600 ms) runs out without fresh quorum acks.
+    for node in &nodes {
+        let raft = node.raft(group).unwrap();
+        raft.runtime_config().elect(false);
+        raft.runtime_config().heartbeat(false);
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let raft = leader.raft(group).unwrap();
+    match raft.ensure_linearizable(ReadPolicy::LeaseRead).await {
+        Err(error) => assert!(
+            error
+                .forward_to_leader()
+                .is_some_and(|f| f.leader_id.is_none()),
+            "lease must be expired: {error:?}"
+        ),
+        Ok(read) => panic!("lease unexpectedly valid at {read:?}"),
+    }
+    let view = leader
+        .read_leased_with_applied_at(group, Instant::now() + Duration::from_secs(5), |fsm| {
+            fsm.value(group)
+        })
+        .await
+        .expect("expired lease falls back to ReadIndex");
+    assert_eq!(view.value, 5);
+    // A follower that knows the leader answers with the hint, no ReadIndex round.
+    let follower = nodes.iter().find(|n| n.node_id() != leader_id).unwrap();
+    match follower
+        .read_leased_with_applied_at(group, Instant::now() + Duration::from_secs(5), |fsm| {
+            fsm.value(group)
+        })
+        .await
+    {
+        Err(MultiRaftError::NotLeader { hint }) => assert_eq!(hint, Some(leader_id)),
+        other => panic!("expected NotLeader with hint, got {other:?}"),
+    }
+}

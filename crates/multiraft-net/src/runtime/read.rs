@@ -1,6 +1,7 @@
 //! Application reads use one caller budget and one observer, independent for each native confirmation.
 use super::*;
 use crate::read_observation::{ReadGuard, ReadObserver, ReadOutcome, ReadStage, TryReadError};
+use openraft::ReadPolicy;
 
 impl<S: StateMachine> RuntimeHandle<S> {
     /// Native ReadIndex then this invocation's local FSM query. A ReadIndex round
@@ -25,8 +26,26 @@ impl<S: StateMachine> RuntimeHandle<S> {
         deadline: Instant,
         query: impl FnOnce(&S) -> R,
     ) -> Result<crate::LinearizableView<R>, RuntimeError> {
-        self.read_view_with_observer(group, deadline, query, None, |_| ReadOutcome::Completed)
-            .await
+        self.read_view_with_observer(group, ReadPolicy::ReadIndex, deadline, query, None, |_| {
+            ReadOutcome::Completed
+        })
+        .await
+    }
+    /// Leader lease read then this invocation's local FSM query, returning the
+    /// value with the applied log id sampled under the same FSM lock. A valid
+    /// lease skips the quorum round; an unconfirmed or expired lease falls back
+    /// once to ReadIndex within `deadline`. Linearizable only while clock-rate
+    /// drift between nodes stays within the lease margin.
+    pub async fn read_leased_with_applied<R>(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+        query: impl FnOnce(&S) -> R,
+    ) -> Result<crate::LinearizableView<R>, RuntimeError> {
+        self.read_view_with_observer(group, ReadPolicy::LeaseRead, deadline, query, None, |_| {
+            ReadOutcome::Completed
+        })
+        .await
     }
     /// Per-caller neutral source observations with isolated observer failure.
     pub async fn read_linearizable_observed<R>(
@@ -68,13 +87,21 @@ impl<S: StateMachine> RuntimeHandle<S> {
         observer: Option<&dyn ReadObserver>,
         application_outcome: impl FnOnce(&R) -> ReadOutcome,
     ) -> Result<R, RuntimeError> {
-        self.read_view_with_observer(group, deadline, query, observer, application_outcome)
-            .await
-            .map(|view| view.value)
+        self.read_view_with_observer(
+            group,
+            ReadPolicy::ReadIndex,
+            deadline,
+            query,
+            observer,
+            application_outcome,
+        )
+        .await
+        .map(|view| view.value)
     }
     async fn read_view_with_observer<R>(
         &self,
         group: GroupId,
+        policy: ReadPolicy,
         deadline: Instant,
         query: impl FnOnce(&S) -> R,
         observer: Option<&dyn ReadObserver>,
@@ -122,6 +149,7 @@ impl<S: StateMachine> RuntimeHandle<S> {
                 false,
                 admitted.shared.node.read_observed_view(
                     group,
+                    policy,
                     deadline,
                     query,
                     observer,
