@@ -115,8 +115,10 @@ bridge 只在 `apply_durable` 返回之后才推进内存中的 applied 位置�
   追上。#190 可以让这次强制构建成功。
 - 默认每次写入都同步 WAL（`DiskFsmOptions::sync_writes`）。设为 `false` 时提交不同步，
   由调用方用 `DiskFsmDb::sync_wal` 同步（把 `defers_sync` / `sync_applied` 转发给它）。
-  SIGKILL 仍安全（WAL 仍然写出）；掉电后 FSM 最多回退尚未同步、也未应答的条目，它们从
-  本地日志重放。checkpoint 在清理日志前会先同步 WAL。
+  SIGKILL 仍安全（WAL 仍然写出）。掉电后 FSM 通常最多回退尚未同步、也未应答的条目，它们从
+  本地日志重放；但如果这段未同步的窗口内恰好切换了 WAL，掉电可能留下 WAL 空洞（新 WAL
+  在、旧 WAL 尾部丢失），point-in-time 恢复发现不了，副本会静默分叉。ech0 ADR 0022 接受
+  这一残余风险。checkpoint 在清理日志前会先同步 WAL。
 
 ## 已记录的风险
 

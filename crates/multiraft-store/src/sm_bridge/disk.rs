@@ -97,7 +97,13 @@ impl<S: StateMachine> StateMachineStore<S> {
             .await;
         if !pending.is_empty() {
             // Entries written before an early exit are synced and answered too.
-            inner.sync_and_answer(&mut pending)?;
+            if let Err(sync) = inner.sync_and_answer(&mut pending) {
+                if let Err(apply) = &result {
+                    // Only one error goes up; keep the one that started the exit.
+                    tracing::error!(%apply, %sync, "FSM apply failed, then syncing the entries before it failed too");
+                }
+                return Err(sync);
+            }
         }
         result
     }

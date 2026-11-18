@@ -150,9 +150,12 @@ reopen the instance. ech0's composite FSM (#191) implements `DiskState` over
 - Every write uses a synchronous WAL by default (`DiskFsmOptions::sync_writes`).
   With `false`, commits are not synced and the caller syncs them with
   `DiskFsmDb::sync_wal` (forward `defers_sync` / `sync_applied` to it). They
-  survive SIGKILL (the WAL is still written); after power loss the FSM may
-  move back by at most the unsynced, unanswered entries, which replay from
-  the local log. Checkpoints sync the WAL before the log is purged.
+  survive SIGKILL (the WAL is still written); after power loss the FSM
+  normally moves back by at most the unsynced, unanswered entries, which
+  replay from the local log. If a WAL switch falls inside that unsynced
+  window, power loss can instead leave a WAL hole (newer WAL kept, older
+  tail lost) that point-in-time recovery does not detect, so the replica can
+  silently diverge; ech0 ADR 0022 accepts this residual risk. Checkpoints sync the WAL before the log is purged.
 
 ## Risks recorded
 
