@@ -90,6 +90,25 @@ where
     bytes: u64,
 }
 
+/// shortcut: Lab-only experiment knobs read from the environment; replace with
+/// real config (or drop) once the rate-limit / WAL-recycle experiment decides.
+/// `MULTIRAFT_RAFT_LOG_RATE_LIMIT_MIB`: flush/compaction write rate cap.
+/// `MULTIRAFT_RAFT_LOG_RECYCLE_WAL`: number of WAL files to recycle.
+fn experimental_tuning(options: &mut Options) {
+    let read = |name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+    };
+    if let Some(mib) = read("MULTIRAFT_RAFT_LOG_RATE_LIMIT_MIB") {
+        options.set_ratelimiter((mib * 1024 * 1024) as i64, 100_000, 10);
+    }
+    if let Some(files) = read("MULTIRAFT_RAFT_LOG_RECYCLE_WAL") {
+        options.set_recycle_log_file_num(files as usize);
+    }
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -180,6 +199,7 @@ where
         // a ~100 MiB burst of dirty SST pages otherwise lands in the journal
         // commit that every synchronous WAL append waits for.
         options.set_bytes_per_sync(1024 * 1024);
+        experimental_tuning(&mut options);
         options.create_if_missing(true);
         options.set_use_fsync(sync_all);
         let db = DB::open(&options, path.as_ref()).map_err(db_error)?;

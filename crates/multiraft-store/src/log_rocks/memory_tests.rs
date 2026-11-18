@@ -64,3 +64,25 @@ fn old_default_options_schema_reopens_with_bounded_resources() {
         "default"
     );
 }
+
+#[test]
+fn experiment_knobs_reach_the_persisted_options() {
+    // Env is process-wide; this is the only test that sets these variables.
+    std::env::set_var("MULTIRAFT_RAFT_LOG_RATE_LIMIT_MIB", "32");
+    std::env::set_var("MULTIRAFT_RAFT_LOG_RECYCLE_WAL", "4");
+    let root = tempfile::tempdir().unwrap();
+    let db = RocksLogDb::<TypeConfig>::open(root.path()).unwrap();
+    std::env::remove_var("MULTIRAFT_RAFT_LOG_RATE_LIMIT_MIB");
+    std::env::remove_var("MULTIRAFT_RAFT_LOG_RECYCLE_WAL");
+    let options = std::fs::read_dir(root.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with("OPTIONS-"))
+        .unwrap();
+    let text = std::fs::read_to_string(options.path()).unwrap();
+    assert!(
+        text.contains("recycle_log_file_num=4"),
+        "WAL recycling was sanitized away"
+    );
+    drop(db);
+}
