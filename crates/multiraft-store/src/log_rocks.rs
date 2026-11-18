@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use multiraft_core::StartupProvenance;
+use multiraft_core::DEFAULT_RAFT_LOG_COMPACTION_WRITE_BYTES_PER_SEC;
 use multiraft_fsm::LatencyHistogram;
 use openraft::alias::{LogIdOf, VoteOf};
 use openraft::entry::RaftEntry;
@@ -32,8 +33,6 @@ const CONTROLLED_SCHEMA: &[u8] = b"multiraft-rocks-log-v2-controlled";
 const RAFT_LOG_CACHE_BYTES: usize = 32 * 1024 * 1024;
 /// Node-shared Raft log memtable budget (`allow_stall = false`).
 const RAFT_LOG_WRITE_BUFFER_MANAGER_BYTES: usize = 64 * 1024 * 1024;
-/// Flush/compaction write budget for the shared Raft log DB.
-const RAFT_LOG_BACKGROUND_WRITE_BYTES_PER_SEC: i64 = 32 * 1024 * 1024;
 /// WAL files kept for reuse instead of being deleted.
 const RAFT_LOG_RECYCLED_WAL_FILES: usize = 4;
 
@@ -167,6 +166,20 @@ where
 
     /// Select fsync (`true`) instead of fdatasync for synchronous WAL writes.
     pub fn open_with_sync_all(path: impl AsRef<Path>, sync_all: bool) -> io::Result<Self> {
+        Self::open_with(
+            path,
+            sync_all,
+            DEFAULT_RAFT_LOG_COMPACTION_WRITE_BYTES_PER_SEC,
+        )
+    }
+
+    /// [`Self::open_with_sync_all`] with a flush/compaction write limit in
+    /// bytes per second (`0` = unlimited); WAL writes are never limited.
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        sync_all: bool,
+        background_write_bytes_per_sec: u64,
+    ) -> io::Result<Self> {
         let cache = Cache::new_lru_cache(RAFT_LOG_CACHE_BYTES);
         let write_buffer_manager = WriteBufferManager::new_write_buffer_manager(
             RAFT_LOG_WRITE_BUFFER_MANAGER_BYTES,
@@ -187,7 +200,10 @@ where
         // Cap flush/compaction writes: an L0 compaction rewrites the whole
         // retained log (~100 MiB) in a burst that saturated the shared disk and
         // put every synchronous append behind it. WAL writes are not limited.
-        options.set_ratelimiter(RAFT_LOG_BACKGROUND_WRITE_BYTES_PER_SEC, 100_000, 10);
+        if background_write_bytes_per_sec > 0 {
+            let rate = i64::try_from(background_write_bytes_per_sec).unwrap_or(i64::MAX);
+            options.set_ratelimiter(rate, 100_000, 10);
+        }
         // Reuse WAL files: overwriting already-allocated blocks lets fdatasync
         // skip the ext4 journal commit (Lab sync-write p50 3.2 -> 0.7 ms).
         // RocksDB keeps this on under the default point-in-time recovery.

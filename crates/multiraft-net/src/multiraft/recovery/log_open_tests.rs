@@ -180,3 +180,27 @@ fn dropped_start_waiter_keeps_running_opener_under_node_cleanup() {
         *PROBE.lock().unwrap() = None;
     });
 }
+
+#[test]
+fn node_log_open_applies_configured_compaction_rate() {
+    for (rate, limited) in [(0, false), (64 * 1024 * 1024, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let mut cluster = config(root.path()).cluster;
+        cluster.raft_log_compaction_write_bytes_per_sec = rate;
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let db = runtime()
+            .block_on(open_node_log(&cluster, stopping))
+            .unwrap()
+            .unwrap();
+        drop(db);
+        let log = std::fs::read_to_string(root.path().join("raft-rocksdb/LOG")).unwrap();
+        let value = log
+            .lines()
+            .find_map(|line| line.split_once("Options.rate_limiter:"))
+            .unwrap()
+            .1
+            .trim();
+        // A null pointer prints as `0x0` (macOS) or `(nil)` (glibc).
+        assert_eq!(!matches!(value, "0x0" | "(nil)"), limited, "rate {rate}");
+    }
+}

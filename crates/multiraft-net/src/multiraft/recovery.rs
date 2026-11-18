@@ -218,6 +218,7 @@ pub(super) async fn open_node_log(
     let backend = config.log_storage_backend;
     let sync_all = config.file_log_sync_level == multiraft_core::FileLogSyncLevel::All;
     let snapshot_cap = config.max_snapshot_bytes;
+    let compaction_rate = config.raft_log_compaction_write_bytes_per_sec;
     #[cfg(test)]
     let probe = log_open_tests::probe(&root);
     tokio::task::spawn_blocking(move || {
@@ -267,7 +268,7 @@ pub(super) async fn open_node_log(
             }
         }
         anyhow::ensure!(database.exists() || persisted.is_empty(), "cannot select RocksDB over persisted FileLog or snapshot history; explicit migration required");
-        let db = RocksLogDb::open_with_sync_all(&database, sync_all)?;
+        let db = RocksLogDb::open_with(&database, sync_all, compaction_rate)?;
         for group in persisted {
             let provenance = match db.lifecycle_receipt(group)? {
                 Some(receipt) if matches!(receipt.stage, multiraft_store::ControlledGroupStage::Retired | multiraft_store::ControlledGroupStage::LogsCleaned | multiraft_store::ControlledGroupStage::Cleaned) => continue,

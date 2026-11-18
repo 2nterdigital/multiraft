@@ -44,14 +44,33 @@ fn group_handles_share_engine_resources_and_effective_options() {
             "missing effective option {expected}"
         );
     }
-    let log = std::fs::read_to_string(root.path().join("LOG")).unwrap();
-    assert!(log.contains("Options.rate_limiter: 0x"), "no rate limiter");
+    assert!(rate_limiter_set(root.path()), "no rate limiter");
     drop(db);
     assert!(
         first.owner.storage_memory_stats().unwrap().column_families[0]
             .active_memtable_bytes
             .is_some()
     );
+}
+
+/// Reads `Options.rate_limiter:` from the RocksDB info LOG; a null pointer
+/// prints as `0x0` (macOS) or `(nil)` (glibc).
+fn rate_limiter_set(root: &std::path::Path) -> bool {
+    let log = std::fs::read_to_string(root.join("LOG")).unwrap();
+    let value = log
+        .lines()
+        .find_map(|line| line.split_once("Options.rate_limiter:"))
+        .expect("rate_limiter line in LOG")
+        .1
+        .trim();
+    !matches!(value, "0x0" | "(nil)")
+}
+
+#[test]
+fn zero_compaction_rate_leaves_rate_limiter_unset() {
+    let root = tempfile::tempdir().unwrap();
+    drop(RocksLogDb::<TypeConfig>::open_with(root.path(), false, 0).unwrap());
+    assert!(!rate_limiter_set(root.path()), "rate limiter set at 0");
 }
 
 #[test]
