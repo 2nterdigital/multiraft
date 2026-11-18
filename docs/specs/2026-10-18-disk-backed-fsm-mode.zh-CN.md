@@ -62,9 +62,10 @@ Raft 日志的原子性不延伸到 FSM 库，也不需要：OpenRaft 以状态�
   applied 记录（新库为 `None`）。
 - `DiskState::apply_durable(&mut self, group, index, data: Option<&[u8]>,
   applied: &AppliedState) -> io::Result<ApplyOut>`：每条 apply 的条目恰好调用一次；
-  blank、membership 和内部条目的 `data` 为 `None`。实现必须在返回前用**一次**原子写入
-  让该条目的业务行和 `applied.record()` 落盘。落盘模式下 bridge 不调用 `apply`、
-  `snapshot`、`restore` 和捕获钩子。
+  blank、membership 和内部条目的 `data` 为 `None`。实现必须用**一次**原子写入写出该条目的
+  业务行和 `applied.record()`，并在返回前落盘；`DiskState::defers_sync` 为 true 时改为在
+  `DiskState::sync_applied` 返回时落盘（ech0 ADR 0022：每批 apply 同步一次，最多每 256 条
+  一次）。落盘模式下 bridge 不调用 `apply`、`snapshot`、`restore` 和捕获钩子。
 
 `multiraft-store` 的 `DiskFsmDb` 是实现上述布局的 RocksDB 辅助类型：打开（或创建）
 实例，校验 schema、Group 和应用格式标记（任何不一致或未知列族都 fail closed），
@@ -72,8 +73,10 @@ Raft 日志的原子性不延伸到 FSM 库，也不需要：OpenRaft 以状态�
 batch 并只写一次。`DiskFsmDb::group_path(data_dir, group)` 给出规范位置。rocksdb
 crate 被重新导出，使用方使用同一个锁定版本。
 
-bridge 只在 `apply_durable` 返回之后才发送该条目的客户端响应，并推进内存中的
-applied 位置和 membership。
+bridge 只在 `apply_durable` 返回之后才推进内存中的 applied 位置和 membership；客户端
+响应只在该条目落盘后发送：逐条模式紧跟 `apply_durable`，`defers_sync` 模式在覆盖它的
+`sync_applied` 之后，且都在释放 FSM 锁之前。同步失败时不发任何响应并停掉该组，这些
+条目在重启时重放。
 
 #190 计划给 `DiskState` 增加 checkpoint/导出与安装钩子，默认实现拒绝；现有实现
 继续可编译，流式安装可以关闭、替换并重新打开实例。ech0 的组合 FSM（#191）基于
@@ -110,10 +113,10 @@ applied 位置和 membership。
   进入这个状态（见上文），因此它意味着目录不匹配或损坏。处理办法：删除该 Group 的
   FSM 目录和该节点的数据后重新加入；因为本模式从不清理日志，可以从 leader 重放日志
   追上。#190 可以让这次强制构建成功。
-- 默认每次写入都同步 WAL（`DiskFsmOptions::sync_writes`）。关闭同步后 SIGKILL 仍安全
-  （WAL 仍然写出）；掉电后 FSM 可能回到更早的 applied 位置，只要本地日志保留 FSM
-  持久点之后的所有条目就是安全的。落盘模式不能压缩时这一点总成立；#190 必须在清理
-  日志前先 flush FSM。
+- 默认每次写入都同步 WAL（`DiskFsmOptions::sync_writes`）。设为 `false` 时提交不同步，
+  由调用方用 `DiskFsmDb::sync_wal` 同步（把 `defers_sync` / `sync_applied` 转发给它）。
+  SIGKILL 仍安全（WAL 仍然写出）；掉电后 FSM 最多回退尚未同步、也未应答的条目，它们从
+  本地日志重放。checkpoint 在清理日志前会先同步 WAL。
 
 ## 已记录的风险
 

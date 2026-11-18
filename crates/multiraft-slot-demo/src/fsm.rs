@@ -409,6 +409,12 @@ impl DiskState for DemoFsm {
         disk.db.commit(batch, applied)?;
         Ok(ApplyOut { effects })
     }
+    fn defers_sync(&self) -> bool {
+        self.disk_db().is_ok_and(DiskFsmDb::defers_sync)
+    }
+    fn sync_applied(&mut self) -> io::Result<()> {
+        self.disk_db()?.sync_wal()
+    }
     fn snapshot_workspace(&self) -> io::Result<std::path::PathBuf> {
         self.disk_db()?.snapshot_workspace()
     }
