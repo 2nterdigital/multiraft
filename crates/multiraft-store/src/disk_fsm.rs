@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use multiraft_fsm::{AppliedState, DiskStoragePaths, GroupId};
+use multiraft_fsm::{AppliedState, DiskStoragePaths, GroupId, LatencyHistogram};
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, WriteOptions, DB,
 };
@@ -78,6 +78,8 @@ pub struct DiskFsmDb {
     path: PathBuf,
     group: GroupId,
     options: DiskFsmOptions,
+    /// Duration of each [`Self::commit`] write; diagnostics only.
+    commit_latency: LatencyHistogram,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -123,6 +125,7 @@ impl DiskFsmDb {
             path: path.to_owned(),
             group,
             options,
+            commit_latency: LatencyHistogram::default(),
         })
     }
 
@@ -184,11 +187,12 @@ impl DiskFsmDb {
         let names = column_families(&self.options)?
             .into_iter()
             .collect::<Vec<_>>();
-        Ok(crate::storage_memory::collect(
-            self.live()?,
-            self.path.display().to_string(),
-            &names,
-        ))
+        let mut stats =
+            crate::storage_memory::collect(self.live()?, self.path.display().to_string(), &names);
+        stats
+            .io_latency
+            .insert("fsm_commit_sync", self.commit_latency.snapshot());
+        Ok(stats)
     }
 
     fn live(&self) -> io::Result<&DB> {
@@ -233,7 +237,11 @@ impl DiskFsmDb {
         batch.put_cf(meta_cf(db)?, APPLIED_KEY, applied.record());
         let mut write = WriteOptions::default();
         write.set_sync(self.options.sync_writes);
-        db.write_opt(batch, &write).map_err(db_error)
+        // Recorded even with `sync_writes = false`; the name follows the default.
+        let started = std::time::Instant::now();
+        let result = db.write_opt(batch, &write).map_err(db_error);
+        self.commit_latency.record(started.elapsed());
+        result
     }
 }
 
@@ -318,5 +326,16 @@ mod memory_tests {
         drop(db.db.take());
         assert!(db.try_db().is_err());
         assert!(db.storage_memory_stats().is_err());
+    }
+
+    #[test]
+    fn commit_records_io_latency() {
+        let root = tempfile::tempdir().unwrap();
+        let db = DiskFsmDb::open(root.path().join("db"), 7, DiskFsmOptions::new(b"test")).unwrap();
+        let count = || db.storage_memory_stats().unwrap().io_latency["fsm_commit_sync"].count;
+        assert_eq!(count(), 0);
+        db.commit(WriteBatch::default(), &AppliedState::new(1, 1, vec![]))
+            .unwrap();
+        assert_eq!(count(), 1);
     }
 }

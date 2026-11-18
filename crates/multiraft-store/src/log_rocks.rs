@@ -7,8 +7,10 @@ use std::io;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use multiraft_core::StartupProvenance;
+use multiraft_fsm::LatencyHistogram;
 use openraft::alias::{LogIdOf, VoteOf};
 use openraft::entry::RaftEntry;
 use openraft::RaftTypeConfig;
@@ -37,6 +39,22 @@ struct Engine {
     cache: Cache,
     write_buffer_manager: WriteBufferManager,
     db_id: String,
+    io_latency: IoLatency,
+}
+
+/// Cumulative per-engine I/O stage latencies; diagnostics only.
+#[derive(Default)]
+struct IoLatency {
+    /// `append` entry until just before `io_completed`: how long RaftCore waits.
+    append_total: LatencyHistogram,
+    /// `append` entry until its blocking closure starts.
+    append_queue: LatencyHistogram,
+    /// Waiting for the per-group gate in `append` and `blocking`.
+    gate_wait: LatencyHistogram,
+    /// Every synchronous `Engine::write`.
+    sync_write: LatencyHistogram,
+    /// Whole `save_committed`, scheduling included.
+    save_committed: LatencyHistogram,
 }
 
 /// One node's shared log engine. Clones and group handles keep the DB alive.
@@ -117,7 +135,10 @@ impl Engine {
     fn write(&self, batch: WriteBatch) -> io::Result<()> {
         let mut options = WriteOptions::default();
         options.set_sync(true);
-        self.db.write_opt(batch, &options).map_err(db_error)
+        let started = Instant::now();
+        let result = self.db.write_opt(batch, &options).map_err(db_error);
+        self.io_latency.sync_write.record(started.elapsed());
+        result
     }
     fn gate(&self, group: u64) -> io::Result<Arc<Mutex<()>>> {
         Ok(Arc::clone(
@@ -184,6 +205,7 @@ where
                 cache,
                 write_buffer_manager,
                 db_id: std::fs::canonicalize(path.as_ref())?.display().to_string(),
+                io_latency: IoLatency::default(),
             }),
             config: PhantomData,
         })
@@ -219,6 +241,17 @@ where
             write_buffer_manager_limit_bytes: engine.write_buffer_manager.get_buffer_size() as u64,
             write_buffer_manager_usage_bytes: engine.write_buffer_manager.get_usage() as u64,
         });
+        let latency = &engine.io_latency;
+        stats.io_latency = [
+            ("log_append_total", &latency.append_total),
+            ("log_append_queue", &latency.append_queue),
+            ("log_gate_wait", &latency.gate_wait),
+            ("log_sync_write", &latency.sync_write),
+            ("log_save_committed", &latency.save_committed),
+        ]
+        .into_iter()
+        .map(|(name, histogram)| (name, histogram.snapshot()))
+        .collect();
         Ok(stats)
     }
 
@@ -449,6 +482,17 @@ where
         }
         Err(invalid("committed/truncate identity is not recoverable"))
     }
+    /// Take the group gate, recording the wait.
+    fn lock_gate(&self) -> io::Result<MutexGuard<'_, ()>> {
+        let started = Instant::now();
+        let guard = lock(&self.gate);
+        self.owner
+            .engine
+            .io_latency
+            .gate_wait
+            .record(started.elapsed());
+        guard
+    }
     async fn blocking<T, F>(&self, operation: F) -> io::Result<T>
     where
         T: Send + 'static,
@@ -456,7 +500,7 @@ where
     {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _guard = lock(&store.gate)?;
+            let _guard = store.lock_gate()?;
             store.check_generation()?;
             operation(store.clone())
         })
