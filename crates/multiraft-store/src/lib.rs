@@ -11,6 +11,7 @@ mod log_file;
 mod log_mem;
 mod log_rocks;
 mod native_log;
+mod rocks_env;
 mod sm_bridge;
 mod snapshot_catalog;
 mod storage_memory;

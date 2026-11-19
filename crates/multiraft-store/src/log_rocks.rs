@@ -210,6 +210,7 @@ where
         options.set_recycle_log_file_num(RAFT_LOG_RECYCLED_WAL_FILES);
         options.create_if_missing(true);
         options.set_use_fsync(sync_all);
+        crate::rocks_env::ensure_flush_threads();
         let db = DB::open(&options, path.as_ref()).map_err(db_error)?;
         match db.get(SCHEMA_KEY).map_err(db_error)? {
             Some(value) if value == SCHEMA || value == CONTROLLED_SCHEMA => {}
