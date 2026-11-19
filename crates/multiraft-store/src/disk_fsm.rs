@@ -176,6 +176,7 @@ impl DiskFsmDb {
                 ));
             }
         }
+        crate::rocks_env::ensure_flush_threads();
         let db = DB::open_cf_descriptors(&db_options, path, options.descriptors(&names))
             .map_err(db_error)?;
         check_markers(&db, group, &options.app_format, &names, false)?;
