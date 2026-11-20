@@ -13,7 +13,7 @@ impl RocksLogDb<TypeConfig> {
     pub fn verify_adoption_log(&self, original: &LegacyReplica, identity: &[u8]) -> io::Result<()> {
         let group = original.group;
         let gate = self.engine.gate(group)?;
-        let _guard = lock(&gate)?;
+        let _guard = lock_uncached(&gate)?;
         let generation = match self.engine.receipt(group)? {
             Some(receipt)
                 if receipt.generation == 1

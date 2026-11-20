@@ -4,7 +4,6 @@
 //! Retained bytes count encoded entry values only, not SST/WAL physical space.
 use std::collections::HashMap;
 use std::io;
-use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -36,13 +35,34 @@ const RAFT_LOG_WRITE_BUFFER_MANAGER_BYTES: usize = 64 * 1024 * 1024;
 /// WAL files kept for reuse instead of being deleted.
 const RAFT_LOG_RECYCLED_WAL_FILES: usize = 4;
 
-struct Engine {
+struct Engine<C: RaftTypeConfig> {
     db: DB,
-    gates: Mutex<HashMap<u64, Arc<Mutex<()>>>>,
+    gates: Mutex<HashMap<u64, Arc<Mutex<GroupCache<C>>>>>,
     cache: Cache,
     write_buffer_manager: WriteBufferManager,
     db_id: String,
     io_latency: IoLatency,
+}
+
+/// Decoded per-group facts held under the group gate; `None` means not loaded.
+///
+/// Only the hot-path operations in `storage.rs` read it, writing metadata
+/// through on success. Lifecycle, adoption and validation read RocksDB
+/// directly and take the gate through [`lock_uncached`], which leaves it
+/// unloaded. Every handle still applies its own generation check on a hit.
+struct GroupCache<C: RaftTypeConfig> {
+    /// The controlled-group receipt; `Some(None)` caches its absence.
+    receipt: Option<Option<ControlledGroupReceipt>>,
+    metadata: Option<Metadata<C>>,
+}
+
+impl<C: RaftTypeConfig> GroupCache<C> {
+    fn unloaded() -> Self {
+        Self {
+            receipt: None,
+            metadata: None,
+        }
+    }
 }
 
 /// Cumulative per-engine I/O stage latencies; diagnostics only.
@@ -63,8 +83,7 @@ struct IoLatency {
 /// One node's shared log engine. Clones and group handles keep the DB alive.
 #[derive(Clone)]
 pub struct RocksLogDb<C: RaftTypeConfig> {
-    engine: Arc<Engine>,
-    config: PhantomData<C>,
+    engine: Arc<Engine<C>>,
 }
 
 /// One group's OpenRaft log interface in a shared engine.
@@ -72,17 +91,19 @@ pub struct RocksLogDb<C: RaftTypeConfig> {
 pub struct RocksLogStore<C: RaftTypeConfig> {
     owner: RocksLogDb<C>,
     group: u64,
-    gate: Arc<Mutex<()>>,
+    gate: Arc<Mutex<GroupCache<C>>>,
     generation: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(bound = "", deny_unknown_fields)]
-struct Metadata<C: RaftTypeConfig>
-where
-    LogIdOf<C>: Serialize + DeserializeOwned,
-    VoteOf<C>: Serialize + DeserializeOwned,
-{
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(
+    bound(
+        serialize = "LogIdOf<C>: Serialize, VoteOf<C>: Serialize",
+        deserialize = "LogIdOf<C>: DeserializeOwned, VoteOf<C>: DeserializeOwned"
+    ),
+    deny_unknown_fields
+)]
+struct Metadata<C: RaftTypeConfig> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     controlled_generation: Option<u64>,
     ever_written: bool,
@@ -103,6 +124,15 @@ fn lock<T>(mutex: &Mutex<T>) -> io::Result<MutexGuard<'_, T>> {
     mutex
         .lock()
         .map_err(|_| io::Error::other("rocks log gate poisoned"))
+}
+/// Take the gate for a path that reads RocksDB directly; the group cache is
+/// left unloaded, so the next hot-path call reloads whatever this path wrote.
+fn lock_uncached<C: RaftTypeConfig>(
+    gate: &Mutex<GroupCache<C>>,
+) -> io::Result<MutexGuard<'_, GroupCache<C>>> {
+    let mut guard = lock(gate)?;
+    *guard = GroupCache::unloaded();
+    Ok(guard)
 }
 fn encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| invalid(e.to_string()))
@@ -134,7 +164,7 @@ fn entry_index(group: u64, raw: &[u8]) -> io::Result<u64> {
     ))
 }
 
-impl Engine {
+impl<C: RaftTypeConfig> Engine<C> {
     fn write(&self, batch: WriteBatch) -> io::Result<()> {
         let mut options = WriteOptions::default();
         options.set_sync(true);
@@ -143,12 +173,10 @@ impl Engine {
         self.io_latency.sync_write.record(started.elapsed());
         result
     }
-    fn gate(&self, group: u64) -> io::Result<Arc<Mutex<()>>> {
-        Ok(Arc::clone(
-            lock(&self.gates)?
-                .entry(group)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        ))
+    fn gate(&self, group: u64) -> io::Result<Arc<Mutex<GroupCache<C>>>> {
+        Ok(Arc::clone(lock(&self.gates)?.entry(group).or_insert_with(
+            || Arc::new(Mutex::new(GroupCache::unloaded())),
+        )))
     }
 }
 
@@ -236,7 +264,6 @@ where
                 db_id: std::fs::canonicalize(path.as_ref())?.display().to_string(),
                 io_latency: IoLatency::default(),
             }),
-            config: PhantomData,
         })
     }
 
@@ -293,7 +320,7 @@ where
             gate: self.engine.gate(group)?,
         };
         {
-            let _guard = lock(&store.gate)?;
+            let _guard = lock_uncached(&store.gate)?;
             store.check_generation()?;
             if store.metadata()?.is_none() {
                 let metadata = Metadata::<C> {
@@ -322,7 +349,7 @@ where
             generation: None,
             gate: self.engine.gate(group)?,
         };
-        let _guard = lock(&store.gate)?;
+        let _guard = lock_uncached(&store.gate)?;
         store.check_generation()?;
         match store.validate()? {
             Some(meta) if meta.ever_written => Ok(StartupProvenance::Persisted),
@@ -339,7 +366,7 @@ where
             generation: None,
             gate: self.engine.gate(group)?,
         };
-        let _guard = lock(&store.gate)?;
+        let _guard = lock_uncached(&store.gate)?;
         store.check_generation()?;
         Ok(store.metadata()?.map_or(0, |meta| meta.bytes))
     }
@@ -512,7 +539,7 @@ where
         Err(invalid("committed/truncate identity is not recoverable"))
     }
     /// Take the group gate, recording the wait.
-    fn lock_gate(&self) -> io::Result<MutexGuard<'_, ()>> {
+    fn lock_gate(&self) -> io::Result<MutexGuard<'_, GroupCache<C>>> {
         let started = Instant::now();
         let guard = lock(&self.gate);
         self.owner
@@ -525,18 +552,20 @@ where
     async fn blocking<T, F>(&self, operation: F) -> io::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(Self) -> io::Result<T> + Send + 'static,
+        F: FnOnce(Self, &mut GroupCache<C>) -> io::Result<T> + Send + 'static,
     {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _guard = store.lock_gate()?;
-            store.check_generation()?;
-            operation(store.clone())
+            let mut cache = store.lock_gate()?;
+            store.check_generation_cached(&mut cache)?;
+            operation(store.clone(), &mut cache)
         })
         .await
         .map_err(io::Error::other)?
     }
 }
 
+#[cfg(test)]
+mod cache_tests;
 #[cfg(test)]
 mod memory_tests;

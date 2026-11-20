@@ -11,7 +11,16 @@ use openraft::{LogState, RaftLogReader, RaftTypeConfig};
 use rocksdb::{Direction, IteratorMode, WriteBatch};
 use serde::{de::DeserializeOwned, Serialize};
 
-use super::{db_error, decode, encode, entry_index, entry_key, invalid, key, RocksLogStore};
+use super::lifecycle::generation_active;
+use super::{
+    db_error, decode, encode, entry_index, entry_key, invalid, key, GroupCache, Metadata,
+    RocksLogStore,
+};
+
+/// Ranges of at most this many entries are read with point lookups. Replication
+/// and apply reads are usually a few entries, where creating, seeking and
+/// dropping a RocksDB iterator costs more than the lookups themselves.
+const POINT_READ_MAX_ENTRIES: u64 = 8;
 
 impl<C> RaftLogReader<C> for RocksLogStore<C>
 where
@@ -34,8 +43,8 @@ where
             Bound::Excluded(index) => index.checked_sub(1),
             Bound::Unbounded => Some(u64::MAX),
         };
-        self.blocking(move |store| {
-            let meta = store.required_metadata()?;
+        self.blocking(move |store, cache| {
+            let meta = store.cached_metadata(cache)?;
             let (Some(lower), Some(upper), Some(tail)) = (lower, upper, meta.tail) else {
                 return Ok(vec![]);
             };
@@ -51,49 +60,17 @@ where
             if lower > upper {
                 return Ok(vec![]);
             }
-            let start = entry_key(store.group, lower);
-            let end = key(store.group, b'f');
-            let mut expected = Some(lower);
-            let mut entries = Vec::new();
-            let mut previous = None;
-            for row in store
-                .owner
-                .engine
-                .db
-                .iterator(IteratorMode::From(&start, Direction::Forward))
-            {
-                let (raw, value) = row.map_err(db_error)?;
-                if raw.as_ref() >= end.as_slice() {
-                    break;
-                }
-                let index = entry_index(store.group, &raw)?;
-                if index > upper {
-                    break;
-                }
-                if Some(index) != expected {
-                    return Err(invalid("gap in requested log range"));
-                }
-                let entry: C::Entry = decode(&value)?;
-                if entry.log_id().index() != index {
-                    return Err(invalid("entry key/log id mismatch"));
-                }
-                if previous.as_ref().is_some_and(|id| entry.log_id() <= *id) {
-                    return Err(invalid("nonmonotonic log identities"));
-                }
-                previous = Some(entry.log_id());
-                entries.push(entry);
-                expected = index.checked_add(1);
+            if upper - lower < POINT_READ_MAX_ENTRIES {
+                store.read_points(lower, upper)
+            } else {
+                store.read_iterated(lower, upper)
             }
-            if expected != upper.checked_add(1) {
-                return Err(invalid("missing entry in requested log range"));
-            }
-            Ok(entries)
         })
         .await
     }
 
     async fn read_vote(&mut self) -> io::Result<Option<VoteOf<C>>> {
-        self.blocking(|store| Ok(store.required_metadata()?.vote))
+        self.blocking(|store, cache| Ok(store.cached_metadata(cache)?.vote))
             .await
     }
 }
@@ -108,8 +85,8 @@ where
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> io::Result<LogState<C>> {
-        self.blocking(|store| {
-            let meta = store.required_metadata()?;
+        self.blocking(|store, cache| {
+            let meta = store.cached_metadata(cache)?;
             Ok(LogState {
                 last_log_id: meta.tail.or_else(|| meta.purged.clone()),
                 last_purged_log_id: meta.purged,
@@ -120,13 +97,11 @@ where
 
     async fn save_vote(&mut self, vote: &VoteOf<C>) -> io::Result<()> {
         let vote = vote.clone();
-        self.blocking(move |store| {
-            let mut meta = store.required_metadata()?;
+        self.blocking(move |store, cache| {
+            let mut meta = store.cached_metadata(cache)?;
             meta.vote = Some(vote);
             meta.ever_written = true;
-            let mut batch = WriteBatch::default();
-            store.put_metadata(&mut batch, &meta)?;
-            store.owner.engine.write(batch)
+            store.write_metadata(cache, WriteBatch::default(), meta)
         })
         .await
     }
@@ -134,8 +109,8 @@ where
     async fn save_committed(&mut self, committed: Option<LogIdOf<C>>) -> io::Result<()> {
         let started = Instant::now();
         let result = self
-            .blocking(move |store| {
-                let mut meta = store.required_metadata()?;
+            .blocking(move |store, cache| {
+                let mut meta = store.cached_metadata(cache)?;
                 if let Some(old) = meta.committed.as_ref() {
                     if committed.as_ref().is_none_or(|new| new < old) {
                         return Err(invalid("committed log cannot regress"));
@@ -146,9 +121,7 @@ where
                 }
                 meta.ever_written |= committed.is_some();
                 meta.committed = committed;
-                let mut batch = WriteBatch::default();
-                store.put_metadata(&mut batch, &meta)?;
-                store.owner.engine.write(batch)
+                store.write_metadata(cache, WriteBatch::default(), meta)
             })
             .await;
         let latency = &self.owner.engine.io_latency;
@@ -157,7 +130,7 @@ where
     }
 
     async fn read_committed(&mut self) -> io::Result<Option<LogIdOf<C>>> {
-        self.blocking(|store| Ok(store.required_metadata()?.committed))
+        self.blocking(|store, cache| Ok(store.cached_metadata(cache)?.committed))
             .await
     }
 
@@ -176,9 +149,9 @@ where
             let latency = &store.owner.engine.io_latency;
             latency.append_queue.record(entered.elapsed());
             let result = (|| {
-                let _guard = store.lock_gate()?;
-                store.check_generation()?;
-                store.append_entries(entries)
+                let mut cache = store.lock_gate()?;
+                store.check_generation_cached(&mut cache)?;
+                store.append_entries(&mut cache, entries)
             })();
             latency.append_total.record(entered.elapsed());
             callback.io_completed(
@@ -194,8 +167,8 @@ where
     }
 
     async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<C>>) -> io::Result<()> {
-        self.blocking(move |store| {
-            let mut meta = store.required_metadata()?;
+        self.blocking(move |store, cache| {
+            let mut meta = store.cached_metadata(cache)?;
             for protected in [&meta.purged, &meta.committed].into_iter().flatten() {
                 if last_log_id
                     .as_ref()
@@ -226,15 +199,14 @@ where
             });
             let mut batch = WriteBatch::default();
             batch.delete_range(entry_key(store.group, start), key(store.group, b'f'));
-            store.put_metadata(&mut batch, &meta)?;
-            store.owner.engine.write(batch)
+            store.write_metadata(cache, batch, meta)
         })
         .await
     }
 
     async fn purge(&mut self, log_id: LogIdOf<C>) -> io::Result<()> {
-        self.blocking(move |store| {
-            let mut meta = store.required_metadata()?;
+        self.blocking(move |store, cache| {
+            let mut meta = store.cached_metadata(cache)?;
             if let Some(previous) = meta.purged.as_ref() {
                 if log_id.index() < previous.index() {
                     return Err(invalid("purge marker cannot regress"));
@@ -276,8 +248,7 @@ where
                 |index| entry_key(store.group, index),
             );
             batch.delete_range(entry_key(store.group, 0), end);
-            store.put_metadata(&mut batch, &meta)?;
-            store.owner.engine.write(batch)
+            store.write_metadata(cache, batch, meta)
         })
         .await
     }
@@ -294,11 +265,56 @@ where
     LogIdOf<C>: Serialize + DeserializeOwned,
     VoteOf<C>: Serialize + DeserializeOwned,
 {
-    fn append_entries(&self, entries: Vec<C::Entry>) -> io::Result<()> {
+    /// Check the handle's generation against the receipt, loading it once.
+    pub(super) fn check_generation_cached(&self, cache: &mut GroupCache<C>) -> io::Result<()> {
+        if cache.receipt.is_none() {
+            cache.receipt = Some(self.owner.engine.receipt(self.group)?);
+        }
+        generation_active(
+            self.generation,
+            cache.receipt.as_ref().and_then(Option::as_ref),
+        )
+    }
+
+    /// Decoded metadata from the group cache, loading it once from RocksDB.
+    fn cached_metadata(&self, cache: &mut GroupCache<C>) -> io::Result<Metadata<C>> {
+        if let Some(meta) = cache.metadata.as_ref() {
+            // The cache is per group; each handle still fences its own generation.
+            if meta.controlled_generation != self.generation {
+                return Err(invalid("group metadata generation mismatch"));
+            }
+            return Ok(meta.clone());
+        }
+        let meta = self.required_metadata()?;
+        cache.metadata = Some(meta.clone());
+        Ok(meta)
+    }
+
+    /// Write `batch` with `meta`, caching `meta` only once the write succeeds.
+    fn write_metadata(
+        &self,
+        cache: &mut GroupCache<C>,
+        mut batch: WriteBatch,
+        meta: Metadata<C>,
+    ) -> io::Result<()> {
+        self.put_metadata(&mut batch, &meta)?;
+        match self.owner.engine.write(batch) {
+            Ok(()) => {
+                cache.metadata = Some(meta);
+                Ok(())
+            }
+            Err(error) => {
+                *cache = GroupCache::unloaded();
+                Err(error)
+            }
+        }
+    }
+
+    fn append_entries(&self, cache: &mut GroupCache<C>, entries: Vec<C::Entry>) -> io::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut meta = self.required_metadata()?;
+        let mut meta = self.cached_metadata(cache)?;
         let mut batch = WriteBatch::default();
         let mut previous = None;
         for entry in entries {
@@ -318,23 +334,27 @@ where
                 return Err(invalid("append overlaps purged prefix"));
             }
             let encoded = encode(&entry)?;
-            if let Some(existing) = self
-                .owner
-                .engine
-                .db
-                .get(entry_key(self.group, index))
-                .map_err(db_error)?
-            {
-                let existing_entry: C::Entry = decode(&existing)?;
-                if existing_entry.log_id() != id || existing.as_slice() != encoded {
-                    return Err(invalid(
-                        "append conflicts with existing entry; truncate first",
-                    ));
-                }
-                continue;
-            }
             let basis = meta.tail.as_ref().or(meta.purged.as_ref());
             let next = basis.map_or(Some(0), |last| last.index().checked_add(1));
+            // Nothing is stored past the tail: entries and tail share one WriteBatch,
+            // and truncate/purge delete_range in the batch that moves the tail.
+            if next != Some(index) {
+                if let Some(existing) = self
+                    .owner
+                    .engine
+                    .db
+                    .get(entry_key(self.group, index))
+                    .map_err(db_error)?
+                {
+                    let existing_entry: C::Entry = decode(&existing)?;
+                    if existing_entry.log_id() != id || existing.as_slice() != encoded {
+                        return Err(invalid(
+                            "append conflicts with existing entry; truncate first",
+                        ));
+                    }
+                    continue;
+                }
+            }
             if next != Some(index) || basis.is_some_and(|last| id <= *last) {
                 return Err(invalid("append leaves a gap or regresses log identity"));
             }
@@ -346,8 +366,74 @@ where
             meta.tail = Some(id);
         }
         meta.ever_written = true;
-        self.put_metadata(&mut batch, &meta)?;
-        self.owner.engine.write(batch)
+        self.write_metadata(cache, batch, meta)
+    }
+
+    /// Read `lower..=upper`, all inside the retained log, one lookup per entry.
+    /// On intact data, same results and errors as [`Self::read_iterated`]. On
+    /// corrupt data (a missing entry followed by an undecodable one, or a
+    /// malformed key in the entry range) both fail, possibly with other messages.
+    pub(super) fn read_points(&self, lower: u64, upper: u64) -> io::Result<Vec<C::Entry>> {
+        let mut entries = Vec::new();
+        let mut previous = None;
+        for index in lower..=upper {
+            let Some(entry) = self.entry(index)? else {
+                // The iterator reports a gap if any later entry in range exists.
+                for later in index.saturating_add(1)..=upper {
+                    if self.entry(later)?.is_some() {
+                        return Err(invalid("gap in requested log range"));
+                    }
+                }
+                return Err(invalid("missing entry in requested log range"));
+            };
+            if previous.as_ref().is_some_and(|id| entry.log_id() <= *id) {
+                return Err(invalid("nonmonotonic log identities"));
+            }
+            previous = Some(entry.log_id());
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// Read `lower..=upper`, all inside the retained log, with one iterator.
+    pub(super) fn read_iterated(&self, lower: u64, upper: u64) -> io::Result<Vec<C::Entry>> {
+        let start = entry_key(self.group, lower);
+        let end = key(self.group, b'f');
+        let mut expected = Some(lower);
+        let mut entries = Vec::new();
+        let mut previous = None;
+        for row in self
+            .owner
+            .engine
+            .db
+            .iterator(IteratorMode::From(&start, Direction::Forward))
+        {
+            let (raw, value) = row.map_err(db_error)?;
+            if raw.as_ref() >= end.as_slice() {
+                break;
+            }
+            let index = entry_index(self.group, &raw)?;
+            if index > upper {
+                break;
+            }
+            if Some(index) != expected {
+                return Err(invalid("gap in requested log range"));
+            }
+            let entry: C::Entry = decode(&value)?;
+            if entry.log_id().index() != index {
+                return Err(invalid("entry key/log id mismatch"));
+            }
+            if previous.as_ref().is_some_and(|id| entry.log_id() <= *id) {
+                return Err(invalid("nonmonotonic log identities"));
+            }
+            previous = Some(entry.log_id());
+            entries.push(entry);
+            expected = index.checked_add(1);
+        }
+        if expected != upper.checked_add(1) {
+            return Err(invalid("missing entry in requested log range"));
+        }
+        Ok(entries)
     }
 
     fn range_bytes(&self, first: u64, last: u64) -> io::Result<u64> {
