@@ -186,7 +186,7 @@ pub fn inspect_legacy_replica(
                 schema = true
             }
             Some(b'e') if key.len() == 18 => {
-                let entry: DefaultEntryOf<TypeConfig> = decode(&value)?;
+                let entry: DefaultEntryOf<TypeConfig> = crate::log_rocks::decode_entry(&value)?;
                 let index = u64::from_be_bytes(key[10..].try_into().map_err(io::Error::other)?);
                 if entry.log_id().index != index {
                     return Err(invalid("legacy entry identity/key mismatch"));
@@ -307,7 +307,10 @@ pub fn inspect_legacy_replica(
 
 /// Stable digest encoding ignores only the explicit controlled-generation metadata addition.
 pub(crate) fn canonical_log_value(tag: Option<u8>, value: &[u8]) -> io::Result<Vec<u8>> {
-    if tag == Some(b'r') {
+    // bincode entry values are already canonical.
+    if tag == Some(b'r')
+        || (tag == Some(b'e') && value.first() == Some(&crate::log_rocks::ENTRY_BINCODE))
+    {
         return Ok(value.to_vec());
     }
     let mut value: serde_json::Value = serde_json::from_slice(value).map_err(io::Error::other)?;
