@@ -1,13 +1,12 @@
 //! Partial staging keeps admission owned while existing active readers continue.
-use multiraft_core::{StartupProvenance, TypeConfig};
+use multiraft_core::{SnapshotMetaWithId, StartupProvenance};
 use multiraft_store::SnapshotCatalog;
-use openraft::alias::SnapshotMetaOf;
 use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::time::Duration;
 use tracing_subscriber::prelude::*;
 
-fn meta(id: &str) -> SnapshotMetaOf<TypeConfig> {
-    SnapshotMetaOf::<TypeConfig> {
+fn meta(id: &str) -> SnapshotMetaWithId {
+    SnapshotMetaWithId {
         last_log_id: None,
         last_membership: Default::default(),
         snapshot_id: id.to_owned(),

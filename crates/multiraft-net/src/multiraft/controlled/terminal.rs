@@ -176,14 +176,14 @@ fn validate_native_terminal(
         || specification.target_generation == 0
         || old.len() != 3
         || starting.get_joint_config().len() != 1
-        || starting.learner_ids().next().is_some()
+        || starting.non_write_voter_ids().next().is_some()
         || old.iter().any(|node| starting.get_node(node).is_none())
         || source.len() != 1
         || target != [proof.target_open.target_node]
         || specification.target_voters.len() != 3
         || members.get_joint_config().len() != 1
         || members.voter_ids().collect::<BTreeSet<_>>() != specification.target_voters
-        || members.learner_ids().next().is_some()
+        || members.non_write_voter_ids().next().is_some()
         || members.get_node(&source[0]).is_some()
         || specification
             .target_voters

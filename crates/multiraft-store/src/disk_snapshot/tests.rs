@@ -11,8 +11,8 @@ fn scratch() -> tempfile::TempDir {
     tempfile::tempdir_in(root).unwrap()
 }
 
-fn meta(index: u64) -> SnapshotMetaOf<TypeConfig> {
-    SnapshotMetaOf::<TypeConfig> {
+fn meta(index: u64) -> SnapshotMetaWithId {
+    SnapshotMetaWithId {
         last_log_id: Some(LogId::new(
             LeaderIdOf::<TypeConfig>::new_committed(2, 1),
             index,
@@ -48,6 +48,48 @@ fn manifest_roundtrip_and_structural_refusals() {
     let mut whole = meta(5);
     whole.snapshot_id = "native-7-1-5-1".into();
     assert!(!is_disk_snapshot(&whole, &bytes), "id prefix is required");
+    // OpenRaft's id-less metadata: the manifest must decode, for this Group, at this cut.
+    assert_eq!(
+        disk_snapshot_meta(7, &good.meta.meta(), &bytes),
+        Some(good.meta.clone())
+    );
+    assert_eq!(
+        disk_snapshot_meta(8, &good.meta.meta(), &bytes),
+        None,
+        "other group"
+    );
+    assert_eq!(
+        disk_snapshot_meta(7, &meta(6).meta(), &bytes),
+        None,
+        "other cut"
+    );
+    assert_eq!(
+        disk_snapshot_meta(7, &good.meta.meta(), b"whole image"),
+        None
+    );
+    let mut unprefixed = good.clone();
+    unprefixed.meta.snapshot_id = "native-7-1-5-1".into();
+    let unprefixed = unprefixed.encode().unwrap();
+    assert_eq!(disk_snapshot_meta(7, &good.meta.meta(), &unprefixed), None);
+    assert_eq!(
+        wire_snapshot_meta(7, &good.meta.meta(), &bytes).unwrap(),
+        good.meta
+    );
+    assert!(
+        wire_snapshot_meta(7, &good.meta.meta(), &unprefixed).is_err(),
+        "manifest magic is never sent as a whole image"
+    );
+    assert!(wire_snapshot_meta(7, &meta(6).meta(), &bytes).is_err());
+    let image = wire_snapshot_meta(7, &meta(5).meta(), b"whole image").unwrap();
+    assert!(
+        !image.snapshot_id.is_empty() && !image.snapshot_id.starts_with(DISK_SNAPSHOT_ID_PREFIX)
+    );
+    assert_eq!(
+        image,
+        wire_snapshot_meta(7, &meta(5).meta(), b"other image").unwrap(),
+        "derived from the cut"
+    );
+    assert!(!is_disk_snapshot(&image, b"whole image"));
 
     for bad in [
         manifest(&[]),
@@ -127,14 +169,14 @@ fn workspace_keeps_only_the_newest_complete_checkpoint() {
     for index in [3, 9] {
         let capture = workspace.temp_checkpoint();
         write_tree(capture.path(), "x");
-        let published = workspace.publish(7, capture, meta(index)).unwrap();
+        let published = workspace.publish(7, capture, meta(index).meta()).unwrap();
         assert_eq!(published.manifest.meta.last_log_id, meta(index).last_log_id);
     }
     // An older capture loses to the published newer snapshot.
     let stale = workspace.temp_checkpoint();
     write_tree(stale.path(), "y");
     let stale_path = stale.path().to_owned();
-    let kept = workspace.publish(7, stale, meta(4)).unwrap();
+    let kept = workspace.publish(7, stale, meta(4).meta()).unwrap();
     assert_eq!(kept.manifest.meta.last_log_id, meta(9).last_log_id);
     assert!(!stale_path.exists(), "losing capture removed");
     assert_eq!(fs::read_dir(root.path().join("ws")).unwrap().count(), 2);
@@ -160,13 +202,13 @@ fn chunk_stream_roundtrip_survives_republish_and_rejects_corruption() {
         .collect();
     fs::write(capture.path().join("big.sst"), &big).unwrap();
     fs::write(capture.path().join("empty"), b"").unwrap();
-    let published = workspace.publish(7, capture, meta(5)).unwrap();
+    let published = workspace.publish(7, capture, meta(5).meta()).unwrap();
 
     let mut source = ChunkSource::open(published.bytes.clone(), 7).unwrap();
     // A newer compaction removes the published directory; the lease keeps the files.
     let newer = workspace.temp_checkpoint();
     write_tree(newer.path(), "n");
-    workspace.publish(7, newer, meta(6)).unwrap();
+    workspace.publish(7, newer, meta(6).meta()).unwrap();
     assert!(!published.manifest.source.exists());
 
     let receive = |corrupt: bool, source: &mut ChunkSource| -> io::Result<Incoming> {
@@ -234,7 +276,7 @@ fn an_exact_retry_of_the_last_chunk_is_accepted_and_other_disorder_is_not() {
     fs::create_dir_all(capture.path()).unwrap();
     let data: Vec<u8> = (0..(MAX_CHUNK_BYTES + 5)).map(|i| (i % 7) as u8).collect();
     fs::write(capture.path().join("a.sst"), &data).unwrap();
-    let published = workspace.publish(7, capture, meta(5)).unwrap();
+    let published = workspace.publish(7, capture, meta(5).meta()).unwrap();
     let mut source = ChunkSource::open(published.bytes, 7).unwrap();
     let DiskChunk::Begin { transfer, manifest } = source.next_chunk().unwrap().unwrap() else {
         panic!("begin first");

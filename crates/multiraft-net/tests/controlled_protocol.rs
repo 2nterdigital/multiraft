@@ -240,7 +240,7 @@ async fn learner_installs_typed_ledger_snapshot_and_tail_before_exact_terminal()
         &vec![specification.target_voters.clone()]
     );
     assert_eq!(
-        membership.membership().learner_ids().count(),
+        membership.membership().non_write_voter_ids().count(),
         0,
         "source is fully excluded"
     );

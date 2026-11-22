@@ -7,13 +7,7 @@ use multiraft_store::Raft;
 use openraft::{async_runtime::WatchReceiver as _, Instant as _};
 
 const MAX_MEMBERSHIP_ITEMS: usize = 1024;
-fn membership(
-    value: &openraft::StoredMembership<
-        <TypeConfig as openraft::RaftTypeConfig>::LeaderId,
-        NodeId,
-        openraft::BasicNode,
-    >,
-) -> SourceFact<MembershipObservation> {
+fn membership(value: &multiraft_core::typ::StoredMembership) -> SourceFact<MembershipObservation> {
     let config = value.membership().get_joint_config();
     let mut items = config.len();
     if items > MAX_MEMBERSHIP_ITEMS {
@@ -29,7 +23,7 @@ fn membership(
     items = items.saturating_add(
         value
             .membership()
-            .learner_ids()
+            .non_write_voter_ids()
             .take(MAX_MEMBERSHIP_ITEMS + 1)
             .count(),
     );

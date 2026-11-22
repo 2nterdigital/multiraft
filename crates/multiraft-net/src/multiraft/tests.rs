@@ -127,3 +127,27 @@ async fn group_observer_does_not_wake_on_data_progress() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A single voter forms its own write quorum, so OpenRaft 0.10.1 never refuses
+/// its writes for lease and `await_write_lease` must not wait at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_voter_leader_writes_without_lease_wait() -> anyhow::Result<()> {
+    let nodes = MultiRaft::start_cluster(vec![ClusterConfig::for_test(1, &[1])]).await?;
+    let group = 98;
+    nodes[0].create_group(group, &[1]).await?;
+    wait_for_leader(&nodes, group, Duration::from_secs(10))
+        .await
+        .expect("leader elected");
+    let raft = nodes[0].raft(group).expect("leader raft");
+    let lease = Duration::from_millis(raft.config().election_timeout_max);
+    for i in 1..=20 {
+        assert!(
+            application::write_ready(&raft.metrics().borrow_watched(), lease),
+            "single voter leader must not take the lease wait"
+        );
+        nodes[0]
+            .propose(group, CounterFsm::encode_add(1, i))
+            .await?;
+    }
+    Ok(())
+}

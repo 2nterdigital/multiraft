@@ -138,7 +138,7 @@ impl<S: StateMachine> StateMachineStore<S> {
     /// has this store's layout, and its applied record is exactly `meta`'s cut.
     pub async fn verify_disk_snapshot(
         &self,
-        meta: &SnapshotMetaOf<TypeConfig>,
+        meta: &SnapshotMetaWithId,
         data: &[u8],
     ) -> io::Result<()> {
         self.require_disk()?;
@@ -227,7 +227,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         let manifest = DiskManifest::decode(&data, self.group_id)?;
         let last = meta
             .last_log_id
-            .filter(|_| manifest.meta == *meta)
+            .filter(|_| manifest.meta.matches(meta))
             .ok_or_else(|| invalid("disk snapshot manifest disagrees with its metadata"))?;
         let incoming = self
             .take_incoming(|incoming| incoming.verified() && incoming.manifest_bytes() == data)

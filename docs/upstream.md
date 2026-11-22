@@ -7,17 +7,17 @@
 Workspace `Cargo.toml` pins:
 
 ```toml
-openraft = { git = "https://github.com/2nterdigital/openraft.git", rev = "ea46d0e571f7497f1f549e125254dfcb2ff45e2e", version = "=0.10.0-alpha.30", default-features = false, features = ["serde", "type-alias", "tokio-rt"] }
-openraft-multi = { git = "https://github.com/2nterdigital/openraft.git", rev = "ea46d0e571f7497f1f549e125254dfcb2ff45e2e", version = "=0.10.0-alpha.30" }
+openraft = { git = "https://github.com/2nterdigital/openraft.git", rev = "b5f3dc1a4df74891d4a8236b9b35af90158dbb52", version = "=0.10.1", default-features = false, features = ["serde", "type-alias", "tokio-rt"] }
+openraft-multi = { git = "https://github.com/2nterdigital/openraft.git", rev = "b5f3dc1a4df74891d4a8236b9b35af90158dbb52", version = "=0.10.1" }
 ```
 
 Both crates use an **exact** version requirement (`=`). Do not widen to `^` / `~` without a deliberate bump and retest of the demo + `./scripts/acceptance.sh`.
 
 ## Why lock
 
-`openraft-multi` and the Multi-Raft APIs used by `multiraft-net` (`MultiGroup`, shared network / router patterns) are still on the **0.10.0-alpha** line. Patch alphas can change type aliases, feature flags, and example layouts. Pinning both crates to the same alpha revision avoids:
+`openraft-multi` and the Multi-Raft APIs used by `multiraft-net` (`MultiGroup`, shared network / router patterns) track the **0.10** line, where patch releases have changed type aliases, feature flags, and example layouts. Pinning both crates to the same source revision avoids:
 
-- accidental Cargo resolution to a newer incompatible alpha
+- accidental Cargo resolution to a newer incompatible release
 - `openraft` / `openraft-multi` version skew within one workspace
 - silent breakage of phase-1 in-process `GroupRouter` + demo acceptance
 
@@ -25,7 +25,7 @@ Both crates use an **exact** version requirement (`=`). Do not widen to `^` / `~
 
 Upstream multi-group KV example (same release train):
 
-- [openraft `examples/multi-raft-kv`](https://github.com/datafuselabs/openraft/tree/v0.10.0-alpha.30/examples/multi-raft-kv)
+- [openraft `examples/multi-raft-kv`](https://github.com/datafuselabs/openraft/tree/v0.10.1/examples/multi-raft-kv)
 
 When bumping the pin, start from that tree’s `Cargo.toml` / README for the target tag, then re-run:
 
@@ -41,16 +41,27 @@ cargo test --workspace
 3. Fix compile / API breaks in `multiraft-core` and `multiraft-net`.
 4. Pass workspace tests and acceptance.
 
-## Optional election source observer
+## Fork patches
 
-The exact alpha30 version is additionally bound to
-`https://github.com/2nterdigital/openraft.git` at
-`ea46d0e571f7497f1f549e125254dfcb2ff45e2e` for both workspace crates. This source
-revision is based on upstream alpha30 `19be0c27e5141d8acea3468cdb8a90875f117c27`
-and adds an optional constructor-installed typed election observer. It does not
-change native election algorithms, parameters, persisted formats or default
-transport/PreVote behavior. Cargo.lock fixes openraft, openraft-multi, macros and
-runtime crates to the same source revision. No registry cache or vendored shim
-is edited. See [source facts](specs/election-source-facts.md) and the paired
-[native PR](https://github.com/2nterdigital/openraft/pull/1). A future source update
-must deliberately update both git revisions and repeat workspace/acceptance checks.
+Both workspace crates resolve to `https://github.com/2nterdigital/openraft.git`
+at `b5f3dc1a4df74891d4a8236b9b35af90158dbb52` (branch `claude/v0.10.1-fork`).
+That revision is upstream tag `v0.10.1` (`6d3ede17`) plus three patches carried
+over from the earlier alpha30 fork (`8f0b2b48`):
+
+- an optional constructor-installed typed election observer
+  (see [source facts](specs/election-source-facts.md));
+- guarded single-step membership changes and a construction policy; a guarded
+  change from a uniform built-in `Membership` always appends the joint step;
+- `Config::broadcast_commit` (default `true`); `false` stops sending an empty
+  AppendEntries for a commit-index advance alone.
+
+Cargo.lock fixes openraft, openraft-multi, macros and runtime crates to the
+same source revision. No registry cache or vendored shim is edited. A future
+source update must deliberately update both git revisions and repeat
+workspace/acceptance checks.
+
+Wire and disk compatibility with alpha30 nodes is kept on the multiraft side:
+the 3-field `SnapshotMetaWithId` still writes a non-empty snapshot id, the
+legacy `VoteRequest` layout is decoded as a fallback, and append replies stay
+`AppendEntriesResponse` on the wire. `pre_vote` is granted locally and never
+sent, as on alpha30.

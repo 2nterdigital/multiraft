@@ -107,7 +107,7 @@ fn applied(path: &Path, group: u64) -> io::Result<Applied> {
         || record
             .membership
             .membership()
-            .learner_ids()
+            .non_write_voter_ids()
             .next()
             .is_some()
         || record.membership.membership().voter_ids().count() != 3

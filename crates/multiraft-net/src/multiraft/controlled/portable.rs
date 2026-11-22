@@ -39,7 +39,8 @@ pub struct NativeTargetScope {
 pub struct NativeSeedHeader {
     pub record: OperationRecord,
     pub vote: multiraft_core::typ::Vote,
-    pub meta: multiraft_core::typ::SnapshotMeta,
+    /// The manifest's metadata, id included: alpha.30 targets compare it to the manifest.
+    pub meta: multiraft_core::SnapshotMetaWithId,
     pub manifest: Vec<u8>,
 }
 /// Versioned requests; chunks are bounded and streamed into a target-owned workspace.

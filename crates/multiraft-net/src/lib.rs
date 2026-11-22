@@ -123,8 +123,9 @@ pub fn encode<T: Serialize>(t: T) -> Vec<u8> {
     bincode::serialize(&t).expect("raft encode")
 }
 
-pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> T {
-    bincode::deserialize(bytes).expect("raft decode")
+/// Peer bytes are untrusted: a malformed payload is an error, never a panic.
+pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> bincode::Result<T> {
+    bincode::deserialize(bytes)
 }
 
 pub use runtime::{

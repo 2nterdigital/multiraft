@@ -24,6 +24,7 @@ use futures::TryStreamExt;
 use multiraft_core::is_standby_snapshot_trigger;
 use multiraft_core::Request;
 use multiraft_core::Response;
+use multiraft_core::SnapshotMetaWithId;
 use multiraft_core::TypeConfig;
 use multiraft_fsm::GroupId;
 use multiraft_fsm::StateMachine;
@@ -316,22 +317,9 @@ impl<S: StateMachine> StateMachineStore<S> {
             .freeze_for_snapshot(inner.group_id)
             .map_err(io::Error::other)?;
 
-        let snapshot_idx = inner.next_snapshot_idx();
-        let snapshot_id = if let Some(last) = inner.last_applied_log {
-            format!(
-                "{}-{}-{}",
-                last.committed_leader_id(),
-                last.index(),
-                snapshot_idx
-            )
-        } else {
-            format!("--{}", snapshot_idx)
-        };
-
         let meta = SnapshotMetaOf::<TypeConfig> {
             last_log_id: inner.last_applied_log,
             last_membership: inner.last_membership.clone(),
-            snapshot_id,
         };
 
         let snapshot = StoredSnapshot {
@@ -354,7 +342,6 @@ impl<S: StateMachine> StateMachineStore<S> {
             operation = "native_snapshot_build",
             phase = "complete",
             group_id,
-            snapshot_id = %meta.snapshot_id,
             last_log_index = ?last_log_index,
             last_log_term = ?last_log_term,
             snapshot_bytes,
@@ -488,11 +475,6 @@ where
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    async fn begin_receiving_snapshot(&mut self) -> Result<Self::SnapshotData, io::Error> {
-        Ok(Cursor::new(Vec::new()))
-    }
-
     #[tracing::instrument(level = "trace", skip(self, snapshot))]
     async fn install_snapshot(
         &mut self,
@@ -501,7 +483,7 @@ where
     ) -> Result<(), io::Error> {
         if self.disk {
             let data = snapshot.into_inner();
-            if !crate::disk_snapshot::is_disk_snapshot(meta, &data) {
+            if crate::disk_snapshot::disk_snapshot_meta(self.group_id, meta, &data).is_none() {
                 return Err(disk::unsupported("snapshot install"));
             }
             return self.install_disk_snapshot(meta, data).await;

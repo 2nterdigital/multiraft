@@ -66,7 +66,7 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
                     || specification
                         .expected_start
                         .membership()
-                        .learner_ids()
+                        .non_write_voter_ids()
                         .next()
                         .is_some()
                     || specification
@@ -145,7 +145,7 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
                     });
                     if membership.get_joint_config().len() != 1
                         || actual != record.specification.target_voters
-                        || membership.learner_ids().next().is_some()
+                        || membership.non_write_voter_ids().next().is_some()
                     {
                         Some(ControlRejection::IncompleteConfiguration)
                     } else if self.last_membership.log_id().is_none_or(|required| {

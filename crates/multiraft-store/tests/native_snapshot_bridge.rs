@@ -212,13 +212,15 @@ async fn reopened_builder_uses_distinct_snapshot_identity_for_a_new_native_cut()
     let root = tempfile::tempdir().unwrap();
     let mut first = store(root.path(), 1024);
     apply(&mut first, 1, 5).await;
-    let old = first
+    first
         .try_create_snapshot_builder(false)
         .await
         .unwrap()
         .build_snapshot()
         .await
         .unwrap();
+    // OpenRaft's metadata has no id; the durable catalog keeps it.
+    let old = first.native_snapshot_info().await.unwrap().unwrap();
     let mut reopened = store(root.path(), 1024);
     let saved = reopened.get_current_snapshot().await.unwrap().unwrap();
     reopened
@@ -226,13 +228,15 @@ async fn reopened_builder_uses_distinct_snapshot_identity_for_a_new_native_cut()
         .await
         .unwrap();
     apply(&mut reopened, 2, 7).await;
-    let new = reopened
+    reopened
         .try_create_snapshot_builder(false)
         .await
         .unwrap()
         .build_snapshot()
         .await
         .unwrap();
+    let new = reopened.native_snapshot_info().await.unwrap().unwrap();
+    assert!(!old.meta.snapshot_id.is_empty());
     assert_ne!(old.meta.snapshot_id, new.meta.snapshot_id);
     assert_eq!(new.meta.last_log_id.unwrap().index, 2);
 }

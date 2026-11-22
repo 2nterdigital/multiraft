@@ -8,7 +8,7 @@ This document compares **multiraft** — an open-source, Rust Multi-Raft library
 
 ## Positioning
 
-**multiraft is not a fork of Aeron.** It does not embed the Aeron Media Driver, Consensus Module, or Archive. It is an **Aeron-inspired hot path** on pinned **[openraft](https://github.com/databendlabs/openraft) `=0.10.0-alpha.30`** + `openraft-multi`.
+**multiraft is not a fork of Aeron.** It does not embed the Aeron Media Driver, Consensus Module, or Archive. It is an **Aeron-inspired hot path** on pinned **[openraft](https://github.com/databendlabs/openraft) `=0.10.1`** + `openraft-multi`.
 
 > **2026-08-22 containment:** `STANDBY=1` is a lab learner/catalog/checksum/advertisement-generation flow. The catalog is not a current snapshot provider; live HTTP/ad/catalog/daisy restore is typed unsupported, while normal OpenRaft recovery remains. The historical Factory 6677 `StandbyOffload` restore contract is withdrawn because C42 and its metadata did not prove complete ownership. A future protocol needs separately Accepted complete metadata, atomic capture, Vote/full `LogId`/membership, and `install_full_snapshot`.
 

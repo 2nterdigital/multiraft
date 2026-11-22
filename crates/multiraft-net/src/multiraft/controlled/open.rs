@@ -29,7 +29,7 @@ impl<S: StateMachine> MultiRaft<S> {
             || specification.target_voters.len() != 3
             || old.difference(&specification.target_voters).count() != 1
             || starting.get_joint_config().len() != 1
-            || starting.learner_ids().next().is_some()
+            || starting.non_write_voter_ids().next().is_some()
         {
             return Err(ControlledError::Rejected(
                 "invalid target replacement reservation",
@@ -242,7 +242,7 @@ impl<S: StateMachine> MultiRaft<S> {
                             || catalog
                                 .membership
                                 .membership()
-                                .learner_ids()
+                                .non_write_voter_ids()
                                 .next()
                                 .is_some()
                             || voters.len() != 3

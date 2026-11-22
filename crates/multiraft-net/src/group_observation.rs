@@ -10,11 +10,7 @@ use openraft::async_runtime::WatchReceiver as _;
 use openraft::metrics::RaftServerMetrics;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId;
-use openraft::BasicNode;
-use openraft::StoredMembership;
-
-type RawStoredMembership =
-    StoredMembership<<TypeConfig as openraft::RaftTypeConfig>::LeaderId, NodeId, BasicNode>;
+type RawStoredMembership = multiraft_core::typ::StoredMembership;
 type RawLogId = openraft::alias::LogIdOf<TypeConfig>;
 type RawServerMetricsReceiver = WatchReceiverOf<TypeConfig, RaftServerMetrics<TypeConfig>>;
 
@@ -233,7 +229,7 @@ pub(crate) fn normalize_membership(membership: &RawStoredMembership) -> Membersh
     MembershipObservation {
         log_id: membership.log_id().as_ref().map(normalize_log_id),
         voter_configs: membership.membership().get_joint_config().clone(),
-        learner_ids: membership.membership().learner_ids().collect(),
+        learner_ids: membership.membership().non_write_voter_ids().collect(),
     }
 }
 
@@ -275,7 +271,6 @@ mod tests {
     use openraft::metrics::RaftServerMetrics;
     use openraft::testing::log_id;
     use openraft::type_config::TypeConfigExt;
-    use openraft::BasicNode;
     use openraft::Membership;
     use openraft::ServerState;
     use openraft::StoredMembership;
@@ -291,8 +286,7 @@ mod tests {
         index: u64,
         voter_configs: Vec<BTreeSet<NodeId>>,
         all_nodes: &[NodeId],
-    ) -> Arc<StoredMembership<<TypeConfig as openraft::RaftTypeConfig>::LeaderId, NodeId, BasicNode>>
-    {
+    ) -> Arc<RawStoredMembership> {
         Arc::new(StoredMembership::new(
             Some(log_id::<TypeConfig>(term, node_id, index)),
             Membership::new_with_defaults(voter_configs, all_nodes.iter().copied()),
@@ -302,18 +296,15 @@ mod tests {
     fn metrics_with(
         local_node_id: NodeId,
         state: ServerState,
-        effective_membership: Arc<
-            StoredMembership<<TypeConfig as openraft::RaftTypeConfig>::LeaderId, NodeId, BasicNode>,
-        >,
-        committed_membership: Arc<
-            StoredMembership<<TypeConfig as openraft::RaftTypeConfig>::LeaderId, NodeId, BasicNode>,
-        >,
+        effective_membership: Arc<RawStoredMembership>,
+        committed_membership: Arc<RawStoredMembership>,
     ) -> RaftServerMetrics<TypeConfig> {
         RaftServerMetrics {
             id: local_node_id,
             vote: Vote::new_committed(9, 2),
             state,
             current_leader: Some(2),
+            last_leader_contact: None,
             membership_config: effective_membership,
             committed_membership_config: committed_membership,
         }

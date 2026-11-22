@@ -13,7 +13,7 @@ use openraft::network::Backoff;
 use openraft::network::RPCOption;
 use openraft::network::RaftNetworkFactory;
 use openraft::raft::AppendEntriesRequest;
-use openraft::raft::AppendEntriesResponse;
+use openraft::raft::AppendResult;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::raft::TransferLeaderResponse;
@@ -40,7 +40,7 @@ impl GroupRouter<TypeConfig, GroupId> for Router {
         group_id: GroupId,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
+    ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
         // Hot path: typed in-process hop; ignore RPCOption (no transport TTL).
         self.send_append(target, group_id, rpc)
             .await
@@ -59,6 +59,20 @@ impl GroupRouter<TypeConfig, GroupId> for Router {
             .map_err(RPCError::Unreachable)
     }
 
+    /// Grant locally, without a wire call, exactly as alpha.30 did: its
+    /// `GroupNetworkAdapter` used the `RaftNetworkV2` default, so alpha.30
+    /// nodes have no Pre-Vote route. `Config::enable_pre_vote` stays unset
+    /// (off); enabling it needs a real RPC that every peer serves first.
+    async fn pre_vote(
+        &self,
+        _target: NodeId,
+        _group_id: GroupId,
+        rpc: VoteRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
+        Ok(VoteResponse::new(rpc.vote, None, true))
+    }
+
     async fn full_snapshot(
         &self,
         target: NodeId,
@@ -68,7 +82,15 @@ impl GroupRouter<TypeConfig, GroupId> for Router {
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
-        if multiraft_store::is_disk_snapshot(&snapshot.meta, snapshot.snapshot.get_ref()) {
+        // A disk manifest, or manifest magic that does not decode: never a whole image.
+        if multiraft_store::disk_snapshot::wire_snapshot_meta(
+            group_id,
+            &snapshot.meta,
+            snapshot.snapshot.get_ref(),
+        )
+        .map_or(true, |meta| {
+            multiraft_store::is_disk_snapshot(&meta, snapshot.snapshot.get_ref())
+        }) {
             // Disk snapshots stream checkpoint files; only the gRPC transport does that.
             return Err(StreamingError::Unreachable(
                 openraft::error::Unreachable::new(&std::io::Error::other(

@@ -226,7 +226,8 @@ impl<S: StateMachine> StateMachineStore<S> {
         self.validation.verify(context)?;
         if let Some(catalog) = &self.catalog {
             let (index, term) = context.applied.unwrap_or((0, 0));
-            catalog.write(self.group_id, index, term, meta.snapshot_id.clone(), &data)?;
+            // OpenRaft no longer hands the peer's snapshot id to an install.
+            catalog.write(self.group_id, index, term, format!("{index}-{term}"), &data)?;
         }
         inner.last_applied_log = meta.last_log_id;
         inner.last_membership = meta.last_membership.clone();

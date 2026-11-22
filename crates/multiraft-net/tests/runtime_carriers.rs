@@ -146,7 +146,7 @@ async fn running_original_sources_add_an_unknown_candidate_only_after_carrier_in
         .expect("actual native learner4 is reachable through installed runtime carrier");
     let after = group.membership(deadline()).await.unwrap();
     assert_eq!(
-        after.membership().learner_ids().collect::<Vec<_>>(),
+        after.membership().non_write_voter_ids().collect::<Vec<_>>(),
         vec![4]
     );
     prepared

@@ -87,14 +87,14 @@ impl<S: StateMachine> MultiRaft<S> {
                 Ok(())
             }
             Err(e) => {
+                // Before the forward mapping: a lease refusal is a forward too.
+                if membership_pending(&e) {
+                    return Err(transient_membership_err("add_learner", &e));
+                }
                 if let Some(fwd) = e.forward_to_leader() {
                     return Err(MultiRaftError::NotLeader {
                         hint: fwd.leader_id,
                     });
-                }
-                let msg = e.to_string();
-                if msg.contains("configuration change") {
-                    return Err(transient_membership_err("add_learner", &e));
                 }
                 Err(MultiRaftError::Other(anyhow::anyhow!("add_learner: {e}")))
             }
@@ -114,7 +114,7 @@ impl<S: StateMachine> MultiRaft<S> {
             .membership_config
             .membership()
             .clone();
-        let is_learner = membership.learner_ids().any(|id| id == node_id);
+        let is_learner = membership.non_write_voter_ids().any(|id| id == node_id);
         let is_voter = membership.voter_ids().any(|id| id == node_id);
         if is_voter {
             self.standby_throttle.remove(node_id);
@@ -147,17 +147,17 @@ impl<S: StateMachine> MultiRaft<S> {
                 Ok(())
             }
             Err(e) => {
-                if let Some(fwd) = e.forward_to_leader() {
-                    return Err(MultiRaftError::NotLeader {
-                        hint: fwd.leader_id,
-                    });
-                }
-                let msg = e.to_string();
-                if msg.contains("configuration change") {
+                // Before the forward mapping: a lease refusal is a forward too.
+                if membership_pending(&e) {
                     return Err(transient_membership_err(
                         "promote_standby change_membership",
                         &e,
                     ));
+                }
+                if let Some(fwd) = e.forward_to_leader() {
+                    return Err(MultiRaftError::NotLeader {
+                        hint: fwd.leader_id,
+                    });
                 }
                 Err(MultiRaftError::Other(anyhow::anyhow!(
                     "promote_standby change_membership: {e}"
@@ -204,17 +204,17 @@ impl<S: StateMachine> MultiRaft<S> {
                 Ok(())
             }
             Err(e) => {
-                if let Some(fwd) = e.forward_to_leader() {
-                    return Err(MultiRaftError::NotLeader {
-                        hint: fwd.leader_id,
-                    });
-                }
-                let msg = e.to_string();
-                if msg.contains("configuration change") {
+                // Before the forward mapping: a lease refusal is a forward too.
+                if membership_pending(&e) {
                     return Err(transient_membership_err(
                         "demote_to_standby change_membership",
                         &e,
                     ));
+                }
+                if let Some(fwd) = e.forward_to_leader() {
+                    return Err(MultiRaftError::NotLeader {
+                        hint: fwd.leader_id,
+                    });
                 }
                 Err(MultiRaftError::Other(anyhow::anyhow!(
                     "demote_to_standby change_membership: {e}"
@@ -244,7 +244,7 @@ impl<S: StateMachine> MultiRaft<S> {
                 .borrow_watched()
                 .membership_config
                 .membership()
-                .learner_ids()
+                .non_write_voter_ids()
                 .collect(),
         )
     }

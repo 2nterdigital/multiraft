@@ -131,6 +131,10 @@ pub(crate) fn project(
             pre_vote_enabled,
             decision,
         } => NativeElectionKind::AutomaticElection {
+            // Passed through as observed facts. Since OpenRaft 0.10.1 the gate can
+            // campaign as a leader whose transfer expired (`is_leader`), or as a
+            // committed-only campaigner outside the effective voters (`is_voter`),
+            // so neither is a constant; nothing in multiraft branches on them.
             timing: timing(value, at),
             is_voter,
             voter_count,

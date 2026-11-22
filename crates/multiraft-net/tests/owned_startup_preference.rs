@@ -568,7 +568,7 @@ async fn vote_only_history_is_recovery_even_when_native_basis_is_none() {
 async fn provider_proves_valid_inactive_snapshot_inert_before_allowing_first_initialization() {
     let root = tempfile::tempdir().unwrap();
     let catalog = multiraft_store::SnapshotCatalog::new(root.path().join("snapshots"), 1);
-    let meta = openraft::alias::SnapshotMetaOf::<multiraft_core::TypeConfig> {
+    let meta = multiraft_core::SnapshotMetaWithId {
         last_log_id: None,
         last_membership: Default::default(),
         snapshot_id: "inert".to_owned(),

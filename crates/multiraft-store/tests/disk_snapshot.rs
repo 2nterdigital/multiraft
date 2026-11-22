@@ -8,15 +8,17 @@ use std::sync::Arc;
 
 use futures::stream;
 use multiraft_core::typ::{Entry, LogId};
-use multiraft_core::{Request, TypeConfig};
+use multiraft_core::{Request, SnapshotMetaWithId, TypeConfig};
 use multiraft_fsm::{AppliedState, ApplyOut, DiskState, GroupId, StateMachine};
-use multiraft_store::disk_snapshot::{inject_install_fault, ChunkSource, InstallFault};
+use multiraft_store::disk_snapshot::{
+    inject_install_fault, wire_snapshot_meta, ChunkSource, InstallFault,
+};
 use multiraft_store::rocksdb::WriteBatch;
 use multiraft_store::{
     is_disk_snapshot, DiskChunk, DiskFsmDb, DiskFsmOptions, NativeSmOptions, SnapshotCatalog,
     StateMachineStore,
 };
-use openraft::alias::{LeaderIdOf, SnapshotMetaOf};
+use openraft::alias::LeaderIdOf;
 use openraft::storage::{IOFlushed, RaftLogStorage, RaftStateMachine};
 use openraft::vote::RaftLeaderIdExt;
 use openraft::{EntryPayload, Membership, RaftSnapshotBuilder};
@@ -200,7 +202,7 @@ async fn open_owner_quiescence_preserves_verified_transfer_for_native_install() 
         .unwrap();
     receiver.wait_native_quiescent().await;
     receiver
-        .install_snapshot(&meta, std::io::Cursor::new(manifest))
+        .install_snapshot(&meta.meta(), std::io::Cursor::new(manifest))
         .await
         .unwrap();
     assert_eq!(receiver.applied_state().await.unwrap().0, meta.last_log_id);
@@ -320,11 +322,7 @@ async fn apply(store: &mut StateMachineStore<DiskBlobs>, entries: Vec<Entry>) {
 async fn leader(
     root: &Path,
     n: u64,
-) -> (
-    StateMachineStore<DiskBlobs>,
-    SnapshotMetaOf<TypeConfig>,
-    Vec<u8>,
-) {
+) -> (StateMachineStore<DiskBlobs>, SnapshotMetaWithId, Vec<u8>) {
     let mut leader = store(root, DiskBlobs::open(&path(root)));
     let mut entries = vec![membership(0)];
     entries.extend((1..=n).map(|index| add(index, index)));
@@ -335,7 +333,10 @@ async fn leader(
         .build_snapshot()
         .await
         .unwrap();
-    (leader, snapshot.meta, snapshot.snapshot.into_inner())
+    // The metadata a sender puts on the wire: the manifest's, with its id.
+    let data = snapshot.snapshot.into_inner();
+    let meta = wire_snapshot_meta(GROUP, &snapshot.meta, &data).unwrap();
+    (leader, meta, data)
 }
 
 /// Stream every chunk of `manifest` into `receiver`, optionally corrupting one data chunk.
@@ -379,7 +380,7 @@ async fn build_publishes_a_manifest_and_restart_serves_it() {
 
     let mut restarted = store(root.path(), DiskBlobs::open(&path(root.path())));
     let current = restarted.get_current_snapshot().await.unwrap().unwrap();
-    assert_eq!(current.meta, meta);
+    assert_eq!(current.meta, meta.meta());
     assert_eq!(current.snapshot.into_inner(), data);
 }
 
@@ -396,7 +397,7 @@ async fn streamed_install_replaces_state_and_survives_restart() {
     transfer(&follower, data.clone(), None).await.unwrap();
     follower.verify_disk_snapshot(&meta, &data).await.unwrap();
     follower
-        .install_snapshot(&meta, io::Cursor::new(data.clone()))
+        .install_snapshot(&meta.meta(), io::Cursor::new(data.clone()))
         .await
         .unwrap();
     assert_eq!(
@@ -462,10 +463,13 @@ async fn refused_transfers_leave_the_old_state() {
     let mut forged = meta.clone();
     forged.last_log_id = Some(log_id(41));
     assert!(follower.verify_disk_snapshot(&forged, &data).await.is_err());
+    let mut forged = meta.clone();
+    forged.snapshot_id.push_str("-other");
+    assert!(follower.verify_disk_snapshot(&forged, &data).await.is_err());
 
     // Install without ingress verification is refused before any swap.
     let error = follower
-        .install_snapshot(&meta, io::Cursor::new(data.clone()))
+        .install_snapshot(&meta.meta(), io::Cursor::new(data.clone()))
         .await
         .err()
         .unwrap();
@@ -521,7 +525,7 @@ async fn failed_swaps_keep_the_old_store_live_and_durable() {
         follower.verify_disk_snapshot(&meta, &data).await.unwrap();
         inject_install_fault(Some(fault));
         let result = follower
-            .install_snapshot(&meta, io::Cursor::new(data.clone()))
+            .install_snapshot(&meta.meta(), io::Cursor::new(data.clone()))
             .await;
         inject_install_fault(None);
         assert!(result.is_err(), "{fault:?}");
@@ -635,7 +639,7 @@ async fn a_verified_transfer_survives_a_new_begin_and_a_resubmission() {
     follower.verify_disk_snapshot(&meta, &data).await.unwrap();
 
     follower
-        .install_snapshot(&meta, io::Cursor::new(data.clone()))
+        .install_snapshot(&meta.meta(), io::Cursor::new(data.clone()))
         .await
         .unwrap();
     assert_eq!(
@@ -665,7 +669,7 @@ async fn a_failure_before_the_swap_cleans_up_and_reopens_reads() {
         .join("installed");
     std::fs::create_dir_all(marker.join("blocker")).unwrap();
     let result = follower
-        .install_snapshot(&meta, io::Cursor::new(data.clone()))
+        .install_snapshot(&meta.meta(), io::Cursor::new(data.clone()))
         .await;
     assert!(result.is_err());
     follower.application_ready().unwrap();

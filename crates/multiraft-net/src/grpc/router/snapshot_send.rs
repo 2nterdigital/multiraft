@@ -118,7 +118,14 @@ impl SnapshotSender {
                 tokio::sync::TryAcquireError::Closed => refused("native snapshot owner closed"),
                 tokio::sync::TryAcquireError::NoPermits => refused("native snapshot send busy"),
             })?;
-        if multiraft_store::is_disk_snapshot(&snapshot.meta, snapshot.snapshot.get_ref()) {
+        // Alpha.30 receivers need the snapshot id: a disk manifest keeps its own.
+        let meta = multiraft_store::disk_snapshot::wire_snapshot_meta(
+            group_id,
+            &snapshot.meta,
+            snapshot.snapshot.get_ref(),
+        )
+        .map_err(|_| refused("invalid disk snapshot manifest"))?;
+        if multiraft_store::is_disk_snapshot(&meta, snapshot.snapshot.get_ref()) {
             return self
                 .send_disk(transport, target, group_id, vote, snapshot, option, permit)
                 .await;
@@ -130,7 +137,7 @@ impl SnapshotSender {
             return Err(refused("native snapshot size limit"));
         }
         let data = snapshot.snapshot.into_inner();
-        let wire_size = bincode::serialized_size(&(vote, &snapshot.meta, &data))
+        let wire_size = bincode::serialized_size(&(vote, &meta, &data))
             .map_err(|_| refused("invalid snapshot metadata"))?;
         if wire_size > (transport.snapshot_cap + 1024 * 1024) as u64
             || wire_size.saturating_sub(data.len() as u64 + 8) > 1024 * 1024 - 1024
@@ -155,7 +162,7 @@ impl SnapshotSender {
                     target,
                     group_id,
                     "/raft/snapshot",
-                    (vote, snapshot.meta, data),
+                    (vote, meta, data),
                     Some(deadline),
                 )
                 .await
