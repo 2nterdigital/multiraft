@@ -8,8 +8,8 @@ use rocksdb::{Direction, IteratorMode, WriteBatch};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::{
-    db_error, decode, encode, invalid, key, lock_uncached, prefix, Engine, Metadata, RocksLogDb,
-    RocksLogStore, CONTROLLED_SCHEMA, SCHEMA, SCHEMA_KEY,
+    db_error, decode, encode, invalid, key, prefix, Engine, Metadata, RocksLogDb, RocksLogStore,
+    CONTROLLED_SCHEMA, SCHEMA, SCHEMA_KEY,
 };
 
 /// Durable target admission and cleanup stage; native actors authorize transitions.
@@ -117,7 +117,7 @@ where
     /// Read the durable receipt without creating or starting a native core.
     pub fn lifecycle_receipt(&self, group: u64) -> io::Result<Option<ControlledGroupReceipt>> {
         let gate = self.engine.gate(group)?;
-        let _guard = lock_uncached(&gate)?;
+        let _guard = self.engine.lock_uncached(&gate)?;
         self.engine.receipt(group)
     }
 
@@ -161,7 +161,7 @@ where
             gate: self.engine.gate(group)?,
             generation: None,
         };
-        let _guard = lock_uncached(&store.gate)?;
+        let _guard = store.owner.engine.lock_uncached(&store.gate)?;
         if let Some(old) = self.engine.receipt(group)? {
             return if old.generation == generation
                 && old.identity == identity
@@ -232,7 +232,7 @@ where
             return Err(invalid("invalid controlled admission transition"));
         }
         let gate = self.engine.gate(group)?;
-        let _guard = lock_uncached(&gate)?;
+        let _guard = self.engine.lock_uncached(&gate)?;
         let mut receipt = self.exact_receipt(group, generation)?;
         if receipt.identity != identity {
             return Err(invalid("controlled operation identity mismatch"));
@@ -266,7 +266,7 @@ where
             generation: Some(generation),
         };
         {
-            let _guard = lock_uncached(&store.gate)?;
+            let _guard = store.owner.engine.lock_uncached(&store.gate)?;
             store.check_generation()?;
             store
                 .validate()?
@@ -282,7 +282,7 @@ where
         generation: u64,
     ) -> io::Result<StartupProvenance> {
         let store = self.group_generation(group, generation)?;
-        let _guard = lock_uncached(&store.gate)?;
+        let _guard = store.owner.engine.lock_uncached(&store.gate)?;
         store.check_generation()?;
         Ok(if store.required_metadata()?.ever_written {
             StartupProvenance::Persisted
@@ -294,7 +294,7 @@ where
     /// Read retained logical bytes for an exact active generation.
     pub fn retained_log_bytes_generation(&self, group: u64, generation: u64) -> io::Result<u64> {
         let store = self.group_generation(group, generation)?;
-        let _guard = lock_uncached(&store.gate)?;
+        let _guard = store.owner.engine.lock_uncached(&store.gate)?;
         store.check_generation()?;
         Ok(store.required_metadata()?.bytes)
     }
@@ -307,7 +307,7 @@ where
         generation: u64,
     ) -> io::Result<u64> {
         let gate = self.engine.gate(group)?;
-        let _guard = lock_uncached(&gate)?;
+        let _guard = self.engine.lock_uncached(&gate)?;
         let receipt = self.exact_receipt(group, generation)?;
         if matches!(
             receipt.stage,
@@ -342,7 +342,7 @@ where
         generation: u64,
     ) -> io::Result<u64> {
         let gate = self.engine.gate(group)?;
-        let _guard = lock_uncached(&gate)?;
+        let _guard = self.engine.lock_uncached(&gate)?;
         self.exact_receipt(group, generation)?;
         let start = prefix(group);
         let mut count = 0_u64;
@@ -368,7 +368,7 @@ where
             return Err(invalid("empty terminal proof"));
         }
         let gate = self.engine.gate(group)?;
-        let _guard = lock_uncached(&gate)?;
+        let _guard = self.engine.lock_uncached(&gate)?;
         let mut receipt = self.exact_receipt(group, generation)?;
         if matches!(
             receipt.stage,
@@ -398,7 +398,7 @@ where
         terminal_proof: &[u8],
     ) -> io::Result<()> {
         let gate = self.engine.gate(group)?;
-        let _guard = lock_uncached(&gate)?;
+        let _guard = self.engine.lock_uncached(&gate)?;
         let mut receipt = self.exact_receipt(group, generation)?;
         if receipt.terminal_proof.as_deref() != Some(terminal_proof)
             || !matches!(
@@ -440,7 +440,7 @@ where
         terminal_proof: &[u8],
     ) -> io::Result<()> {
         let gate = self.engine.gate(group)?;
-        let _guard = lock_uncached(&gate)?;
+        let _guard = self.engine.lock_uncached(&gate)?;
         let mut receipt = self.exact_receipt(group, generation)?;
         if receipt.terminal_proof.as_deref() != Some(terminal_proof)
             || !matches!(
@@ -471,7 +471,7 @@ where
             return Err(invalid("rejoin requires next generation and new identity"));
         }
         let gate = self.engine.gate(group)?;
-        let _guard = lock_uncached(&gate)?;
+        let _guard = self.engine.lock_uncached(&gate)?;
         let receipt = self
             .engine
             .receipt(group)?

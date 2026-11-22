@@ -47,7 +47,7 @@ records, not an application schema or a cross-database transaction contract.
 ## Durability and log operations
 
 Every database mutation uses an atomic RocksDB `WriteBatch` with synchronous
-WAL writes. The Raft vote, committed/purged basis, retained entries, tail, and
+WAL writes, unless the commit window below is enabled. The Raft vote, committed/purged basis, retained entries, tail, and
 encoded-entry byte count are updated through this storage interface.
 Append, suffix truncation, and prefix purge update their entries and metadata
 in the same batch. This atomicity does not extend to an application's FSM DB.
@@ -70,6 +70,46 @@ identities, byte counts, required metadata, and schema markers. Appends reject
 gaps, identity regressions, and conflicting replacements until truncation.
 Truncation cannot discard the committed or purged recovery basis; purge supports
 native snapshot installation advancing the purged marker beyond the log tail.
+
+### Node-level commit window
+
+`ClusterConfig::raft_log_commit_window` (default `Duration::ZERO`, off) lets
+the hot-path writes of all groups on a node share WAL syncs. It is read when
+the log database opens and affects only that node; setting it back to zero and
+restarting restores per-write syncs. Keys and formats do not change. Values
+above 1 s are rejected when the database opens.
+
+- **Semantics.** Append, vote, committed, truncate and purge write without sync,
+  then wait, still holding the group gate, until one `flush_wal(true)` covers
+  them. One committer thread per engine starts that flush one window after the
+  oldest waiting write, or as soon as the previous flush ends if that is later. A write is released only by a flush whose cut
+  was read after the write returned, so a returned storage call is durable as
+  before; caches and `IOFlushed` are updated only after release. Lifecycle,
+  schema and group-creation writes stay synchronous.
+- **Power loss.** Holding the gate leaves each group at most one unacknowledged
+  write, and its entries and metadata share one batch, so after power loss that
+  write either fully exists or does not: the same as a crash before the
+  acknowledgement, which Raft tolerates. Groups share no keys. This reasoning
+  has not been verified by power-loss tests; do one before enabling the window
+  in production. It also relies on RocksDB's default write path (no manual WAL
+  flush, pipelined, unordered or two-queue writes), which upgrades must recheck.
+- **Failure.** A failed WAL flush, or the committer thread exiting for any
+  reason including a panic, makes the engine fatal: waiting writes fail, and
+  every later read, write or lifecycle call on that engine fails without
+  reloading cached state, because RocksDB may still serve unsynced data that
+  callers were told failed. Restart the node. With the window off, a failed
+  write is reported only to its own caller.
+- **Cost.** Each waiting write occupies one blocking-pool thread for about one
+  window plus one flush, and at most one per group waits at a time. Reads of
+  the same group (`try_get_log_entries`, `read_vote`, ...) queue behind that
+  write on the group gate, each also holding a blocking-pool thread, so
+  occupancy is about groups x (1 + reads queued per group); keep the Tokio
+  blocking pool (default 512 threads) above that. Each group's log writes are serial, so one group
+  tops out near 1 / (write + wait) writes per second; past that, appends carry
+  more entries per write.
+- **Metrics.** With the window on, `log_commit_flush` (flush duration) and
+  `log_commit_batch` (writes released per flush, recorded as `n * 1 ms`) are
+  added; `log_sync_write` covers write plus wait, comparable with the window off.
 
 File-specific coalescing and streaming controls are ignored by RocksDB:
 `file_log_coalesce_us`, `file_log_stream_buf_bytes`, `file_log_stream_flush_ms`,

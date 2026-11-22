@@ -147,6 +147,7 @@ async fn failed_write_unloads_the_cache_and_keeps_durable_state() {
             write_buffer_manager: WriteBufferManager::new_write_buffer_manager(1024, false),
             db_id: "read-only".to_owned(),
             io_latency: IoLatency::default(),
+            commit: None,
         }),
     };
     let mut store = db.group(3).unwrap();

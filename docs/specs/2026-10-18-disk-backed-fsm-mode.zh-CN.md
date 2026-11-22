@@ -96,7 +96,9 @@ bridge 只在 `apply_durable` 返回之后才推进内存中的 applied 位置�
   启动时被拒绝。锁定的 OpenRaft 把条目 apply 到*已提交给日志 IO* 的位置，而不是已 flush
   的位置（`engine_impl.rs`，`log_submitted.min(apply_accepted)`）。RaftCore 在执行后续
   `SaveCommittedAndApply` 之前会就地 await `log_store.append`（`core/raft_core.rs`）。
-  RocksDB 的 `append` 在同步 WAL 写入完成后才返回（`log_rocks/storage.rs`），因此条目在
+  RocksDB 的 `append` 在同步 WAL 写入完成后才返回（`log_rocks/storage.rs`）；设置了
+  `raft_log_commit_window` 时，要等一次覆盖该写入的共享 WAL sync 完成才返回
+  （[提交窗口](../rocksdb-raft-log.md#node-level-commit-window)），因此条目在
   FSM 写入之前已在本地日志中落盘。FileLog 的 `append` 可能在合并组提交之前返回，崩溃后
   可能出现已落盘的 FSM 领先本地日志。
 

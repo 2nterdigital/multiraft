@@ -1,12 +1,13 @@
 //! Shared RocksDB Raft log engine, partitioned by stable group identity.
 //!
-//! Every mutation uses an atomic WriteBatch with synchronous WAL durability.
+//! Every mutation uses an atomic WriteBatch with synchronous WAL durability;
+//! with a commit window, hot-path writes share WAL syncs instead (`commit.rs`).
 //! Retained bytes count encoded entry values only, not SST/WAL physical space.
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use multiraft_core::StartupProvenance;
 use multiraft_core::DEFAULT_RAFT_LOG_COMPACTION_WRITE_BYTES_PER_SEC;
@@ -21,6 +22,7 @@ use rocksdb::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 mod adoption;
+mod commit;
 mod lifecycle;
 mod storage;
 pub use lifecycle::{ControlledGroupReceipt, ControlledGroupStage};
@@ -42,13 +44,15 @@ struct Engine<C: RaftTypeConfig> {
     write_buffer_manager: WriteBufferManager,
     db_id: String,
     io_latency: IoLatency,
+    /// `None` = no commit window: every write syncs itself.
+    commit: Option<Arc<commit::Commit>>,
 }
 
 /// Decoded per-group facts held under the group gate; `None` means not loaded.
 ///
 /// Only the hot-path operations in `storage.rs` read it, writing metadata
 /// through on success. Lifecycle, adoption and validation read RocksDB
-/// directly and take the gate through [`lock_uncached`], which leaves it
+/// directly and take the gate through [`Engine::lock_uncached`], which leaves it
 /// unloaded. Every handle still applies its own generation check on a hit.
 struct GroupCache<C: RaftTypeConfig> {
     /// The controlled-group receipt; `Some(None)` caches its absence.
@@ -74,10 +78,16 @@ struct IoLatency {
     append_queue: LatencyHistogram,
     /// Waiting for the per-group gate in `append` and `blocking`.
     gate_wait: LatencyHistogram,
-    /// Every synchronous `Engine::write`.
+    /// Every synchronous `Engine::write`; with a window, hot-path write plus wait.
     sync_write: LatencyHistogram,
     /// Whole `save_committed`, scheduling included.
     save_committed: LatencyHistogram,
+    /// Each committer `flush_wal(true)`; exported only with a commit window.
+    commit_flush: LatencyHistogram,
+    /// Tickets released per successful flush, NOT a latency: each flush records
+    /// `n * 1 ms`, so `count` = flushes and `sum_ns / 1e6` = released writes.
+    /// Exported only with a commit window.
+    commit_batch: LatencyHistogram,
 }
 
 /// One node's shared log engine. Clones and group handles keep the DB alive.
@@ -125,15 +135,6 @@ fn lock<T>(mutex: &Mutex<T>) -> io::Result<MutexGuard<'_, T>> {
         .lock()
         .map_err(|_| io::Error::other("rocks log gate poisoned"))
 }
-/// Take the gate for a path that reads RocksDB directly; the group cache is
-/// left unloaded, so the next hot-path call reloads whatever this path wrote.
-fn lock_uncached<C: RaftTypeConfig>(
-    gate: &Mutex<GroupCache<C>>,
-) -> io::Result<MutexGuard<'_, GroupCache<C>>> {
-    let mut guard = lock(gate)?;
-    *guard = GroupCache::unloaded();
-    Ok(guard)
-}
 fn encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| invalid(e.to_string()))
 }
@@ -166,12 +167,24 @@ fn entry_index(group: u64, raw: &[u8]) -> io::Result<u64> {
 
 impl<C: RaftTypeConfig> Engine<C> {
     fn write(&self, batch: WriteBatch) -> io::Result<()> {
+        self.check_fatal()?;
         let mut options = WriteOptions::default();
         options.set_sync(true);
         let started = Instant::now();
         let result = self.db.write_opt(batch, &options).map_err(db_error);
         self.io_latency.sync_write.record(started.elapsed());
         result
+    }
+    /// Take the gate for a path that reads RocksDB directly; the group cache is
+    /// left unloaded, so the next hot-path call reloads whatever this path wrote.
+    fn lock_uncached<'a>(
+        &self,
+        gate: &'a Mutex<GroupCache<C>>,
+    ) -> io::Result<MutexGuard<'a, GroupCache<C>>> {
+        let mut guard = lock(gate)?;
+        *guard = GroupCache::unloaded();
+        self.check_fatal()?;
+        Ok(guard)
     }
     fn gate(&self, group: u64) -> io::Result<Arc<Mutex<GroupCache<C>>>> {
         Ok(Arc::clone(lock(&self.gates)?.entry(group).or_insert_with(
@@ -208,6 +221,31 @@ where
         sync_all: bool,
         background_write_bytes_per_sec: u64,
     ) -> io::Result<Self> {
+        Self::open_with_commit_window(
+            path,
+            sync_all,
+            background_write_bytes_per_sec,
+            Duration::ZERO,
+        )
+    }
+
+    /// [`Self::open_with`] with a node-level group-commit window for hot-path
+    /// writes (`ZERO` = each write syncs itself). See `ClusterConfig::raft_log_commit_window`.
+    pub fn open_with_commit_window(
+        path: impl AsRef<Path>,
+        sync_all: bool,
+        background_write_bytes_per_sec: u64,
+        commit_window: Duration,
+    ) -> io::Result<Self> {
+        if commit_window > commit::MAX_WINDOW {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "raft log commit window {commit_window:?} exceeds the {:?} limit",
+                    commit::MAX_WINDOW
+                ),
+            ));
+        }
         let cache = Cache::new_lru_cache(RAFT_LOG_CACHE_BYTES);
         let write_buffer_manager = WriteBufferManager::new_write_buffer_manager(
             RAFT_LOG_WRITE_BUFFER_MANAGER_BYTES,
@@ -236,6 +274,8 @@ where
         // skip the ext4 journal commit (Lab sync-write p50 3.2 -> 0.7 ms).
         // RocksDB keeps this on under the default point-in-time recovery.
         options.set_recycle_log_file_num(RAFT_LOG_RECYCLED_WAL_FILES);
+        // The commit window's release rule relies on RocksDB's default write
+        // path: keep manual WAL flush, pipelined, unordered and two-queue writes off.
         options.create_if_missing(true);
         options.set_use_fsync(sync_all);
         crate::rocks_env::ensure_flush_threads();
@@ -255,16 +295,18 @@ where
                 db.write_opt(batch, &write_options).map_err(db_error)?;
             }
         }
-        Ok(Self {
-            engine: Arc::new(Engine {
-                db,
-                gates: Mutex::new(HashMap::new()),
-                cache,
-                write_buffer_manager,
-                db_id: std::fs::canonicalize(path.as_ref())?.display().to_string(),
-                io_latency: IoLatency::default(),
-            }),
-        })
+        let engine = Arc::new(Engine {
+            db,
+            gates: Mutex::new(HashMap::new()),
+            cache,
+            write_buffer_manager,
+            db_id: std::fs::canonicalize(path.as_ref())?.display().to_string(),
+            io_latency: IoLatency::default(),
+            commit: (!commit_window.is_zero())
+                .then(|| Arc::new(commit::Commit::new(commit_window))),
+        });
+        commit::spawn(&engine)?;
+        Ok(Self { engine })
     }
 
     /// Sample this shared engine once per database identity, across all group clones.
@@ -308,6 +350,15 @@ where
         .into_iter()
         .map(|(name, histogram)| (name, histogram.snapshot()))
         .collect();
+        if engine.commit.is_some() {
+            for (name, histogram) in [
+                ("log_commit_flush", &latency.commit_flush),
+                // Tickets per flush in 1 ms units; see `IoLatency::commit_batch`.
+                ("log_commit_batch", &latency.commit_batch),
+            ] {
+                stats.io_latency.insert(name, histogram.snapshot());
+            }
+        }
         Ok(stats)
     }
 
@@ -320,7 +371,7 @@ where
             gate: self.engine.gate(group)?,
         };
         {
-            let _guard = lock_uncached(&store.gate)?;
+            let _guard = store.owner.engine.lock_uncached(&store.gate)?;
             store.check_generation()?;
             if store.metadata()?.is_none() {
                 let metadata = Metadata::<C> {
@@ -349,7 +400,7 @@ where
             generation: None,
             gate: self.engine.gate(group)?,
         };
-        let _guard = lock_uncached(&store.gate)?;
+        let _guard = store.owner.engine.lock_uncached(&store.gate)?;
         store.check_generation()?;
         match store.validate()? {
             Some(meta) if meta.ever_written => Ok(StartupProvenance::Persisted),
@@ -366,7 +417,7 @@ where
             generation: None,
             gate: self.engine.gate(group)?,
         };
-        let _guard = lock_uncached(&store.gate)?;
+        let _guard = store.owner.engine.lock_uncached(&store.gate)?;
         store.check_generation()?;
         Ok(store.metadata()?.map_or(0, |meta| meta.bytes))
     }
@@ -542,12 +593,11 @@ where
     fn lock_gate(&self) -> io::Result<MutexGuard<'_, GroupCache<C>>> {
         let started = Instant::now();
         let guard = lock(&self.gate);
-        self.owner
-            .engine
-            .io_latency
-            .gate_wait
-            .record(started.elapsed());
-        guard
+        let engine = &self.owner.engine;
+        engine.io_latency.gate_wait.record(started.elapsed());
+        let guard = guard?;
+        engine.check_fatal()?;
+        Ok(guard)
     }
     async fn blocking<T, F>(&self, operation: F) -> io::Result<T>
     where
@@ -567,5 +617,7 @@ where
 
 #[cfg(test)]
 mod cache_tests;
+#[cfg(test)]
+mod commit_tests;
 #[cfg(test)]
 mod memory_tests;
