@@ -86,7 +86,6 @@ async fn native_grpc_transfers_five_mib_and_receiver_reopens_its_local_checkpoin
     let router = GrpcRouter::new(vec![(2, address)], 1);
     let id = LogId::new(LeaderIdOf::<TypeConfig>::new_committed(3, 1), 10);
     let meta = SnapshotMetaOf::<TypeConfig> {
-        snapshot_id: "five-mib".into(),
         last_log_id: Some(id),
         last_membership: StoredMembershipOf::<TypeConfig>::new(
             Some(LogId::new(LeaderIdOf::<TypeConfig>::new_committed(3, 1), 1)),

@@ -15,7 +15,7 @@ pub(crate) use transfer::Incoming;
 pub use transfer::{ChunkSource, DiskChunk, MAX_CHUNK_BYTES};
 pub(crate) use workspace::{Published, TempCheckpoint, Workspace};
 
-use multiraft_core::TypeConfig;
+use multiraft_core::{SnapshotMetaWithId, TypeConfig};
 use multiraft_fsm::GroupId;
 use openraft::alias::SnapshotMetaOf;
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ pub struct ManifestFile {
 #[serde(deny_unknown_fields)]
 pub struct DiskManifest {
     pub group: GroupId,
-    pub meta: SnapshotMetaOf<TypeConfig>,
+    pub meta: SnapshotMetaWithId,
     pub files: Vec<ManifestFile>,
     /// Sender-local checkpoint directory. Receivers never read it.
     pub source: PathBuf,
@@ -52,9 +52,62 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-/// Whether OpenRaft snapshot bytes are a disk manifest rather than a whole image.
-pub fn is_disk_snapshot(meta: &SnapshotMetaOf<TypeConfig>, data: &[u8]) -> bool {
+/// Whether snapshot RPC bytes (metadata as sent on the wire) are a disk
+/// manifest rather than a whole image.
+pub fn is_disk_snapshot(meta: &SnapshotMetaWithId, data: &[u8]) -> bool {
     data.starts_with(MAGIC) && meta.snapshot_id.starts_with(DISK_SNAPSHOT_ID_PREFIX)
+}
+
+/// The manifest metadata (with its `disk-v1-` id) when OpenRaft snapshot bytes
+/// are a disk manifest of `group` at `meta`'s cut; `None` for a whole image.
+///
+/// OpenRaft's metadata no longer carries the id, so the id-prefix half of
+/// [`is_disk_snapshot`] is checked on the manifest itself.
+pub fn disk_snapshot_meta(
+    group: GroupId,
+    meta: &SnapshotMetaOf<TypeConfig>,
+    data: &[u8],
+) -> Option<SnapshotMetaWithId> {
+    if !data.starts_with(MAGIC) {
+        return None;
+    }
+    DiskManifest::decode(data, group)
+        .ok()
+        .map(|manifest| manifest.meta)
+        .filter(|manifest_meta| manifest_meta.matches(meta))
+}
+
+/// Snapshot id for a whole image that OpenRaft handed over without one.
+/// Derived from the cut alone, so a resent snapshot keeps its id.
+pub fn whole_image_snapshot_id(group: GroupId, meta: &SnapshotMetaOf<TypeConfig>) -> String {
+    match meta.last_log_id {
+        Some(last) => format!(
+            "native-{group}-{}-{}",
+            last.committed_leader_id(),
+            last.index
+        ),
+        None => format!("native-{group}-empty"),
+    }
+}
+
+/// The metadata to put on the wire (or into a peer-visible record) for an
+/// OpenRaft snapshot: a disk manifest keeps its own id, a whole image gets
+/// [`whole_image_snapshot_id`]. Peers on OpenRaft 0.10.0-alpha.30 require it.
+/// Manifest magic that does not decode to this cut is refused rather than sent
+/// as a whole image, which a disk-backed receiver could only fail to install.
+pub fn wire_snapshot_meta(
+    group: GroupId,
+    meta: &SnapshotMetaOf<TypeConfig>,
+    data: &[u8],
+) -> io::Result<SnapshotMetaWithId> {
+    if !data.starts_with(MAGIC) {
+        return Ok(SnapshotMetaWithId::new(
+            meta.clone(),
+            whole_image_snapshot_id(group, meta),
+        ));
+    }
+    disk_snapshot_meta(group, meta, data)
+        .ok_or_else(|| invalid("disk snapshot manifest disagrees with its metadata"))
 }
 
 fn valid_name(name: &str) -> bool {

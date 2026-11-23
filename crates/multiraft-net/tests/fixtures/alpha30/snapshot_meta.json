@@ -1,0 +1,1 @@
+{"last_log_id":{"leader_id":{"term":7,"node_id":2},"index":102},"last_membership":{"log_id":{"leader_id":{"term":3,"node_id":1},"index":40},"membership":{"configs":[[1,2,3],[2,3,4]],"nodes":{"1":{"addr":"10.0.0.1:7000"},"2":{"addr":"10.0.0.2:7000"},"3":{"addr":"10.0.0.3:7000"},"4":{"addr":"10.0.0.4:7000"},"5":{"addr":"10.0.0.5:7000"}}}},"snapshot_id":"disk-v1-7-2-102-abcdef"}

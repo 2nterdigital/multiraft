@@ -12,9 +12,8 @@ use openraft::{
         RPCOption, RaftNetworkFactory,
     },
     raft::{
-        AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, StreamAppendResult,
-        TransferLeaderError, TransferLeaderRequest, TransferLeaderResponse, VoteRequest,
-        VoteResponse,
+        AppendEntriesRequest, AppendResult, SnapshotResponse, TransferLeaderError,
+        TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
     },
     vote::RaftLeaderId,
     OptionalSend,
@@ -64,7 +63,7 @@ impl<N: NetAppend<TypeConfig>> NetAppend<TypeConfig> for ObservedNetwork<N> {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
-    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
+    ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
         self.inner.append_entries(rpc, option).await
     }
 }
@@ -82,7 +81,7 @@ impl<N: NetVote<TypeConfig>> NetVote<TypeConfig> for ObservedNetwork<N> {
                     request: VoteRpcRequest {
                         vote: vote(&rpc.vote),
                         last_log_id: rpc.last_log_id.as_ref().map(normalize_log_id),
-                        leadership_transfer: rpc.leadership_transfer,
+                        leadership_transfer: rpc.leadership_transfer_from.is_some(),
                     },
                 },
             )
@@ -138,7 +137,7 @@ impl<N: NetStreamAppend<TypeConfig>> NetStreamAppend<TypeConfig> for ObservedNet
     ) -> BoxFuture<
         's,
         Result<
-            BoxStream<'s, Result<StreamAppendResult<TypeConfig>, RPCError<TypeConfig>>>,
+            BoxStream<'s, Result<AppendResult<TypeConfig>, RPCError<TypeConfig>>>,
             RPCError<TypeConfig>,
         >,
     >

@@ -361,7 +361,8 @@ async fn purged_log_without_persisted_fsm_reports_recovery_failure() {
     node.shutdown().await.expect("shutdown unpublished node");
 
     let expected_directory = group_path.display().to_string();
-    let expected_cause = "Cannot re-apply logs: need logs from index 0, but purged up to";
+    // OpenRaft 0.10.1 wording of the same refusal.
+    let expected_cause = "logs from index 0 are lost on this node";
     assert_missing_log_recovery_source(&error, expected_cause);
     let safe_summary = "group 9 recovery failed during Construct: native storage failed";
     assert_eq!(error.to_string(), safe_summary);

@@ -11,7 +11,7 @@
 //! - `installed`: the applied position of the last swapped-in checkpoint.
 use super::{invalid, nonce, DiskManifest, ManifestFile, DISK_SNAPSHOT_ID_PREFIX};
 use crate::durability::sync_dir;
-use multiraft_core::TypeConfig;
+use multiraft_core::{SnapshotMetaWithId, TypeConfig};
 use multiraft_fsm::GroupId;
 use openraft::alias::{LogIdOf, SnapshotMetaOf};
 use std::fs;
@@ -160,7 +160,7 @@ impl Workspace {
         &self,
         group: GroupId,
         capture: TempCheckpoint,
-        mut meta: SnapshotMetaOf<TypeConfig>,
+        meta: SnapshotMetaOf<TypeConfig>,
     ) -> io::Result<Published> {
         if let Some(current) = self.latest(group)? {
             if current.manifest.meta.last_log_id >= meta.last_log_id {
@@ -176,10 +176,10 @@ impl Workspace {
         let files = list_synced(capture.path())?;
         let dir = self.root.join(&stem);
         fs::rename(capture.take(), &dir)?;
-        meta.snapshot_id = format!("{DISK_SNAPSHOT_ID_PREFIX}{group}-{index}-{suffix}");
+        let snapshot_id = format!("{DISK_SNAPSHOT_ID_PREFIX}{group}-{index}-{suffix}");
         let manifest = DiskManifest {
             group,
-            meta,
+            meta: SnapshotMetaWithId::new(meta, snapshot_id),
             files,
             source: dir,
         };

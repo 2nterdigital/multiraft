@@ -104,6 +104,7 @@ async fn controlled_append_uses_json_and_old_peer_never_receives_binary_fallback
         router
             .append_entries(2, 8, append(false), RPCOption::new(Duration::from_secs(1)))
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(paths.lock().unwrap()[1], "/raft/append");
         router.join().await.unwrap();

@@ -140,7 +140,6 @@ fn durable_recovery_events_report_persisted_boundaries() {
             let seed_meta = SnapshotMetaOf::<TypeConfig> {
                 last_log_id: Some(last_log_id),
                 last_membership: StoredMembershipOf::<TypeConfig>::default(),
-                snapshot_id: "seed-3-2-7".to_owned(),
             };
             let mut state_machine = StateMachineStore::new(44, CounterFsm::new());
             RaftStateMachine::install_snapshot(

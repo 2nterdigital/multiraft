@@ -88,6 +88,11 @@ impl ChunkSource {
         self.manifest.files.len()
     }
 
+    /// The manifest's metadata, with its `disk-v1-` snapshot id.
+    pub fn meta(&self) -> &multiraft_core::SnapshotMetaWithId {
+        &self.manifest.meta
+    }
+
     /// The next message, or `None` after the last file ended (blocking IO).
     pub fn next_chunk(&mut self) -> io::Result<Option<DiskChunk>> {
         if !self.begun {

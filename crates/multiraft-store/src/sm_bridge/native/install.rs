@@ -72,8 +72,11 @@ impl<S: StateMachine> StateMachineStore<S> {
             .await
             .map_err(io::Error::other)?;
         let options = native.options.clone();
-        let owned_meta = meta.clone();
         let group = self.group_id;
+        let owned_meta = SnapshotMetaWithId::new(
+            meta.clone(),
+            crate::disk_snapshot::whole_image_snapshot_id(group, meta),
+        );
         let stage_started = std::time::Instant::now();
         let (stage, data, permit) = tokio::task::spawn_blocking(move || {
             let stage = options.catalog.stage_native(

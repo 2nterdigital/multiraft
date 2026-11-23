@@ -255,7 +255,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                     guard,
                 )
                 .await
-                .map_err(|error| ControlledError::Native(error.to_string()))?;
+                .map_err(membership_refusal)?;
                 Ok(())
             })
             .await
@@ -301,7 +301,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                 let exact = membership.get_joint_config().len() == 1
                     && membership.voter_ids().collect::<BTreeSet<_>>()
                         == record.specification.target_voters
-                    && membership.learner_ids().next().is_none();
+                    && membership.non_write_voter_ids().next().is_none();
                 if exact {
                     return Ok(());
                 }
@@ -317,7 +317,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                         guard,
                     )
                     .await
-                    .map_err(|error| ControlledError::Native(error.to_string()))?;
+                    .map_err(membership_refusal)?;
                 } else {
                     if membership.get_joint_config().len() == 2 {
                         return Ok(());
@@ -355,7 +355,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                         guard,
                     )
                     .await
-                    .map_err(|error| ControlledError::Native(error.to_string()))?;
+                    .map_err(membership_refusal)?;
                 }
                 Ok(())
             })
@@ -397,7 +397,7 @@ impl<S: StateMachine> ControlledGroup<S> {
                         || membership.get_joint_config().len() != 1
                         || membership.voter_ids().collect::<BTreeSet<_>>()
                             != record.specification.target_voters
-                        || membership.learner_ids().next().is_some()
+                        || membership.non_write_voter_ids().next().is_some()
                     {
                         return Err(ControlledError::Rejected(
                             "exact final configuration is not committed",
@@ -482,6 +482,25 @@ pub(super) async fn checked_executor<S: StateMachine>(
     }
     Ok(record)
 }
+/// OpenRaft 0.10.1 refuses a membership append, writing no log, until the
+/// leader commits a log of its own term (`UncommittedLeaderLog`). The executor's
+/// committed Begin/Claim is such a log, so this is not expected under a pinned
+/// executor; it is still reported as a refusal, distinct from native failure,
+/// because the step is idempotent and may simply be retried.
+fn membership_refusal(
+    error: openraft::error::RaftError<TypeConfig, openraft::error::ClientWriteError<TypeConfig>>,
+) -> ControlledError {
+    use openraft::error::{ChangeMembershipError, ClientWriteError};
+    if matches!(
+        error.api_error(),
+        Some(ClientWriteError::ChangeMembershipError(
+            ChangeMembershipError::UncommittedLeaderLog(_)
+        ))
+    ) {
+        return ControlledError::Rejected("leader has not committed a log of its own term yet");
+    }
+    ControlledError::Native(error.to_string())
+}
 async fn membership_guard<S: StateMachine>(
     raft: &Raft<S>,
     executor: &ControlledExecutor,
@@ -502,6 +521,7 @@ async fn write_control<S: StateMachine>(
     command: NativeControl,
 ) -> Result<NativeLedger, ControlledError> {
     let (responder, receiver) = openraft::impls::ProgressResponder::complete_only();
+    crate::multiraft::application::await_write_lease(raft).await;
     raft.write(Request::native_control(command))
         .with_leader(leader)
         .responder(responder)

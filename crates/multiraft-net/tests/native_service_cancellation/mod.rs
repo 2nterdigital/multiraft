@@ -5,7 +5,7 @@ use multiraft_fsm::{ApplyOut, GroupId};
 use multiraft_store::{
     FileLogStoreOf, NativeSmOptions, SnapshotCatalog, StateMachineStore, StubNetworkFactory,
 };
-use openraft::alias::{LeaderIdOf, LogIdOf, SnapshotMetaOf, StoredMembershipOf};
+use openraft::alias::{LeaderIdOf, LogIdOf, StoredMembershipOf};
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderIdExt;
 use std::{
@@ -94,7 +94,8 @@ async fn cancelled_service_waiter_does_not_admit_another_native_install() {
         ]),
     )
     .unwrap();
-    let meta = SnapshotMetaOf::<TypeConfig> {
+    // The wire tuple keeps the alpha.30 metadata layout, id included.
+    let meta = multiraft_core::SnapshotMetaWithId {
         snapshot_id: "cancelled-rpc".into(),
         last_log_id: Some(id),
         last_membership: StoredMembershipOf::<TypeConfig>::new(None, membership),

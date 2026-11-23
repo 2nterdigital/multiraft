@@ -13,8 +13,8 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use super::lifecycle::generation_active;
 use super::{
-    db_error, decode, encode, entry_index, entry_key, invalid, key, GroupCache, Metadata,
-    RocksLogStore,
+    db_error, decode_entry, encode_entry, entry_index, entry_key, invalid, key, GroupCache,
+    Metadata, RocksLogStore,
 };
 
 /// Ranges of at most this many entries are read with point lookups. Replication
@@ -333,7 +333,7 @@ where
             {
                 return Err(invalid("append overlaps purged prefix"));
             }
-            let encoded = encode(&entry)?;
+            let encoded = encode_entry(&entry)?;
             let basis = meta.tail.as_ref().or(meta.purged.as_ref());
             let next = basis.map_or(Some(0), |last| last.index().checked_add(1));
             // Nothing is stored past the tail: entries and tail share one WriteBatch,
@@ -346,8 +346,9 @@ where
                     .get(entry_key(self.group, index))
                     .map_err(db_error)?
                 {
-                    let existing_entry: C::Entry = decode(&existing)?;
-                    if existing_entry.log_id() != id || existing.as_slice() != encoded {
+                    let existing_entry: C::Entry = decode_entry(&existing)?;
+                    // Re-encode: a legacy JSON value of the same entry must still match.
+                    if existing_entry.log_id() != id || encode_entry(&existing_entry)? != encoded {
                         return Err(invalid(
                             "append conflicts with existing entry; truncate first",
                         ));
@@ -419,7 +420,7 @@ where
             if Some(index) != expected {
                 return Err(invalid("gap in requested log range"));
             }
-            let entry: C::Entry = decode(&value)?;
+            let entry: C::Entry = decode_entry(&value)?;
             if entry.log_id().index() != index {
                 return Err(invalid("entry key/log id mismatch"));
             }

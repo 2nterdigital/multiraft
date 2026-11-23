@@ -69,8 +69,8 @@ Full notes: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · [中文](docs/ARCHIT
 
 | Crate | Version |
 |-------|---------|
-| `openraft` | `=0.10.0-alpha.30` |
-| `openraft-multi` | `=0.10.0-alpha.30` |
+| `openraft` | `=0.10.1` |
+| `openraft-multi` | `=0.10.1` |
 
 See [docs/upstream.md](docs/upstream.md) · [中文](docs/upstream.zh-CN.md).
 

@@ -681,7 +681,6 @@ async fn snapshot_mode_disabled_native_complete_snapshot_rpc() -> anyhow::Result
     let meta = multiraft_core::typ::SnapshotMeta {
         last_log_id: Some(last_log_id),
         last_membership: multiraft_core::typ::StoredMembership::new(Some(last_log_id), membership),
-        snapshot_id: "disabled-native-complete-42".into(),
     };
     let data = CounterFsm::new().snapshot(0)?;
     node.router()

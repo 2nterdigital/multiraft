@@ -76,8 +76,9 @@ impl<S: StateMachine> MultiRaft<S> {
             .raft(group)
             .ok_or(MultiRaftError::UnknownGroup(group))?;
         let n = payloads.len();
+        await_write_lease(&raft).await;
         let mut stream = raft
-            .client_write_many(payloads.into_iter().map(Request::new))
+            .client_write_many(payloads.into_iter().map(Request::new), Default::default())
             .await
             .map_err(|e| MultiRaftError::Other(anyhow::anyhow!("client_write_many: {e}")))?;
         let mut out = Vec::with_capacity(n);
@@ -90,10 +91,21 @@ impl<S: StateMachine> MultiRaft<S> {
                     index: resp.log_id.index(),
                     term: resp.log_id.committed_leader_id().term,
                 }),
-                Err(fwd) => {
+                // Alpha.30 answered only `ForwardToLeader` here, including for
+                // entries a new leader truncated; `LogEntryDiscarded` and a lease
+                // refusal (`ForwardReason::LeaseExpired`) carry the same routing.
+                Err(
+                    openraft::error::ClientWriteError::ForwardToLeader(fwd)
+                    | openraft::error::ClientWriteError::LogEntryDiscarded(fwd),
+                ) => {
                     return Err(MultiRaftError::NotLeader {
                         hint: fwd.leader_id,
                     });
+                }
+                Err(error) => {
+                    return Err(MultiRaftError::Other(anyhow::anyhow!(
+                        "client_write_many: {error}"
+                    )));
                 }
             }
         }
@@ -128,6 +140,7 @@ impl<S: StateMachine> MultiRaft<S> {
         raft: &Raft<S>,
         data: Vec<u8>,
     ) -> Result<ProposeApplied, MultiRaftError> {
+        await_write_lease(raft).await;
         match raft.client_write(Request::new(data)).await {
             Ok(resp) => Ok(ProposeApplied {
                 index: resp.log_id.index(),
@@ -160,6 +173,56 @@ impl<S: StateMachine> MultiRaft<S> {
             }
         }
     }
+}
+
+/// Wait, at most one election timeout, until this node is not leader or holds a
+/// write lease, so the single write that follows is not refused with
+/// `ForwardReason::LeaseExpired`. OpenRaft 0.10.1 refuses (appending nothing)
+/// while a leader's quorum lease is unconfirmed, e.g. right after election until
+/// its first replication round is acknowledged; alpha.30 accepted the write.
+/// Past the wait the leader is cut off from its quorum and the write's refusal
+/// is returned as is.
+pub(super) async fn await_write_lease<S: StateMachine>(raft: &Raft<S>) {
+    // OpenRaft's `timer_config.leader_lease` is `election_timeout_max`.
+    let lease = Duration::from_millis(raft.config().election_timeout_max);
+    let ready = move |m: &openraft::RaftMetrics<TypeConfig>| write_ready(m, lease);
+    if ready(&raft.metrics().borrow_watched()) {
+        return;
+    }
+    // Timeout or shutdown: write anyway and let that result speak.
+    let _ = raft.wait(Some(lease)).metrics(ready, "write lease").await;
+}
+
+/// Whether a write may go now: this node is not leader (the write is forwarded
+/// with a hint), or it is a leader holding its write lease.
+pub(super) fn write_ready(m: &openraft::RaftMetrics<TypeConfig>, lease: Duration) -> bool {
+    m.state != openraft::ServerState::Leader
+        || write_lease_valid(
+            m.id,
+            m.membership_config.membership().get_joint_config(),
+            m.last_quorum_acked.as_ref().map(|acked| acked.into_inner()),
+            TypeConfig::now(),
+            lease,
+        )
+}
+
+/// Published-metrics mirror of OpenRaft 0.10.1 `Leader::is_lease_valid`: a leader
+/// that alone forms every write quorum of its (joint) config holds the lease;
+/// otherwise a quorum must have acked within `lease`. Metrics do not expose an
+/// ongoing leadership transfer, which voids a self-quorum lease; that write is
+/// then refused once and reported as `NotLeader`.
+fn write_lease_valid(
+    id: NodeId,
+    joint: &[BTreeSet<NodeId>],
+    last_quorum_acked: Option<openraft::alias::InstantOf<TypeConfig>>,
+    now: openraft::alias::InstantOf<TypeConfig>,
+    lease: Duration,
+) -> bool {
+    let self_quorum = !joint.is_empty()
+        && joint
+            .iter()
+            .all(|config| config.len() == 1 && config.contains(&id));
+    self_quorum || last_quorum_acked.is_some_and(|acked| now < acked + lease)
 }
 
 impl<S: StateMachine> MultiRaft<S> {
@@ -321,5 +384,55 @@ impl<S: StateMachine> MultiRaft<S> {
     /// Whether this node accepts [`Self::read_stale`].
     pub fn stale_queries_enabled(&self) -> bool {
         self.config.enable_stale_queries
+    }
+}
+
+#[cfg(test)]
+mod write_lease_tests {
+    use super::write_lease_valid;
+    use multiraft_core::TypeConfig;
+    use openraft::type_config::TypeConfigExt;
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    const LEASE: Duration = Duration::from_millis(300);
+
+    fn joint(configs: &[&[u64]]) -> Vec<BTreeSet<u64>> {
+        configs
+            .iter()
+            .map(|c| c.iter().copied().collect())
+            .collect()
+    }
+
+    #[test]
+    fn single_voter_holds_lease_without_any_quorum_ack() {
+        let now = TypeConfig::now();
+        assert!(write_lease_valid(1, &joint(&[&[1]]), None, now, LEASE));
+        assert!(write_lease_valid(
+            1,
+            &joint(&[&[1], &[1]]),
+            None,
+            now,
+            LEASE
+        ));
+    }
+
+    #[test]
+    fn multi_voter_lease_needs_a_fresh_quorum_ack() {
+        let now = TypeConfig::now();
+        let three = joint(&[&[1, 2, 3]]);
+        assert!(!write_lease_valid(1, &three, None, now, LEASE));
+        assert!(write_lease_valid(1, &three, Some(now), now, LEASE));
+        assert!(!write_lease_valid(1, &three, Some(now), now + LEASE, LEASE));
+        // Joint config with a multi-voter half is not a self quorum.
+        assert!(!write_lease_valid(
+            1,
+            &joint(&[&[1], &[1, 2, 3]]),
+            None,
+            now,
+            LEASE
+        ));
+        // A leader outside its single-voter config is not a self quorum.
+        assert!(!write_lease_valid(1, &joint(&[&[2]]), None, now, LEASE));
     }
 }

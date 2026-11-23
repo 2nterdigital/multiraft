@@ -1,18 +1,18 @@
 //! Catch loss of native leader/membership identity and unsafe activation/regression.
-use multiraft_core::TypeConfig;
+use multiraft_core::{SnapshotMetaWithId, TypeConfig};
 use multiraft_store::SnapshotCatalog;
-use openraft::alias::{LogIdOf, SnapshotMetaOf, StoredMembershipOf};
+use openraft::alias::{LogIdOf, StoredMembershipOf};
 use openraft::vote::RaftLeaderIdExt;
 use openraft::{BasicNode, Membership};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn meta(index: u64) -> SnapshotMetaOf<TypeConfig> {
+fn meta(index: u64) -> SnapshotMetaWithId {
     let members = BTreeMap::from([
         (11, BasicNode::new("one")),
         (22, BasicNode::new("two")),
         (33, BasicNode::new("three")),
     ]);
-    SnapshotMetaOf::<TypeConfig> {
+    SnapshotMetaWithId {
         last_log_id: Some(LogIdOf::<TypeConfig>::new(
             openraft::alias::LeaderIdOf::<TypeConfig>::new_committed(7, 22),
             index,

@@ -1,6 +1,7 @@
 //! Fresh committed operation checkpoints establish a native vote/log floor before route publication.
 use super::*;
-use multiraft_core::typ::{self, LogId, SnapshotMeta, Vote};
+use multiraft_core::typ::{self, LogId, Vote};
+use multiraft_core::SnapshotMetaWithId;
 use openraft::storage::{RaftLogReader, RaftLogStorage, RaftStateMachine};
 use openraft::vote::RaftLeaderId;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ struct SeedAnchor {
     record: multiraft_core::OperationRecord,
     vote: Vote,
     fingerprint: Option<[u8; 32]>,
-    meta: SnapshotMeta,
+    meta: SnapshotMetaWithId,
 }
 fn anchor_path(root: &std::path::Path, group: GroupId, generation: u64) -> PathBuf {
     root.join("controlled-seed")
@@ -89,7 +90,11 @@ impl<S: StateMachine> ControlledGroup<S> {
                     record,
                     vote,
                     fingerprint: node.config.raft_transport_fingerprint,
-                    meta: snapshot.meta,
+                    meta: multiraft_store::disk_snapshot::wire_snapshot_meta(
+                        this.group,
+                        &snapshot.meta,
+                        &manifest,
+                    )?,
                     manifest,
                     input: super::seed_stream::SeedInput::local(&node, this.group),
                 })
@@ -232,7 +237,7 @@ pub(super) async fn install<S: StateMachine>(
     raft.install_full_snapshot(
         anchor.vote,
         openraft::alias::SnapshotOf::<TypeConfig, typ::SnapshotData> {
-            meta: anchor.meta.clone(),
+            meta: anchor.meta.meta(),
             snapshot: std::io::Cursor::new(manifest),
         },
     )

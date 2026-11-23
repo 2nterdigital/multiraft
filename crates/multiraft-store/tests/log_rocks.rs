@@ -126,7 +126,8 @@ async fn retained_bytes_follow_atomic_append_suffix_and_prefix_changes() {
     let batch = entries(1, 0..4);
     let sizes: Vec<_> = batch
         .iter()
-        .map(|entry| serde_json::to_vec(entry).unwrap().len() as u64)
+        // Tag byte plus bincode body (`log_rocks::encode_entry`).
+        .map(|entry| 1 + bincode::serialized_size(entry).unwrap())
         .collect();
     store.blocking_append(batch).await.unwrap();
     assert_eq!(db.retained_log_bytes(1).unwrap(), sizes.iter().sum::<u64>());

@@ -459,12 +459,16 @@ fn peer_image(root: &Path) -> multiraft_core::typ::Snapshot {
     use openraft::alias::LeaderIdOf;
     use openraft::vote::RaftLeaderIdExt;
     let catalog = multiraft_store::SnapshotCatalog::new(root.join("snapshots"), 1);
-    let mut meta = catalog.load_native(7, 1024).unwrap().unwrap().meta;
+    let mut meta = catalog
+        .load_native(7, 1024)
+        .unwrap()
+        .unwrap()
+        .meta
+        .into_meta();
     meta.last_log_id = Some(LogId::new(
         LeaderIdOf::<TypeConfig>::new_committed(9, 2),
         50,
     ));
-    meta.snapshot_id = "owned-peer-after-startup-proof".into();
     let mut counter = CounterFsm::new();
     counter
         .apply(7, 50, &CounterFsm::encode_add(99, 50))
@@ -550,7 +554,23 @@ async fn pending_startup_peer_snapshot_is_nonfatal_at_grpc_and_inprocess_ingress
                 .unwrap(),
             15
         );
-        let before = handle.local_group_status(7, deadline()).await.unwrap();
+        // A restarted single voter is the only candidate and, under OpenRaft
+        // 0.10.1, campaigns at a higher term right after startup; its blank
+        // entry applies after startup, so sample once it has settled.
+        let settle = Instant::now() + Duration::from_secs(5);
+        let before = loop {
+            let status = handle.local_group_status(7, deadline()).await.unwrap();
+            if status.leader_hint == Some(1)
+                && status.last_applied.map(|applied| applied.index) == status.last_log_index
+            {
+                break status;
+            }
+            assert!(
+                Instant::now() < settle,
+                "restored leader did not settle: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         let installing_peer = match &peer {
             Peer::Grpc(router) => Peer::Grpc(router.clone()),
             Peer::InProcess(router) => Peer::InProcess(router.clone()),
@@ -636,6 +656,10 @@ async fn recovering_native_group_refuses_peers_without_invoking_fatal_sm_guard()
             Arc::new(
                 openraft::Config {
                     enable_tick: false,
+                    // Since OpenRaft 0.10.1 `enable_tick` stops neither elections
+                    // (`enable_elect`) nor the restarted leader's restore campaign.
+                    enable_elect: false,
+                    enable_leader_restore: Some(false),
                     snapshot_policy: openraft::SnapshotPolicy::Never,
                     ..Default::default()
                 }

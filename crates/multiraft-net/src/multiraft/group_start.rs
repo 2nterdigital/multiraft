@@ -104,7 +104,9 @@ impl<S: StateMachine> MultiRaft<S> {
         );
         let config = Config {
             enable_elect: !quarantine,
-            enable_leader_restore: if quarantine { Some(false) } else { None },
+            // OpenRaft 0.10.1 restores a restarted leader by campaigning at a higher
+            // term; a rolling restart of many groups would depose every new leader.
+            enable_leader_restore: Some(false),
             heartbeat_interval: self.config.heartbeat_interval_ms,
             election_timeout_min: self.config.election_timeout_min_ms,
             election_timeout_max: self.config.election_timeout_max_ms,
@@ -114,12 +116,13 @@ impl<S: StateMachine> MultiRaft<S> {
             // Wipe/restart chaos and follower catch-up can present a shorter log
             // than the leader last matched; without this openraft panics.
             allow_log_reversion: Some(true),
-            api_batch_linger_ms: self.config.api_batch_linger_ms,
-            api_batch_capacity: if self.config.api_batch_capacity == 0 {
+            api_batch_linger_ms: Some(self.config.api_batch_linger_ms),
+            broadcast_commit: self.config.broadcast_commit,
+            api_batch_capacity: Some(if self.config.api_batch_capacity == 0 {
                 4096
             } else {
                 self.config.api_batch_capacity
-            },
+            }),
             max_append_entries: Some(if self.config.max_append_entries == 0 {
                 4096
             } else {
@@ -509,7 +512,7 @@ impl<S: StateMachine> MultiRaft<S> {
             let mut last_learners: Option<BTreeSet<NodeId>> = None;
             loop {
                 let membership = rx.borrow_watched().membership_config.membership().clone();
-                let learners: BTreeSet<NodeId> = membership.learner_ids().collect();
+                let learners: BTreeSet<NodeId> = membership.non_write_voter_ids().collect();
                 if last_learners.as_ref() != Some(&learners) {
                     let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
                     for &id in &learners {

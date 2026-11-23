@@ -77,7 +77,7 @@ fn symlinks_cannot_alias_pristine_native_namespaces() {
 fn fully_validated_inactive_generation_is_inert_and_never_promoted_to_active() {
     let root = tempfile::tempdir().unwrap();
     let catalog = SnapshotCatalog::new(root.path(), 1);
-    let meta = openraft::alias::SnapshotMetaOf::<multiraft_core::TypeConfig> {
+    let meta = multiraft_core::SnapshotMetaWithId {
         last_log_id: None,
         last_membership: Default::default(),
         snapshot_id: "inert".to_owned(),

@@ -524,7 +524,10 @@ async fn validation_finishing_after_deadline_cannot_publish_and_still_releases_f
     factory.gate = Some(gate.clone());
     let address = address();
     let inputs = factory.config(address, true);
-    let expires = Instant::now() + Duration::from_millis(200);
+    // The deadline must outlast startup up to the validation gate. With the
+    // whole file running in parallel that took 133-179 ms on alpha.30 and
+    // 178-200+ ms on 0.10.1 (70-82 ms alone), so 200 ms left no margin.
+    let expires = Instant::now() + Duration::from_millis(500);
     let starting = tokio::spawn(NodeOwner::start(inputs, factory.clone(), expires));
     tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
         .await

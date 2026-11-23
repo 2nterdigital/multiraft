@@ -138,6 +138,29 @@ fn lock<T>(mutex: &Mutex<T>) -> io::Result<MutexGuard<'_, T>> {
 fn encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| invalid(e.to_string()))
 }
+/// Tag byte of a bincode entry value. JSON values (legacy, and control entries) start with `{`.
+pub(crate) const ENTRY_BINCODE: u8 = 0xB1;
+fn encode_entry<T: Serialize>(entry: &T) -> io::Result<Vec<u8>> {
+    // `Request` refuses non-human-readable control entries; those stay JSON.
+    match bincode::serialize(entry) {
+        Ok(raw) => {
+            let mut value = Vec::with_capacity(raw.len() + 1);
+            value.push(ENTRY_BINCODE);
+            value.extend_from_slice(&raw);
+            Ok(value)
+        }
+        Err(_) => encode(entry),
+    }
+}
+pub(crate) fn decode_entry<T: DeserializeOwned>(value: &[u8]) -> io::Result<T> {
+    match value.first() {
+        Some(&ENTRY_BINCODE) => {
+            bincode::deserialize(&value[1..]).map_err(|e| invalid(e.to_string()))
+        }
+        Some(b'{') => decode(value),
+        _ => Err(invalid("unknown raft log entry encoding")),
+    }
+}
 fn decode<T: DeserializeOwned>(value: &[u8]) -> io::Result<T> {
     serde_json::from_slice(value).map_err(|e| invalid(e.to_string()))
 }
@@ -489,7 +512,7 @@ where
             .get(entry_key(self.group, index))
             .map_err(db_error)?
             .map(|raw| {
-                let entry: C::Entry = decode(&raw)?;
+                let entry: C::Entry = decode_entry(&raw)?;
                 if entry.log_id().index() != index {
                     return Err(invalid("entry key/log id mismatch"));
                 }
@@ -536,7 +559,7 @@ where
             if Some(index) != expected {
                 return Err(invalid("gap in retained group log"));
             }
-            let entry: C::Entry = decode(&value)?;
+            let entry: C::Entry = decode_entry(&value)?;
             if entry.log_id().index() != index {
                 return Err(invalid("entry key/log id mismatch"));
             }

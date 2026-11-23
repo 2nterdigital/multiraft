@@ -159,7 +159,7 @@ fn completion_observed(
     native_snapshot: Option<LogIdOf<TypeConfig>>,
     purged: Option<LogIdOf<TypeConfig>>,
     previous_purged: Option<LogIdOf<TypeConfig>>,
-    durable_snapshot: Option<&openraft::alias::SnapshotMetaOf<TypeConfig>>,
+    durable_snapshot: Option<&multiraft_core::SnapshotMetaWithId>,
 ) -> Option<bool> {
     let durable = durable_snapshot?;
     if durable.last_log_id < target || native_snapshot < target {
@@ -184,7 +184,7 @@ mod completion_tests {
             completion_observed(None, 1024, None, None, None, None),
             None
         );
-        let durable = openraft::alias::SnapshotMetaOf::<TypeConfig>::default();
+        let durable = multiraft_core::SnapshotMetaWithId::default();
         assert_eq!(
             completion_observed(None, 1024, None, None, None, Some(&durable)),
             Some(true)

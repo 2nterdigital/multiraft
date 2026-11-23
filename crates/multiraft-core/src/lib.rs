@@ -8,6 +8,8 @@ mod config;
 mod error;
 mod multiraft;
 mod snapshot;
+mod snapshot_meta;
+pub use snapshot_meta::SnapshotMetaWithId;
 mod startup;
 pub use startup::{
     InitializationLogId, InitializationVote, InitializeDisposition, StartupProvenance,
