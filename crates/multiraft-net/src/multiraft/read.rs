@@ -2,6 +2,8 @@
 use super::*;
 use crate::read_observation::{ReadGuard, ReadObserver, ReadOutcome, ReadStage};
 use multiraft_core::{NativeFailure, ReadIndexFailure};
+#[cfg(feature = "lab-group-version-batch")]
+use openraft::ServerState;
 use tokio::time::Instant;
 
 const READ_BOUND: Duration = Duration::from_secs(10);
@@ -46,6 +48,37 @@ pub(super) async fn confirm<S: StateMachine>(
             })
         }
         Err(_) => Err(ReadIndexFailure::Deadline.into()),
+    }
+}
+async fn confirm_with_retry<S: StateMachine>(
+    raft: &Raft<S>,
+    policy: ReadPolicy,
+    deadline: Instant,
+) -> Result<Option<openraft::alias::LogIdOf<TypeConfig>>, MultiRaftError> {
+    // One ReadIndex round waits only one heartbeat interval for a
+    // quorum; a follower that answers a little later (busy applying
+    // or syncing) is not lost authority. Retry within this caller's
+    // budget; leadership loss and terminal failures still propagate.
+    let mut policy = policy;
+    loop {
+        match confirm(raft, policy.clone(), deadline).await {
+            // No hint: this node's lease is unconfirmed or expired, so
+            // ReadIndex decides leadership. A known other leader is returned as is.
+            // Since OpenRaft 0.10.1 a leader whose lease expired answers a
+            // LeaseRead with `QuorumNotEnough` instead of an empty forward.
+            Err(
+                MultiRaftError::NotLeader { hint: None }
+                | MultiRaftError::ReadIndex(ReadIndexFailure::QuorumUnavailable { .. }),
+            ) if policy == ReadPolicy::LeaseRead => {
+                policy = ReadPolicy::ReadIndex;
+            }
+            Err(MultiRaftError::ReadIndex(ReadIndexFailure::QuorumUnavailable { .. }))
+                if Instant::now() + QUORUM_RETRY < deadline =>
+            {
+                tokio::time::sleep(QUORUM_RETRY).await;
+            }
+            result => break result,
+        }
     }
 }
 impl<S: StateMachine> MultiRaft<S> {
@@ -120,6 +153,58 @@ impl<S: StateMachine> MultiRaft<S> {
         )
         .await
     }
+    #[cfg(feature = "lab-group-version-batch")]
+    /// Use the Raft and FSM captured together at the start of this strict read.
+    pub(crate) async fn read_pinned_linearizable<R>(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+        query: impl FnOnce(&S) -> R,
+    ) -> Result<R, MultiRaftError> {
+        // Retirement signals this owner before removing its group from the registry.
+        let mut retired = self.group_owner(group).stopping();
+        let (raft, sm) = self
+            .groups
+            .lock()
+            .unwrap()
+            .get(&group)
+            .map(|app| (app.raft.clone(), app.state_machine.clone()))
+            .ok_or(MultiRaftError::UnknownGroup(group))?;
+        if *retired.borrow_and_update() {
+            return Err(ReadIndexFailure::Closed.into());
+        }
+        let read = async {
+            let read_log_id = confirm_with_retry(&raft, ReadPolicy::ReadIndex, deadline).await?;
+            let (value, applied) = sm
+                .try_with_fsm_and_applied(query)
+                .await
+                .map_err(|_| ReadIndexFailure::FsmUnavailable)?;
+            if Instant::now() >= deadline {
+                return Err(ReadIndexFailure::Deadline.into());
+            }
+            let metrics = raft.metrics();
+            let metrics = metrics.borrow_watched();
+            if *retired.borrow() || metrics.state == ServerState::Shutdown {
+                return Err(ReadIndexFailure::Closed.into());
+            }
+            if let Err(error) = &metrics.running_state {
+                return Err(native_failure(error.clone()).into());
+            }
+            match applied {
+                Some(applied) if read_log_id.is_none_or(|read| applied >= read) => Ok(value),
+                _ => Err(ReadIndexFailure::FsmUnavailable.into()),
+            }
+        };
+        // Use a separate subscription so the read can check retirement after
+        // returning from the synchronous callback, even if both branches became ready.
+        let mut stopping = retired.clone();
+        tokio::select! {
+            biased;
+            _ = stopping.changed() => Err(ReadIndexFailure::Closed.into()),
+            result = read => result,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn read_observed_view<R>(
         &self,
@@ -146,31 +231,7 @@ impl<S: StateMachine> MultiRaft<S> {
             let raft = self
                 .raft(group)
                 .ok_or(MultiRaftError::UnknownGroup(group))?;
-            // One ReadIndex round waits only one heartbeat interval for a
-            // quorum; a follower that answers a little later (busy applying
-            // or syncing) is not lost authority. Retry within this caller's
-            // budget; leadership loss and terminal failures still propagate.
-            let mut policy = policy;
-            loop {
-                match confirm(&raft, policy.clone(), deadline).await {
-                    // No hint: this node's lease is unconfirmed or expired, so
-                    // ReadIndex decides leadership. A known other leader is returned as is.
-                    // Since OpenRaft 0.10.1 a leader whose lease expired answers a
-                    // LeaseRead with `QuorumNotEnough` instead of an empty forward.
-                    Err(
-                        MultiRaftError::NotLeader { hint: None }
-                        | MultiRaftError::ReadIndex(ReadIndexFailure::QuorumUnavailable { .. }),
-                    ) if policy == ReadPolicy::LeaseRead => {
-                        policy = ReadPolicy::ReadIndex;
-                    }
-                    Err(MultiRaftError::ReadIndex(ReadIndexFailure::QuorumUnavailable {
-                        ..
-                    })) if Instant::now() + QUORUM_RETRY < deadline => {
-                        tokio::time::sleep(QUORUM_RETRY).await;
-                    }
-                    result => break result,
-                }
-            }
+            confirm_with_retry(&raft, policy, deadline).await
         }
         .await;
         stage.finish_source(&result);

@@ -31,6 +31,31 @@ impl<S: StateMachine> RuntimeHandle<S> {
         })
         .await
     }
+    #[cfg(feature = "lab-group-version-batch")]
+    /// Lab-only strict read that pins the native Raft and FSM instance together.
+    /// The single synchronous callback must be bounded and nonblocking.
+    #[doc(hidden)]
+    pub async fn read_pinned_linearizable<R>(
+        &self,
+        group: GroupId,
+        deadline: Instant,
+        query: impl FnOnce(&S) -> R,
+    ) -> Result<R, RuntimeError> {
+        let admitted = self.admit(deadline).await?;
+        admitted.ensure_group(group)?;
+        admitted
+            .run(
+                deadline,
+                RuntimePhase::Read,
+                false,
+                admitted
+                    .shared
+                    .node
+                    .read_pinned_linearizable(group, deadline, query),
+            )
+            .await
+    }
+
     /// Leader lease read then this invocation's local FSM query, returning the
     /// value with the applied log id sampled under the same FSM lock. A valid
     /// lease skips the quorum round; an unconfirmed or expired lease falls back
