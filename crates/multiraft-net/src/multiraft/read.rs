@@ -224,16 +224,13 @@ impl<S: StateMachine> MultiRaft<S> {
             observer,
             closed.clone(),
         );
-        let result = async {
-            if Instant::now() >= deadline {
-                return Err(ReadIndexFailure::Deadline.into());
-            }
-            let raft = self
-                .raft(group)
-                .ok_or(MultiRaftError::UnknownGroup(group))?;
+        let result = if Instant::now() >= deadline {
+            Err(ReadIndexFailure::Deadline.into())
+        } else if let Some(raft) = self.raft(group) {
             confirm_with_retry(&raft, policy, deadline).await
-        }
-        .await;
+        } else {
+            Err(MultiRaftError::UnknownGroup(group))
+        };
         stage.finish_source(&result);
         let read_log_id = result?;
         let mut stage = ReadGuard::new(
