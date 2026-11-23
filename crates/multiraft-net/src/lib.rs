@@ -22,6 +22,9 @@ mod fsm_factory;
 mod group_control;
 mod group_observation;
 mod grpc;
+#[cfg(feature = "lab-group-version-batch")]
+#[doc(hidden)]
+pub mod lab_read_batch_metrics;
 mod leader_hint;
 mod multiraft;
 mod network;

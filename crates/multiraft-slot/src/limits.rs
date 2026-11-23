@@ -74,6 +74,8 @@ impl Budget {
             || bytes > self.limits.per_slot_bytes.saturating_sub(local.bytes)
             || bytes > self.limits.global_bytes.saturating_sub(state.global.bytes)
         {
+            #[cfg(feature = "lab-group-version-batch")]
+            multiraft_net::lab_read_batch_metrics::record_slot_busy();
             return Err(RuntimeError::Busy);
         }
         state.global.requests += 1;

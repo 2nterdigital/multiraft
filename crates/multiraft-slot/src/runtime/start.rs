@@ -182,6 +182,8 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         if Instant::now() >= deadline {
             return Err(RuntimeError::Deadline);
         }
+        #[cfg(feature = "lab-group-version-batch")]
+        let lab_batch_window = super::group_version_batch::configured_window()?;
         let layout = if let Some(startup) = &strict {
             crate::strict_manifest::prepare(
                 &config.data_dir,
@@ -368,6 +370,11 @@ impl<S: SlotStateMachine> SlotNodeOwner<S> {
         let shared = Arc::new(Shared {
             native: native_owner.handle(),
             budget: Budget::new(config.limits, layout.slot_count()),
+            #[cfg(feature = "lab-group-version-batch")]
+            lab_group_version_reads: super::group_version_batch::BatchReads::new(
+                layout.slot_count(),
+                lab_batch_window,
+            ),
             layout: layout.clone(),
             transport_digest,
             node_id: config.node_id,

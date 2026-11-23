@@ -6,6 +6,8 @@ mod carriers;
 pub use carriers::{SlotCarrierComponents, SlotCarrierError};
 mod control;
 mod controlled_start;
+#[cfg(feature = "lab-group-version-batch")]
+mod group_version_batch;
 mod leadership_control;
 mod roles;
 pub use control::{
@@ -44,6 +46,13 @@ use tokio::{
 /// Application-owned query semantics. Callbacks must be bounded and nonblocking.
 /// Applications validate that command/query payload identity agrees with the routing key.
 pub trait SlotStateMachine: StateMachine {
+    #[cfg(feature = "lab-group-version-batch")]
+    /// Identify the application query allowed on the dedicated Lab GroupVersion read wire operation.
+    #[doc(hidden)]
+    fn is_lab_group_version_query(_query: &[u8]) -> bool {
+        false
+    }
+
     fn query(&self, group: u64, request: &[u8]) -> Result<Vec<u8>, Self::Error>;
 }
 
@@ -104,6 +113,8 @@ pub(crate) struct Shared<S: SlotStateMachine> {
     transport_addresses: Option<crate::SlotTransportAddresses>,
     cleaning: AtomicBool,
     pub(crate) budget: Arc<Budget>,
+    #[cfg(feature = "lab-group-version-batch")]
+    lab_group_version_reads: group_version_batch::BatchReads,
     tasks: Mutex<JoinSet<()>>,
     done: watch::Sender<Option<ShutdownReport>>,
     unknown: AtomicU64,
@@ -181,6 +192,8 @@ impl<S: SlotStateMachine> Shared<S> {
             // Same lock as registration: after fencing, shutdown cannot miss a child.
             let _tasks = self.tasks.lock().unwrap();
             self.accepting.store(false, Ordering::Release);
+            #[cfg(feature = "lab-group-version-batch")]
+            self.lab_group_version_reads.close();
             if self.cleaning.swap(true, Ordering::AcqRel) {
                 return;
             }

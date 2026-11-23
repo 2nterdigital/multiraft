@@ -3,6 +3,9 @@ name = "multiraft-net"
 version.workspace = true
 edition.workspace = true
 
+[features]
+lab-group-version-batch = []
+
 [dependencies]
 anyhow = { workspace = true }
 futures = { workspace = true }

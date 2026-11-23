@@ -68,6 +68,8 @@ enum Operation {
     // Read / ReadWithApplied values.
     LeasedRead(Vec<u8>),
     LeasedReadWithApplied(Vec<u8>),
+    #[cfg(feature = "lab-group-version-batch")]
+    LabGroupVersionRead(Vec<u8>),
 }
 #[derive(Serialize, Deserialize)]
 struct Reply {
@@ -197,6 +199,19 @@ impl<S: SlotStateMachine> ApplicationRpcHandler for Handler<S> {
                         if query.len() > MAX_QUERY_BYTES =>
                     {
                         Err(RuntimeError::PayloadTooLarge)
+                    }
+                    #[cfg(feature = "lab-group-version-batch")]
+                    Operation::LabGroupVersionRead(query) => {
+                        if query.len() > MAX_QUERY_BYTES {
+                            return Err(RuntimeError::PayloadTooLarge);
+                        }
+                        let guard = shared
+                            .budget
+                            .acquire(slot, request.key.len() + query.len() + MAX_EFFECTS_BYTES)?;
+                        shared
+                            .execute_lab_group_version_read(slot, query, guard, context.deadline)
+                            .await
+                            .map(Value::Read)
                     }
                     Operation::Read(query) => shared
                         .local_query(
@@ -394,6 +409,40 @@ pub(crate) async fn route_read<S: SlotStateMachine>(
         _ => Err(RuntimeError::Unavailable),
     }
 }
+#[cfg(feature = "lab-group-version-batch")]
+pub(crate) async fn route_lab_group_version_read<S: SlotStateMachine>(
+    shared: &Arc<Shared<S>>,
+    slot: SlotId,
+    key: Vec<u8>,
+    query: Vec<u8>,
+    deadline: Instant,
+) -> Result<Vec<u8>, RuntimeError> {
+    shared.check(deadline)?;
+    let guard = shared
+        .budget
+        .acquire(slot, key.len() + query.len() + MAX_EFFECTS_BYTES)?;
+    let target = destination(shared, slot, &key, deadline).await?;
+    if target == shared.node_id {
+        return shared
+            .execute_lab_group_version_read(slot, query, guard, deadline)
+            .await;
+    }
+    let response = remote(
+        shared,
+        target,
+        slot,
+        key,
+        Operation::LabGroupVersionRead(query),
+        deadline,
+        false,
+    )
+    .await;
+    drop(guard);
+    match response? {
+        Value::Read(value) if value.len() <= MAX_EFFECTS_BYTES => Ok(value),
+        _ => Err(RuntimeError::Unavailable),
+    }
+}
 pub(crate) async fn route_read_with_applied<S: SlotStateMachine>(
     shared: &Arc<Shared<S>>,
     slot: SlotId,
@@ -506,4 +555,49 @@ async fn remote<S: SlotStateMachine>(
         });
     }
     reply.result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_operation_tags_keep_their_wire_encoding() {
+        let operations = [
+            (Operation::Hint, None),
+            (Operation::SlotHint, None),
+            (Operation::Write(vec![42]), Some(42)),
+            (Operation::Read(vec![42]), Some(42)),
+            (Operation::ReadWithApplied(vec![42]), Some(42)),
+            (Operation::LeasedRead(vec![42]), Some(42)),
+            (Operation::LeasedReadWithApplied(vec![42]), Some(42)),
+        ];
+        for (tag, (operation, payload)) in operations.into_iter().enumerate() {
+            let mut wire = (tag as u32).to_le_bytes().to_vec();
+            if let Some(byte) = payload {
+                wire.extend(1_u64.to_le_bytes());
+                wire.push(byte);
+            }
+            assert_eq!(encode(&operation).unwrap(), wire);
+            assert_eq!(encode(&decode::<Operation>(&wire).unwrap()).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn lab_operation_requires_the_feature() {
+        let mut wire = 7_u32.to_le_bytes().to_vec();
+        wire.extend(1_u64.to_le_bytes());
+        wire.push(42);
+
+        #[cfg(feature = "lab-group-version-batch")]
+        assert!(matches!(
+            decode::<Operation>(&wire),
+            Ok(Operation::LabGroupVersionRead(query)) if query == [42]
+        ));
+        #[cfg(not(feature = "lab-group-version-batch"))]
+        assert!(matches!(
+            decode::<Operation>(&wire),
+            Err(RuntimeError::InvalidRequest)
+        ));
+    }
 }

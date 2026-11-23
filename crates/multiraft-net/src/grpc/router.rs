@@ -329,6 +329,8 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
         };
         // The wire keeps the alpha.30 `AppendEntriesResponse`, which has no
         // conflict hint; the leader rebuilds its `AppendResult` from the request.
+        #[cfg(feature = "lab-group-version-batch")]
+        crate::lab_read_batch_metrics::record_append(rpc.entries.is_empty());
         let (prev_log_id, last_log_id) = (rpc.prev_log_id, rpc.last_log_id());
         self.transport
             .send::<_, AppendEntriesResponse<TypeConfig>>(target, group_id, path, rpc, None)
