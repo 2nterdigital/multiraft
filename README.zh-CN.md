@@ -49,8 +49,8 @@ multiraft-demo → multiraft-net (MultiRaft + 共享 gRPC)
 
 | Crate | 版本 |
 |-------|------|
-| `openraft` | `=0.10.0-alpha.30` |
-| `openraft-multi` | `=0.10.0-alpha.30` |
+| `openraft` | `=0.10.1` |
+| `openraft-multi` | `=0.10.1` |
 
 见 [docs/upstream.zh-CN.md](docs/upstream.zh-CN.md) · [English](docs/upstream.md)。
 

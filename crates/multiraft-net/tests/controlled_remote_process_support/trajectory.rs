@@ -311,7 +311,7 @@ pub async fn run() {
         membership.membership().get_joint_config(),
         &vec![spec.target_voters.clone()]
     );
-    assert_eq!(membership.membership().learner_ids().count(), 0);
+    assert_eq!(membership.membership().non_write_voter_ids().count(), 0);
     sources.authority.lose_next_handoff_reply();
     let terminal = group
         .complete_with_port(&executor, &port, deadline())

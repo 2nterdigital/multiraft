@@ -214,7 +214,7 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
     };
 
     let res = match req.path.as_str() {
-        "/raft/append" => api::append(&raft, &req.payload).await,
+        "/raft/append" => api::append(&raft, &req.payload).await?,
         super::controlled_append::PATH => {
             super::controlled_append::receive(&raft, &req.payload).await?
         }
@@ -236,8 +236,8 @@ pub(crate) async fn demux_raft_call<S: StateMachine>(
             })?;
             api::snapshot_chunk(&state_machine, &req.payload).await?
         }
-        "/raft/vote" => api::vote(&raft, &req.payload).await,
-        "/raft/transfer_leader" => api::transfer_leader(&raft, &req.payload).await,
+        "/raft/vote" => api::vote(&raft, &req.payload).await?,
+        "/raft/transfer_leader" => api::transfer_leader(&raft, &req.payload).await?,
         _ => {
             tracing::warn!("unknown grpc path: {}", req.path);
             encode::<Result<(), typ::RaftError>>(Err(typ::RaftError::Fatal(

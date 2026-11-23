@@ -134,7 +134,11 @@ pub(super) async fn reconcile<S: StateMachine>(
         if let Some(config_log) = *membership.log_id() {
             if configs.len() != 1
                 || configs[0] != *voters
-                || membership.membership().learner_ids().next().is_some()
+                || membership
+                    .membership()
+                    .non_write_voter_ids()
+                    .next()
+                    .is_some()
                 || members
                     .iter()
                     .any(|(id, node)| membership.membership().get_node(id) != Some(node))
@@ -354,7 +358,11 @@ impl<S: StateMachine> ControlledGroup<S> {
                     || anchor.intent != intent(&node, &request, &voters)
                     || configs.len() != 1
                     || configs[0] != voters
-                    || configuration.membership().learner_ids().next().is_some()
+                    || configuration
+                        .membership()
+                        .non_write_voter_ids()
+                        .next()
+                        .is_some()
                     || configuration.membership().nodes().count() != 3
                     || anchor.intent.members.iter().any(|(id, metadata)| {
                         configuration.membership().get_node(id) != Some(metadata)

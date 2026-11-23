@@ -317,7 +317,6 @@ async fn install_crash_writer() {
     let meta = openraft::alias::SnapshotMetaOf::<multiraft_core::TypeConfig> {
         last_log_id,
         last_membership,
-        snapshot_id: "received-committed-suffix".into(),
     };
     tracing::subscriber::set_global_default(crash_support::kill_at(
         "multiraft::native_install",

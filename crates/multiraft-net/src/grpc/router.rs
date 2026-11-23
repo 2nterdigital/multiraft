@@ -7,8 +7,8 @@ use openraft::alias::SnapshotOf;
 use openraft::error::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::{Backoff, RPCOption};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderRequest,
-    TransferLeaderResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, AppendResult, SnapshotResponse,
+    TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
 };
 use openraft::OptionalSend;
 use openraft_multi::GroupRouter;
@@ -319,7 +319,7 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
         group_id: GroupId,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
+    ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
         let controlled = self.controlled_groups.read().expect("controlled transport lock poisoned").contains(&group_id)
             || rpc.entries.iter().any(|entry| matches!(&entry.payload, openraft::EntryPayload::Normal(request) if request.control.is_some()));
         let path = if controlled {
@@ -327,9 +327,13 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
         } else {
             "/raft/append"
         };
+        // The wire keeps the alpha.30 `AppendEntriesResponse`, which has no
+        // conflict hint; the leader rebuilds its `AppendResult` from the request.
+        let (prev_log_id, last_log_id) = (rpc.prev_log_id, rpc.last_log_id());
         self.transport
-            .send(target, group_id, path, rpc, None)
+            .send::<_, AppendEntriesResponse<TypeConfig>>(target, group_id, path, rpc, None)
             .await
+            .map(|response| response.into_append_result(prev_log_id, last_log_id))
             .map_err(RPCError::Unreachable)
     }
     async fn vote(
@@ -343,6 +347,16 @@ impl GroupRouter<TypeConfig, GroupId> for GrpcRouter {
             .send(target, group_id, "/raft/vote", rpc, None)
             .await
             .map_err(RPCError::Unreachable)
+    }
+    /// Same local grant as [`crate::router::Router`]'s `pre_vote`: no route exists for it.
+    async fn pre_vote(
+        &self,
+        _target: NodeId,
+        _group_id: GroupId,
+        rpc: VoteRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
+        Ok(VoteResponse::new(rpc.vote, None, true))
     }
     async fn full_snapshot(
         &self,

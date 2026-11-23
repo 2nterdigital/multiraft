@@ -411,7 +411,7 @@ async fn controlled_checkpoint_inspection_reads_the_published_database_not_live_
     descriptor.source = root.path().join("live");
     assert!(
         store
-            .inspect_controlled_checkpoint(&descriptor.meta, &descriptor.encode().unwrap())
+            .inspect_controlled_checkpoint(&descriptor.meta.meta(), &descriptor.encode().unwrap())
             .await
             .is_err(),
         "caller-controlled path cannot substitute the live database"

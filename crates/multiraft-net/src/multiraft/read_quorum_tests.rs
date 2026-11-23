@@ -171,10 +171,14 @@ async fn expired_lease_falls_back_to_read_index() {
     tokio::time::sleep(Duration::from_millis(900)).await;
     let raft = leader.raft(group).unwrap();
     match raft.ensure_linearizable(ReadPolicy::LeaseRead).await {
+        // OpenRaft 0.10.1: an expired lease on the leader is `QuorumNotEnough`.
         Err(error) => assert!(
-            error
-                .forward_to_leader()
-                .is_some_and(|f| f.leader_id.is_none()),
+            matches!(
+                error,
+                openraft::error::RaftError::APIError(
+                    openraft::error::LinearizableReadError::QuorumNotEnough(_)
+                )
+            ),
             "lease must be expired: {error:?}"
         ),
         Ok(read) => panic!("lease unexpectedly valid at {read:?}"),

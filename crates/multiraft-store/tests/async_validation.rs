@@ -335,14 +335,15 @@ async fn repeated_rejected_installs_preserve_old_durable_provider_without_staged
         ]))
         .await
         .unwrap();
-    let old = initial
+    initial
         .try_create_snapshot_builder(false)
         .await
         .unwrap()
         .build_snapshot()
         .await
-        .unwrap()
-        .meta;
+        .unwrap();
+    // The durable provider's metadata, including its snapshot id.
+    let old = initial.native_snapshot_info().await.unwrap().unwrap().meta;
     drop(initial);
     for _ in 0..4 {
         let leases = scratch();
@@ -639,21 +640,24 @@ async fn rejecting_readiness_preserves_native_and_legacy_authority_and_applied_s
                 std::fs::read(disk.path().join("7/native-v1/active.json")).unwrap(),
                 authority.unwrap()
             );
-            assert_eq!(
-                store.native_snapshot_info().await.unwrap().unwrap().meta,
-                old_meta
-            );
+            let durable = store.native_snapshot_info().await.unwrap().unwrap().meta;
+            assert!(durable.matches(&old_meta));
             let restored = catalog.load_native(7, 1024).unwrap().unwrap();
-            assert_eq!(restored.meta, old_meta);
+            assert_eq!(restored.meta, durable);
             assert_eq!(restored.data, old_bytes);
             assert_eq!(generation_dirs(disk.path()), 1);
         } else {
+            // A peer install is catalogued under its cut: OpenRaft no longer
+            // hands the sender's snapshot id to the state machine.
+            let (index, term) = old_meta
+                .last_log_id
+                .map(|id| (id.index, id.leader_id.term))
+                .unwrap();
+            let entry = catalog.latest(7).unwrap().unwrap();
+            assert_eq!(entry.snapshot_id, format!("{index}-{term}"));
+            assert_eq!((entry.last_index, entry.last_term), (index, term));
             assert_eq!(
-                catalog.latest(7).unwrap().unwrap().snapshot_id,
-                old_meta.snapshot_id
-            );
-            assert_eq!(
-                catalog.read(7, &old_meta.snapshot_id).unwrap().unwrap(),
+                catalog.read(7, &entry.snapshot_id).unwrap().unwrap(),
                 old_bytes
             );
         }

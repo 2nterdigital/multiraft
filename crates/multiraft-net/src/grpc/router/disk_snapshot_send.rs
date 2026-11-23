@@ -27,13 +27,14 @@ pub(super) async fn stream(
     abandoned: impl Fn() -> bool,
 ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
     let manifest = snapshot.snapshot.into_inner();
-    let meta = snapshot.meta;
     let leased = manifest.clone();
     let mut source = tokio::task::spawn_blocking(move || ChunkSource::open(leased, group_id))
         .await
         .map_err(|error| unreachable(format!("disk snapshot lease task: {error}")))?
         .map_err(|error| unreachable(format!("disk snapshot source unavailable: {error}")))?;
     let (total, files) = (source.total_bytes(), source.file_count());
+    // Alpha.30 receivers require exactly the manifest's metadata, id included.
+    let meta = source.meta().clone();
     let started = Instant::now();
     tracing::info!(target: "multiraft::transport", peer = target, group_id,
         snapshot_id = %meta.snapshot_id, snapshot_bytes = total, files,

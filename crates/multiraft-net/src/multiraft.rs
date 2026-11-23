@@ -601,7 +601,11 @@ impl<S: StateMachine> MultiRaft<S> {
     }
 }
 
-/// Wait until any handle reports a leader for `group` (test helper).
+/// Wait until a handle leads `group` and a quorum holds a log of its term
+/// (test helper). Under OpenRaft 0.10.1 a leader killed right after election
+/// left a fresh group's survivors holding its committed vote but no membership
+/// log, so they could never elect; leadership counts only once its own-term
+/// blank log is committed.
 pub async fn wait_for_leader(
     nodes: &[MultiRaft],
     group: GroupId,
@@ -610,10 +614,14 @@ pub async fn wait_for_leader(
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         for n in nodes {
-            if let Some(leader) = n.leader(group) {
-                if nodes.iter().any(|x| x.is_leader(group)) {
-                    return Some(leader);
-                }
+            let Some(raft) = n.raft(group) else { continue };
+            let m = raft.metrics().borrow_watched().clone();
+            if m.state == openraft::ServerState::Leader
+                && m.cluster_committed
+                    .as_ref()
+                    .is_some_and(|c| c.committed_leader_id().term == m.current_term)
+            {
+                return Some(m.id);
             }
         }
         TypeConfig::sleep(Duration::from_millis(50)).await;
@@ -630,8 +638,29 @@ fn transient_membership_err(label: &str, e: &impl std::fmt::Display) -> MultiRaf
     ))
 }
 
+/// Membership refusals that clear once the leader settles and write no log:
+/// a change still in progress, and since OpenRaft 0.10.1 a new leader that has
+/// not committed its own-term blank log (`UncommittedLeaderLog`) or has no
+/// quorum-acked lease yet (`ForwardReason::LeaseExpired`, until its first
+/// replication round is acknowledged). The retry is bounded by
+/// `MEMBERSHIP_RETRY_TIMEOUT`; a leader cut off from its quorum stays refused.
+fn membership_pending(
+    e: &multiraft_core::typ::RaftError<multiraft_core::typ::ClientWriteError>,
+) -> bool {
+    use openraft::error::{ChangeMembershipError, ClientWriteError, ForwardReason};
+    match e.api_error() {
+        Some(ClientWriteError::ChangeMembershipError(
+            ChangeMembershipError::InProgress(_) | ChangeMembershipError::UncommittedLeaderLog(_),
+        )) => true,
+        Some(ClientWriteError::ForwardToLeader(forward)) => {
+            forward.reason == ForwardReason::LeaseExpired
+        }
+        _ => false,
+    }
+}
+
 fn membership_err_retryable(err: &MultiRaftError) -> bool {
-    matches!(err, MultiRaftError::Other(e) if e.to_string().contains("configuration change"))
+    matches!(err, MultiRaftError::Other(e) if e.to_string().ends_with("(retry after membership settles)"))
 }
 
 async fn retry_on_membership_pending<F, Fut>(mut op: F) -> Result<(), MultiRaftError>

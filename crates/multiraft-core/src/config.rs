@@ -165,6 +165,10 @@ pub struct ClusterConfig {
     /// openraft `max_payload_entries`: max log entries per **network** AppendEntries RPC
     /// (`0` = library default 300). Raise (e.g. 4096) for sync=1 replication group-commit.
     pub max_payload_entries: u64,
+    /// openraft `broadcast_commit` (default `true`, the library default): send a commit-index
+    /// advance as its own entry-less AppendEntries. `false` lets the next data append or
+    /// heartbeat carry it instead.
+    pub broadcast_commit: bool,
 }
 
 impl ClusterConfig {
@@ -260,6 +264,7 @@ impl ClusterConfig {
             api_batch_capacity: 0,
             max_append_entries: 0,
             max_payload_entries: 0,
+            broadcast_commit: true,
         }
     }
     /// Enable local stale queries (typically called after setting [`Self::role`]

@@ -12,7 +12,7 @@ use openraft::error::StreamingError;
 use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::raft::AppendEntriesRequest;
-use openraft::raft::AppendEntriesResponse;
+use openraft::raft::AppendResult;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::raft::TransferLeaderResponse;
@@ -48,7 +48,7 @@ impl RaftNetworkV2<TypeConfig> for StubNetwork {
         &mut self,
         _rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
+    ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
         Err(unreachable())
     }
 

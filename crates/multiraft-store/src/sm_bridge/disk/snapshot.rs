@@ -33,7 +33,6 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
         let meta = SnapshotMetaOf::<TypeConfig> {
             last_log_id: self.last_applied_log,
             last_membership: self.last_membership.clone(),
-            snapshot_id: String::new(),
         };
         tracing::info!(group_id = self.group_id, last_log_index = ?meta.last_log_id.map(|id| id.index),
             checkpoint_us = started.elapsed().as_micros() as u64, "disk snapshot checkpoint");
@@ -43,7 +42,7 @@ impl<S: StateMachine> StateMachineStoreInner<S> {
 
 fn published_snapshot(published: crate::disk_snapshot::Published) -> DiskSnapshot {
     DiskSnapshot {
-        meta: published.manifest.meta,
+        meta: published.manifest.meta.into_meta(),
         snapshot: Cursor::new(published.bytes),
     }
 }
@@ -109,7 +108,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         }
         let workspace = self.disk_workspace().await?;
         let group = self.group_id;
-        let meta = captured.meta.clone();
+        let meta = captured.meta.meta();
         // The transition, permits and completion survive waiter cancellation;
         // quiescence cannot pass until publication's filesystem IO has finished.
         let published = tokio::task::spawn_blocking(move || {

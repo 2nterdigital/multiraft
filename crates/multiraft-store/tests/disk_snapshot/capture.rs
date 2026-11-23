@@ -176,7 +176,10 @@ async fn checkpoint_fences_same_group_and_keeps_exact_applied_membership_cut() {
     let manifest = snapshot.snapshot.into_inner();
     transfer(&receiver, manifest.clone(), None).await.unwrap();
     receiver
-        .verify_disk_snapshot(&snapshot.meta, &manifest)
+        .verify_disk_snapshot(
+            &wire_snapshot_meta(GROUP, &snapshot.meta, &manifest).unwrap(),
+            &manifest,
+        )
         .await
         .unwrap();
     let _install = INSTALLS.lock().await;

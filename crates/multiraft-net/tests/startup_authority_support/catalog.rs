@@ -69,7 +69,11 @@ impl FileAuthority {
             || configs.len() != 1
             || configs[0] != voters
             || configs[0].len() != 3
-            || membership.membership().learner_ids().next().is_some()
+            || membership
+                .membership()
+                .non_write_voter_ids()
+                .next()
+                .is_some()
         {
             return Err(error(
                 "bootstrap provisioning identity is unavailable or already finalized",
@@ -252,7 +256,7 @@ impl StartupAuthority for FileAuthority {
                     || catalog
                         .membership
                         .membership()
-                        .learner_ids()
+                        .non_write_voter_ids()
                         .next()
                         .is_some()
                     || old.len() != 1
@@ -331,7 +335,11 @@ impl StartupAuthority for FileAuthority {
                     || proof.applied_membership != *membership
                     || !valid_log
                     || configs != &vec![binding.specification.target_voters.clone()]
-                    || membership.membership().learner_ids().next().is_some()
+                    || membership
+                        .membership()
+                        .non_write_voter_ids()
+                        .next()
+                        .is_some()
                     || proof.target_opened != binding.target
                 {
                     return rejected(StartupAuthorityRejection::InvalidProof);

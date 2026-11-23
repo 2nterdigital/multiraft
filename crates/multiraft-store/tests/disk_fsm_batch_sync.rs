@@ -279,7 +279,7 @@ async fn failed_entry_syncs_and_answers_the_entries_before_it() {
     // One message to the core: entries 2..=5 are committed and applied as one batch.
     let bad = Request::new(b"bad".to_vec());
     let results: Vec<_> = raft
-        .client_write_many([add(5), add(7), bad, add(9)])
+        .client_write_many([add(5), add(7), bad, add(9)], Default::default())
         .await
         .unwrap()
         .collect()

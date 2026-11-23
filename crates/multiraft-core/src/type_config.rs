@@ -174,8 +174,6 @@ pub mod typ {
     pub type VoteResponse = openraft::raft::VoteResponse<TypeConfig>;
     pub type AppendEntriesRequest = openraft::raft::AppendEntriesRequest<TypeConfig>;
     pub type AppendEntriesResponse = openraft::raft::AppendEntriesResponse<TypeConfig>;
-    pub type InstallSnapshotRequest = openraft::raft::InstallSnapshotRequest<TypeConfig>;
-    pub type InstallSnapshotResponse = openraft::raft::InstallSnapshotResponse<TypeConfig>;
     pub type SnapshotResponse = openraft::raft::SnapshotResponse<TypeConfig>;
     pub type ClientWriteResponse = openraft::raft::ClientWriteResponse<TypeConfig>;
     pub type StreamAppendResult = openraft::raft::StreamAppendResult<TypeConfig>;

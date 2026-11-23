@@ -22,7 +22,7 @@ pub(in crate::sm_bridge) struct NativeRuntime {
 }
 
 pub(in crate::sm_bridge) struct Capture {
-    pub(in crate::sm_bridge) meta: SnapshotMetaOf<TypeConfig>,
+    pub(in crate::sm_bridge) meta: SnapshotMetaWithId,
     data: Vec<u8>,
     _permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
     already_durable: bool,
@@ -40,7 +40,8 @@ impl Capture {
         permits: BuildPermits,
     ) -> Self {
         Self {
-            meta,
+            // The disk manifest gets its `disk-v1-` id when it is published.
+            meta: SnapshotMetaWithId::new(meta, String::new()),
             data: Vec::new(),
             _permits: Some(permits),
             already_durable: false,
@@ -223,7 +224,8 @@ impl<S: StateMachine> StateMachineStore<S> {
                         && snapshot.meta.last_membership == inner.last_membership
                     {
                         captured = Ok(Capture {
-                            meta: snapshot.meta,
+                            // Already durable: never published again, so its id is unused.
+                            meta: SnapshotMetaWithId::new(snapshot.meta, String::new()),
                             data: snapshot.snapshot.into_inner(),
                             _permits: None,
                             already_durable: true,
@@ -304,7 +306,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         if data.len() > native.options.max_snapshot_bytes {
             return Err(NativeCaptureError::Refused(CaptureRefusal::SizeLimit));
         }
-        let meta = SnapshotMetaOf::<TypeConfig> {
+        let meta = SnapshotMetaWithId {
             last_log_id: inner.last_applied_log,
             last_membership: inner.last_membership.clone(),
             snapshot_id: match inner.last_applied_log {
@@ -376,7 +378,7 @@ impl<S: StateMachine> StateMachineStore<S> {
         .map_err(io::Error::other)?
         .map(|snapshot| {
             snapshot.map(|snapshot| SnapshotOf::<TypeConfig, Cursor<Vec<u8>>> {
-                meta: snapshot.meta,
+                meta: snapshot.meta.into_meta(),
                 snapshot: Cursor::new(snapshot.data),
             })
         })
@@ -407,7 +409,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
                 let _ = sender.send(());
             }
             return Ok(SnapshotOf::<TypeConfig, Self::SnapshotData> {
-                meta: captured.meta,
+                meta: captured.meta.into_meta(),
                 snapshot: Cursor::new(captured.data),
             });
         }
@@ -468,7 +470,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder<S> {
         .await
         .map_err(io::Error::other)??;
         Ok(SnapshotOf::<TypeConfig, Self::SnapshotData> {
-            meta: captured.meta,
+            meta: captured.meta.into_meta(),
             snapshot: Cursor::new(captured.data),
         })
     }

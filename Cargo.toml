@@ -16,8 +16,8 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-openraft = { git = "https://github.com/2nterdigital/openraft.git", rev = "8f0b2b48f60f75915b2d4ce0f152de7dd81b20ce", version = "=0.10.0-alpha.30", default-features = false, features = ["serde", "type-alias", "tokio-rt"] }
-openraft-multi = { git = "https://github.com/2nterdigital/openraft.git", rev = "8f0b2b48f60f75915b2d4ce0f152de7dd81b20ce", version = "=0.10.0-alpha.30" }
+openraft = { git = "https://github.com/2nterdigital/openraft.git", rev = "b5f3dc1a4df74891d4a8236b9b35af90158dbb52", version = "=0.10.1", default-features = false, features = ["serde", "type-alias", "tokio-rt"] }
+openraft-multi = { git = "https://github.com/2nterdigital/openraft.git", rev = "b5f3dc1a4df74891d4a8236b9b35af90158dbb52", version = "=0.10.1" }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 serde = { version = "1", features = ["derive"] }

@@ -5,9 +5,8 @@ use crate::durability::sync_dir;
 pub(super) use lifecycle::shared_registry;
 pub(super) use lifecycle::NativeStageRegistry;
 use lifecycle::TemporaryGeneration;
-use multiraft_core::TypeConfig;
+use multiraft_core::SnapshotMetaWithId;
 use multiraft_fsm::GroupId;
-use openraft::alias::SnapshotMetaOf;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read};
@@ -23,14 +22,14 @@ static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct NativeSnapshot {
-    pub meta: SnapshotMetaOf<TypeConfig>,
+    pub meta: SnapshotMetaWithId,
     pub data: Vec<u8>,
 }
 
 /// Validated persistent facts without materializing the application image.
 #[derive(Debug, Clone)]
 pub struct NativeSnapshotInfo {
-    pub meta: SnapshotMetaOf<TypeConfig>,
+    pub meta: SnapshotMetaWithId,
     pub size: u64,
 }
 
@@ -39,7 +38,7 @@ pub struct NativeSnapshotInfo {
 struct NativeMeta {
     version: u32,
     group: GroupId,
-    meta: SnapshotMetaOf<TypeConfig>,
+    meta: SnapshotMetaWithId,
     size: usize,
     data_sha256: String,
 }
@@ -60,7 +59,7 @@ pub struct NativeSnapshotStage {
     group: GroupId,
     root: PathBuf,
     active: Active,
-    meta: SnapshotMetaOf<TypeConfig>,
+    meta: SnapshotMetaWithId,
     max_bytes: usize,
     lifecycle: Arc<Mutex<NativeStageRegistry>>,
     released: bool,
@@ -97,7 +96,7 @@ fn bounded_read(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn validate_meta(meta: &SnapshotMetaOf<TypeConfig>) -> io::Result<()> {
+fn validate_meta(meta: &SnapshotMetaWithId) -> io::Result<()> {
     if meta.snapshot_id.is_empty() || meta.snapshot_id.len() > 4096 {
         return Err(invalid("invalid snapshot identity"));
     }
@@ -404,7 +403,7 @@ impl SnapshotCatalog {
     pub fn stage_native(
         &self,
         group: GroupId,
-        meta: &SnapshotMetaOf<TypeConfig>,
+        meta: &SnapshotMetaWithId,
         data: &[u8],
         max_bytes: usize,
     ) -> io::Result<NativeSnapshotStage> {
@@ -592,7 +591,7 @@ impl SnapshotCatalog {
     pub fn publish_native(
         &self,
         group: GroupId,
-        meta: &SnapshotMetaOf<TypeConfig>,
+        meta: &SnapshotMetaWithId,
         data: &[u8],
         max_bytes: usize,
     ) -> io::Result<()> {

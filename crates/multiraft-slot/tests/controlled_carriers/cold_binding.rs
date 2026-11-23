@@ -194,9 +194,16 @@ async fn cold_source_preserves_identity_generation_and_local_addresses() {
             .await
             .unwrap();
     }
-    let current = leader(&f, slot).await;
-    if current != 1 {
-        transfer(&f, slot, current, 1).await;
+    // Node 1 was unreachable at its new address until v5 reached the leader, so
+    // it may campaign at a higher term and depose that leader once it rejoins.
+    let until = deadline();
+    loop {
+        let current = leader(&f, slot).await;
+        if current == 1 || try_transfer(&f, slot, current, 1).await {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < until);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     assert_eq!(
         f.handle(1)
