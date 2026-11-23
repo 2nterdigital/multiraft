@@ -298,7 +298,7 @@ where
         meta: Metadata<C>,
     ) -> io::Result<()> {
         self.put_metadata(&mut batch, &meta)?;
-        match self.owner.engine.write(batch) {
+        match self.owner.engine.write_hot(batch) {
             Ok(()) => {
                 cache.metadata = Some(meta);
                 Ok(())

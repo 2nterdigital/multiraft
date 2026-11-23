@@ -125,7 +125,9 @@ reopen the instance. ech0's composite FSM (#191) implements `DiskState` over
   the flushed IO (`engine_impl.rs`, `log_submitted.min(apply_accepted)`).
   RaftCore awaits `log_store.append` inline before it runs a later
   `SaveCommittedAndApply` (`core/raft_core.rs`). The RocksDB `append` returns
-  only after its synchronous WAL write (`log_rocks/storage.rs`), so an entry is
+  only after its synchronous WAL write (`log_rocks/storage.rs`); with
+  `raft_log_commit_window` set it returns only after a shared WAL sync covers the
+  write ([commit window](../rocksdb-raft-log.md#node-level-commit-window)), so an entry is
   durable in the local log before its FSM write. FileLog's `append` can return
   before its coalesced group commit, which would let a crash leave the durable
   FSM ahead of the local log.

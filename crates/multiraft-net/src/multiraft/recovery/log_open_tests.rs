@@ -204,3 +204,24 @@ fn node_log_open_applies_configured_compaction_rate() {
         assert_eq!(!matches!(value, "0x0" | "(nil)"), limited, "rate {rate}");
     }
 }
+
+#[test]
+fn node_log_open_applies_configured_commit_window() {
+    for (window, enabled) in [(Duration::ZERO, false), (Duration::from_millis(1), true)] {
+        let root = tempfile::tempdir().unwrap();
+        let mut cluster = config(root.path()).cluster;
+        cluster.raft_log_commit_window = window;
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let db = runtime()
+            .block_on(open_node_log(&cluster, stopping))
+            .unwrap()
+            .unwrap();
+        let stats = db.storage_memory_stats().unwrap();
+        // The window's histograms are exported only when the engine has a committer.
+        assert_eq!(
+            stats.io_latency.contains_key("log_commit_flush"),
+            enabled,
+            "window {window:?}"
+        );
+    }
+}
