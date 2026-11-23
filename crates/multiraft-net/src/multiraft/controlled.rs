@@ -81,7 +81,8 @@ pub struct ControlledSeed {
     record: multiraft_core::OperationRecord,
     vote: multiraft_core::typ::Vote,
     fingerprint: Option<[u8; 32]>,
-    meta: multiraft_core::typ::SnapshotMeta,
+    /// Peer-visible (seed header, anchor): keeps the alpha.30 layout and the manifest's id.
+    meta: multiraft_core::SnapshotMetaWithId,
     manifest: Vec<u8>,
     input: seed_stream::SeedInput,
 }

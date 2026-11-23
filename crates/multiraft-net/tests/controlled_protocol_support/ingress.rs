@@ -52,7 +52,7 @@ pub async fn unseeded_target_rejects_old_vote() {
         *specification.expected_start.log_id(),
     );
     // The log floor must protect startup independently of a transient leader lease.
-    request.leadership_transfer = true;
+    request.leadership_transfer_from = Some(Vote::new_committed(old_vote.term, old_vote.node_id));
     let response = router
         .vote(
             4,

@@ -8,7 +8,7 @@
 
 ## 定位
 
-**multiraft 不是 Aeron 的分支或 fork。** 它不嵌入 Aeron Media Driver、Consensus Module 或 Archive，而是构建在钉死的 **[openraft](https://github.com/databendlabs/openraft) `=0.10.0-alpha.30`** + `openraft-multi` 之上的 **Aeron 启发式热路径**。
+**multiraft 不是 Aeron 的分支或 fork。** 它不嵌入 Aeron Media Driver、Consensus Module 或 Archive，而是构建在钉死的 **[openraft](https://github.com/databendlabs/openraft) `=0.10.1`** + `openraft-multi` 之上的 **Aeron 启发式热路径**。
 
 > **2026-08-22 containment：** `STANDBY=1` 是实验室 learner/catalog/checksum/ad 生成流程。catalog 不是 current snapshot provider；实时 HTTP/ad/catalog/daisy 恢复返回类型化 unsupported，正常 OpenRaft recovery 继续有效。历史 Factory 6677 `StandbyOffload` 恢复契约因 C42 及其元数据未证明完整所有权而被撤回。未来协议需要单独 Accepted 的完整 metadata、原子捕获、Vote/完整 `LogId`/membership 与 `install_full_snapshot`。
 

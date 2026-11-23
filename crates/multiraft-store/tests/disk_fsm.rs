@@ -359,7 +359,6 @@ async fn whole_image_snapshot_paths_are_refused() {
     let meta = SnapshotMetaOf::<TypeConfig> {
         last_log_id: Some(log_id(9)),
         last_membership: Default::default(),
-        snapshot_id: "whole-image".into(),
     };
     let error = store
         .install_snapshot(&meta, io::Cursor::new(Vec::new()))
@@ -424,7 +423,7 @@ async fn disk_state_ahead_of_the_local_log_fails_closed_before_purge() {
 async fn leftover_whole_image_catalog_snapshot_fails_closed() {
     let root = scratch();
     let catalog = Arc::new(SnapshotCatalog::new(root.path().join("snapshots"), 1));
-    let meta = SnapshotMetaOf::<TypeConfig> {
+    let meta = multiraft_core::SnapshotMetaWithId {
         last_log_id: Some(log_id(1)),
         last_membership: Default::default(),
         snapshot_id: "whole-image".into(),

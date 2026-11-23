@@ -13,7 +13,7 @@ use futures::channel::oneshot;
 use futures::SinkExt;
 use openraft::error::Unreachable;
 use openraft::raft::AppendEntriesRequest;
-use openraft::raft::AppendEntriesResponse;
+use openraft::raft::AppendResult;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::raft::TransferLeaderResponse;
@@ -57,7 +57,7 @@ pub enum RaftCall {
 /// Typed Raft RPC reply for in-process hops.
 pub enum RaftReply {
     Vote(Result<VoteResponse<TypeConfig>, RaftError>),
-    Append(Result<AppendEntriesResponse<TypeConfig>, RaftError>),
+    Append(Result<AppendResult<TypeConfig>, RaftError>),
     Snapshot(Result<SnapshotResponse<TypeConfig>, RaftError>),
     /// Snapshot was refused at ingress without dispatching to the native Core.
     SnapshotUnavailable,
@@ -180,7 +180,7 @@ impl Router {
         to_node: NodeId,
         to_group: GroupId,
         rpc: AppendEntriesRequest<TypeConfig>,
-    ) -> Result<AppendEntriesResponse<TypeConfig>, Unreachable<TypeConfig>> {
+    ) -> Result<AppendResult<TypeConfig>, Unreachable<TypeConfig>> {
         match self
             .send_call(to_node, to_group, RaftCall::Append(rpc))
             .await?

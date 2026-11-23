@@ -11,18 +11,56 @@ use openraft::raft::TransferLeaderResponse;
 use crate::decode;
 use crate::encode;
 use multiraft_core::typ::*;
+use multiraft_core::SnapshotMetaWithId;
 use multiraft_fsm::StateMachine;
 use multiraft_store::Raft;
 use multiraft_store::StateMachineStore;
 
-pub async fn vote<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
-    let res = raft.vote(decode(req)).await;
-    encode(res)
+// tonic requires this concrete status type at the protocol boundary.
+#[allow(clippy::result_large_err)]
+pub async fn vote<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Result<Vec<u8>, tonic::Status> {
+    let res = raft.vote(decode_vote_request(req)?).await;
+    Ok(encode(res))
 }
 
-pub async fn append<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
-    let res = raft.append_entries(decode(req)).await;
-    encode(res)
+/// Fields of a `VoteRequest` sent by a node on OpenRaft 0.10.0-alpha.30.
+#[derive(serde::Deserialize)]
+struct LegacyVoteRequest {
+    vote: Vote,
+    last_log_id: Option<LogId>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    leadership_transfer: bool,
+}
+
+/// Decode a vote request from a current or an alpha.30 peer.
+///
+/// An alpha.30 `leadership_transfer: false` already reads as the current
+/// `leadership_transfer_from: None`; `true` fails the current layout and is
+/// read as the legacy one. It carries no authorizing Leader vote, so it
+/// becomes an ordinary election and the voter's leader lease still applies.
+// tonic requires this concrete status type at the protocol boundary.
+#[allow(clippy::result_large_err)]
+fn decode_vote_request(req: &[u8]) -> Result<VoteRequest, tonic::Status> {
+    decode::<VoteRequest>(req)
+        .or_else(|_| {
+            decode::<LegacyVoteRequest>(req)
+                .map(|legacy| VoteRequest::new(legacy.vote, legacy.last_log_id))
+        })
+        .map_err(|_| tonic::Status::invalid_argument("invalid vote request"))
+}
+
+/// Peers on OpenRaft 0.10.0-alpha.30 expect an `AppendEntriesResponse`; the
+/// conflict hint of the current `AppendResult` is not sent.
+// tonic requires this concrete status type at the protocol boundary.
+#[allow(clippy::result_large_err)]
+pub async fn append<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Result<Vec<u8>, tonic::Status> {
+    let rpc: AppendEntriesRequest =
+        decode(req).map_err(|_| tonic::Status::invalid_argument("invalid append request"))?;
+    let res = raft
+        .append_entries(rpc)
+        .await
+        .map(AppendEntriesResponse::from);
+    Ok(encode(res))
 }
 
 // tonic requires this concrete status type at the protocol boundary.
@@ -55,7 +93,7 @@ pub async fn snapshot<S: StateMachine>(
             })?;
     }
     let snapshot = Snapshot {
-        meta: snapshot_meta,
+        meta: snapshot_meta.into_meta(),
         snapshot: Cursor::new(snapshot_data),
     };
     let res = raft
@@ -112,13 +150,19 @@ fn decode_disk_chunk(req: &[u8]) -> Result<multiraft_store::DiskChunk, tonic::St
     Ok(chunk)
 }
 
-pub async fn transfer_leader<S: StateMachine>(raft: &Raft<S>, req: &[u8]) -> Vec<u8> {
-    let transfer_req: TransferLeaderRequest<multiraft_core::TypeConfig> = decode(req);
+// tonic requires this concrete status type at the protocol boundary.
+#[allow(clippy::result_large_err)]
+pub async fn transfer_leader<S: StateMachine>(
+    raft: &Raft<S>,
+    req: &[u8],
+) -> Result<Vec<u8>, tonic::Status> {
+    let transfer_req: TransferLeaderRequest<multiraft_core::TypeConfig> = decode(req)
+        .map_err(|_| tonic::Status::invalid_argument("invalid transfer leader request"))?;
     let res: Result<TransferLeaderResponse<multiraft_core::TypeConfig>, RaftError> = raft
         .handle_transfer_leader(transfer_req)
         .await
         .map_err(RaftError::Fatal);
-    encode(res)
+    Ok(encode(res))
 }
 
 #[derive(Debug)]
@@ -130,7 +174,7 @@ enum SnapshotDecodeError {
 fn decode_snapshot_request(
     req: &[u8],
     cap: usize,
-) -> Result<(Vote, SnapshotMeta, Vec<u8>), SnapshotDecodeError> {
+) -> Result<(Vote, SnapshotMetaWithId, Vec<u8>), SnapshotDecodeError> {
     use bincode::Options;
     const ENVELOPE: usize = 1024 * 1024;
     if cap == 0 || cap > 64 * 1024 * 1024 || req.len() > cap + ENVELOPE {
@@ -150,7 +194,8 @@ fn decode_snapshot_request(
             _ => SnapshotDecodeError::Encoding,
         };
         let vote = Vote::deserialize(&mut decoder).map_err(classify)?;
-        let meta = SnapshotMeta::deserialize(&mut decoder).map_err(classify)?;
+        // The alpha.30 layout, id included: see `SnapshotMetaWithId`.
+        let meta = SnapshotMetaWithId::deserialize(&mut decoder).map_err(classify)?;
         (vote, meta)
     };
     // The existing fixed-int bincode Vec<u8> is a u64 length followed by bytes.
@@ -172,6 +217,66 @@ fn decode_snapshot_request(
         return Err(SnapshotDecodeError::Encoding);
     }
     Ok((vote, meta, data.to_vec()))
+}
+
+#[cfg(test)]
+mod alpha30_vote_tests {
+    use super::*;
+
+    fn old_vote() -> Vote {
+        Vote::new(8, 3)
+    }
+    fn old_last_log_id() -> Option<LogId> {
+        use openraft::vote::RaftLeaderIdExt;
+        Some(LogId::new(
+            openraft::alias::LeaderIdOf::<multiraft_core::TypeConfig>::new_committed(7, 2),
+            101,
+        ))
+    }
+
+    #[test]
+    fn alpha30_vote_requests_decode_as_ordinary_elections() {
+        for (bytes, last_log_id) in [
+            (
+                &include_bytes!("../tests/fixtures/alpha30/vote_req_old_false.bin")[..],
+                old_last_log_id(),
+            ),
+            (
+                &include_bytes!("../tests/fixtures/alpha30/vote_req_old_true.bin")[..],
+                old_last_log_id(),
+            ),
+            (
+                &include_bytes!("../tests/fixtures/alpha30/vote_req_old_true_nolog.bin")[..],
+                None,
+            ),
+        ] {
+            let request = decode_vote_request(bytes).unwrap();
+            assert_eq!(request, VoteRequest::new(old_vote(), last_log_id));
+            assert_eq!(request.leadership_transfer_from, None);
+        }
+        assert!(decode_vote_request(&[1, 2, 3]).is_err(), "never panics");
+    }
+
+    #[test]
+    fn current_vote_requests_keep_their_transfer_authority_and_alpha30_reads_the_flag() {
+        let mut request = VoteRequest::new(Vote::new(9, 1), old_last_log_id());
+        let ordinary = encode(&request);
+        assert_eq!(decode_vote_request(&ordinary).unwrap(), request);
+        assert!(
+            !decode::<LegacyVoteRequest>(&ordinary)
+                .unwrap()
+                .leadership_transfer
+        );
+        request.leadership_transfer_from = Some(Vote::new_committed(8, 2));
+        let transfer = encode(&request);
+        assert_eq!(decode_vote_request(&transfer).unwrap(), request);
+        // Alpha.30 decodes with trailing bytes allowed: `Some` reads as `true`.
+        assert!(
+            decode::<LegacyVoteRequest>(&transfer)
+                .unwrap()
+                .leadership_transfer
+        );
+    }
 }
 
 #[cfg(test)]
@@ -210,7 +315,7 @@ mod snapshot_bound_tests {
     }
     #[test]
     fn oversized_declared_metadata_is_classified_before_payload_completeness() {
-        let meta = SnapshotMeta {
+        let meta = SnapshotMetaWithId {
             snapshot_id: "x".repeat(2 * 1024 * 1024),
             ..Default::default()
         };
@@ -226,7 +331,7 @@ mod snapshot_bound_tests {
     fn native_snapshot_decode_rejects_oversize_trailing_and_truncated_input() {
         let encoded = encode((
             Vote::new_committed(0, 0),
-            SnapshotMeta::default(),
+            SnapshotMetaWithId::default(),
             vec![7_u8; 5],
         ));
         assert!(decode_snapshot_request(&encoded, 4).is_err());

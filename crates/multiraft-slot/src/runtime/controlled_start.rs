@@ -122,7 +122,7 @@ pub(super) async fn open<S: SlotStateMachine>(
                 || catalog
                     .membership
                     .membership()
-                    .learner_ids()
+                    .non_write_voter_ids()
                     .next()
                     .is_some()
                 || catalog.authorized.keys().copied().collect::<BTreeSet<_>>() != voters

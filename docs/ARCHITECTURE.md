@@ -180,7 +180,7 @@ P3 `read_stale` is explicitly non-linearizable.
 
 | Crate | Version |
 |-------|---------|
-| `openraft` | `=0.10.0-alpha.30` |
-| `openraft-multi` | `=0.10.0-alpha.30` |
+| `openraft` | `=0.10.1` |
+| `openraft-multi` | `=0.10.1` |
 
 See [upstream.md](./upstream.md) · [中文](./upstream.zh-CN.md).

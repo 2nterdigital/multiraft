@@ -219,17 +219,32 @@ async fn leader(f: &Fixture, slot: SlotId) -> u64 {
     }
 }
 async fn transfer(f: &Fixture, slot: SlotId, source: u64, target: u64) {
+    assert!(
+        try_transfer(f, slot, source, target).await,
+        "source lost leadership"
+    );
+}
+/// Like [`transfer`], but returns `false` when `source` stops leading before the
+/// request is queued (sampling refused, or the native precheck re-sampling
+/// rejects it), so the caller can resolve the new leader.
+async fn try_transfer(f: &Fixture, slot: SlotId, source: u64, target: u64) -> bool {
     use multiraft_net::{
         ControlContext, ControlInvocationId, GroupControlPreconditions, GroupControlRequestResult,
         TargetQualification,
     };
     let context = ControlContext::new(ControlInvocationId([8; 16]), deadline());
     let sample = loop {
-        let sample = f
+        let sample = match f
             .handle(source)
             .read_group_control_sample(slot, context)
             .await
-            .unwrap();
+        {
+            Ok(sample) => sample,
+            // The Slot adapter reports every native sampling refusal, including
+            // NotLeader, as Unavailable; the caller re-resolves within its deadline.
+            Err(SlotControlError::Slot(RuntimeError::Unavailable)) => return false,
+            Err(error) => panic!("{error:?}"),
+        };
         if matches!(
             sample.target_qualifications.get(&target),
             Some(TargetQualification::Qualified { .. })
@@ -255,13 +270,11 @@ async fn transfer(f: &Fixture, slot: SlotId, source: u64, target: u64) {
         )
         .await
         .unwrap();
-    assert!(
-        matches!(
-            result.result,
-            GroupControlRequestResult::TriggerQueued { .. }
-        ),
-        "{result:?}"
-    );
+    match result.result {
+        GroupControlRequestResult::TriggerQueued { .. } => {}
+        GroupControlRequestResult::PrecheckRejected { .. } => return false,
+        other => panic!("{other:?}"),
+    }
     let until = deadline();
     while !f
         .handle(target)
@@ -273,6 +286,7 @@ async fn transfer(f: &Fixture, slot: SlotId, source: u64, target: u64) {
         assert!(tokio::time::Instant::now() < until);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    true
 }
 fn key(f: &Fixture, slot: SlotId) -> Vec<u8> {
     (0..10000)

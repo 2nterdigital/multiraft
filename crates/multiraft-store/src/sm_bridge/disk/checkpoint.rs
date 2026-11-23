@@ -113,7 +113,8 @@ impl<S: StateMachine> StateMachineStore<S> {
             ));
         }
         let descriptor = DiskManifest::decode(data, self.group_id)?;
-        if descriptor.meta != *meta {
+        // The manifest bytes are compared below, which binds its snapshot id too.
+        if !descriptor.meta.matches(meta) {
             return Err(invalid("controlled checkpoint metadata mismatch"));
         }
         let _transition = self.disk_rt.transition.lock().await;

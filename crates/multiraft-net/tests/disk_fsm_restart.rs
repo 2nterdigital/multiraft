@@ -555,8 +555,9 @@ async fn rollback_below_the_purged_log_is_refused(sync_writes: bool) {
     // from OpenRaft re-installing the local published checkpoint at construction,
     // which the disk bridge rejects as an unverified (non-transport) snapshot.
     assert!(error.contains("stage: Construct"), "{error}");
+    // OpenRaft 0.10.1 signatures carry no snapshot id: name the checkpoint by its cut.
     assert!(
-        error.contains(&format!("disk-v1-{GROUP}-{purged}-")),
+        error.contains(&format!("index: {purged} }}), last_membership_log_id")),
         "{error}"
     );
     assert!(

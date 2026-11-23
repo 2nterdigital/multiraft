@@ -568,7 +568,11 @@ async fn installed_native_disk_checkpoint_recovers_without_a_saved_committed_rec
         receiver.receive_disk_chunk(chunk).await.unwrap();
     }
     receiver
-        .verify_disk_snapshot(&snapshot.meta, &manifest)
+        .verify_disk_snapshot(
+            &multiraft_store::disk_snapshot::wire_snapshot_meta(7, &snapshot.meta, &manifest)
+                .unwrap(),
+            &manifest,
+        )
         .await
         .unwrap();
     receiver

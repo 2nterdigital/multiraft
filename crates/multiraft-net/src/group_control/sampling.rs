@@ -35,7 +35,7 @@ pub async fn read_group_control_sample<S: StateMachine>(
     let started = Instant::now();
     let state0 = read_state_point(raft, group_id).await?;
     let read_log_id = match raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
-        Ok(log_id) => log_id.as_ref().map(normalize_log_id),
+        Ok(log_id) => Some(normalize_log_id(log_id.log_id())),
         Err(error) => {
             if let Some(forward) = error.forward_to_leader() {
                 return Err(GroupControlSampleError::NotLeader {

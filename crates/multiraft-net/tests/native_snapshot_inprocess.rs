@@ -61,7 +61,6 @@ async fn oversized_inprocess_snapshot_does_not_enter_native_install() {
     let (node, _tx) = Node::with_groups(2, router.clone(), groups);
     let task = tokio::spawn(node.run());
     let meta = SnapshotMetaOf::<TypeConfig> {
-        snapshot_id: "oversize".into(),
         last_log_id: Some(LogIdOf::<TypeConfig>::new(
             LeaderIdOf::<TypeConfig>::new_committed(3, 1),
             10,

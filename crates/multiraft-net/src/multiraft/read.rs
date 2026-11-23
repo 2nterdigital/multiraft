@@ -23,7 +23,7 @@ pub(super) async fn confirm<S: StateMachine>(
     deadline: Instant,
 ) -> Result<Option<openraft::alias::LogIdOf<TypeConfig>>, MultiRaftError> {
     match tokio::time::timeout_at(deadline, raft.ensure_linearizable(policy)).await {
-        Ok(Ok(read_log_id)) => Ok(read_log_id),
+        Ok(Ok(read_log_id)) => Ok(Some(*read_log_id.log_id())),
         Ok(Err(error)) => {
             if let Some(fwd) = error.forward_to_leader() {
                 return Err(MultiRaftError::NotLeader {
@@ -155,9 +155,12 @@ impl<S: StateMachine> MultiRaft<S> {
                 match confirm(&raft, policy.clone(), deadline).await {
                     // No hint: this node's lease is unconfirmed or expired, so
                     // ReadIndex decides leadership. A known other leader is returned as is.
-                    Err(MultiRaftError::NotLeader { hint: None })
-                        if policy == ReadPolicy::LeaseRead =>
-                    {
+                    // Since OpenRaft 0.10.1 a leader whose lease expired answers a
+                    // LeaseRead with `QuorumNotEnough` instead of an empty forward.
+                    Err(
+                        MultiRaftError::NotLeader { hint: None }
+                        | MultiRaftError::ReadIndex(ReadIndexFailure::QuorumUnavailable { .. }),
+                    ) if policy == ReadPolicy::LeaseRead => {
                         policy = ReadPolicy::ReadIndex;
                     }
                     Err(MultiRaftError::ReadIndex(ReadIndexFailure::QuorumUnavailable {
